@@ -61,8 +61,15 @@ scheme stops at 120 tokens/second, and Spark turns already exceed it.
 The telemetry contract package implements the source side:
 
 - `PERFORMANCE_FIELD_DICTIONARIES` registers every dictionary with its state and
-  bucket scheme. Released dictionaries are `accepted`. A dictionary no client
-  emits yet is `draft` and must not be advertised by transport.
+  bucket scheme. `accepted` means intake accepts the dictionary: a released
+  client emits it, or a merged client change emits it and the servers deploy
+  before that client release (server first). `draft` means no client change
+  emits it yet, so intake must not accept it. In every state, transport never
+  advertises a dictionary the device did not declare.
+  `PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION` is the bucket scheme paired with
+  the emitted `PERFORMANCE_FIELD_DICTIONARY_VERSION`;
+  `PERFORMANCE_BUCKET_SCHEME_VERSION` keeps meaning v1 for registry rows, schema
+  enums and stored SQL checks.
   `adaptTelemetryPerformanceRecord` validates a record under its own dictionary
   and returns its labels in the latest vocabulary by identity: each older
   dictionary is a strict vocabulary subset, and the reviewed model catalog only
@@ -74,7 +81,7 @@ The telemetry contract package implements the source side:
   through 300 and logarithmic bins (×1.15) through about 3,228 tokens/second;
   millisecond metrics are unchanged. Dictionary
   `telemetry-performance-registry-2026-10-10.1` pairs it with the latest
-  vocabulary and stays `draft` until a client emits it.
+  vocabulary. It is `accepted` server first, before any client emits it.
 - Pools combine v1 and v2 histograms exactly below 120 tokens/second. A v1
   overflow count stays unresolved mass, which widens bounds to the observed
   maximum instead of being guessed into a v2 bucket.

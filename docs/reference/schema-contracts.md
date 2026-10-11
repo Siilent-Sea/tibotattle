@@ -266,7 +266,13 @@ second speed sample for the same turn. Clients emit field dictionary `telemetry-
 Readers accept every dictionary in `PERFORMANCE_FIELD_DICTIONARIES`:
 - `…2026-09-21.1` (0.1.24–0.1.26, no Ultrafast; their Ultrafast turns are `other`);
 - `…2026-09-29.1` (0.1.27 onward);
-- `…2026-10-10.1`, which is `draft` until a client emits it.
+- `…2026-10-10.1`, which is `accepted` server first, before any client emits it.
+
+`accepted` means intake accepts a dictionary; transport never advertises a
+dictionary the device did not declare. `PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION`
+is the bucket scheme of the emitted dictionary. The legacy Cloudflare Worker's
+D1 performance path is pinned to the dictionary its schema admits and does not
+follow the emitted default.
 
 `adaptTelemetryPerformanceRecord` validates a record under its own dictionary
 and returns it in the latest vocabulary by identity.

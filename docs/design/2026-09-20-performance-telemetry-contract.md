@@ -412,7 +412,7 @@ minimums.
 | --- | --- | --- | --- | --- |
 | `…2026-09-21.1` | 0.1.24–0.1.26 | no `ultrafast` | `performance-histogram-v1` | accepted |
 | `…2026-09-29.1` | 0.1.27 onward | adds `ultrafast` | `performance-histogram-v1` | accepted |
-| `…2026-10-10.1` | none yet | same as `…09-29.1` | `performance-histogram-v2` | draft |
+| `…2026-10-10.1` | none yet | same as `…09-29.1` | `performance-histogram-v2` | accepted (server first) |
 
 Each older dictionary is a strict vocabulary subset of the latest, and the
 reviewed model catalog only grows, so the reader adapter is an identity map
