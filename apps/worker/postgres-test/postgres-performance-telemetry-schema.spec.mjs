@@ -21,6 +21,7 @@ import { dirname, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
+import * as telemetryContract from "@app-usagemonitor/telemetry-contract";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
@@ -30,6 +31,10 @@ import {
   PERFORMANCE_DICTIONARY_2026_09_21,
   PERFORMANCE_DICTIONARY_2026_09_29,
   PERFORMANCE_DICTIONARY_2026_10_10,
+  PERFORMANCE_DICTIONARY_REGISTRY,
+  PERFORMANCE_FIXTURE_DURATION_EDGES_MS,
+  PERFORMANCE_FIXTURE_SPEED_EDGES_V1,
+  PERFORMANCE_FIXTURE_SPEED_EDGES_V2,
   PERFORMANCE_INTAKE_ROUTE_IDS,
   PERFORMANCE_MIGRATION_NAME,
   activatePerformanceRuntime,
@@ -38,6 +43,7 @@ import {
   insertPerformanceGrant,
   insertPerformancePublicationHead,
   insertPerformanceReport,
+  performanceFixtureMaxBucket,
   performanceInstant,
   performanceTable,
   seedPerformanceAccountlessOwner,
@@ -136,6 +142,76 @@ async function withClient(run) {
   const client = await pool.connect();
   try { return await run(client); } finally { client.release(); }
 }
+
+// No database: the shared fixture's records are what later items rebuild and
+// re-parse, so each one must satisfy the telemetry contract under its own
+// dictionary. A contract without dictionary adapters (before SPD-G0) parses
+// under its single v1 vocabulary; v2 records are then checked with their
+// scheme relabelled v1 wherever every bucket lies on the shared v1 edges.
+test("fixtures: synthetic records pass the telemetry contract under their dictionary; edges equal the contract's", (t) => {
+  const contract = telemetryContract;
+  const dictionaryAware = typeof contract.PERFORMANCE_FIELD_DICTIONARIES === "object"
+    && contract.PERFORMANCE_FIELD_DICTIONARIES !== null;
+  const v2Aware = Array.isArray(contract.SPEED_BUCKET_UPPER_CENTI_TPS_V2);
+  assert.equal(dictionaryAware, v2Aware, "dictionary adapters and the v2 speed edges arrive together");
+  assert.deepEqual(PERFORMANCE_FIXTURE_SPEED_EDGES_V1, [...contract.SPEED_BUCKET_UPPER_CENTI_TPS]);
+  assert.deepEqual(PERFORMANCE_FIXTURE_DURATION_EDGES_MS, [...contract.TTFT_BUCKET_UPPER_MS]);
+  assert.deepEqual(PERFORMANCE_FIXTURE_DURATION_EDGES_MS, [...contract.TURN_DURATION_BUCKET_UPPER_MS]);
+  if (v2Aware) assert.deepEqual(PERFORMANCE_FIXTURE_SPEED_EDGES_V2, [...contract.SPEED_BUCKET_UPPER_CENTI_TPS_V2]);
+  const v1 = "performance-histogram-v1";
+  const relabelV1 = (record) => ({ ...record, bucketSchemeVersion: v1,
+    ...Object.fromEntries(["speedHistogram", "ttftHistogram", "completionHistogram"]
+      .map((field) => [field, { ...record[field], schemaVersion: v1 }])) });
+  let parsed = 0;
+  let relabelled = 0;
+  const parse = (record, dictionary) => {
+    const scheme = PERFORMANCE_DICTIONARY_REGISTRY[dictionary].bucketSchemeVersion;
+    if (dictionaryAware) return contract.parseTelemetryPerformanceRecord(record, dictionary);
+    if (scheme === v1) return contract.parseTelemetryPerformanceRecord(record);
+    if (Object.keys(record.speedHistogram.buckets).every((key) => Number(key) < PERFORMANCE_FIXTURE_SPEED_EDGES_V1.length)) {
+      relabelled += 1;
+      return contract.parseTelemetryPerformanceRecord(relabelV1(record));
+    }
+    return null;
+  };
+  const valid = (dictionary, fields) => {
+    const record = syntheticPerformanceRecord({ day: DAY, fieldDictionaryVersion: dictionary, ...fields });
+    if (parse(record, dictionary) !== null) parsed += 1;
+  };
+  for (const dictionary of Object.keys(PERFORMANCE_DICTIONARY_REGISTRY)) {
+    const scheme = PERFORMANCE_DICTIONARY_REGISTRY[dictionary].bucketSchemeVersion;
+    for (let speedBucket = 0; speedBucket <= performanceFixtureMaxBucket(scheme, "speed"); speedBucket += 1) {
+      for (const turns of [1, 3]) valid(dictionary, { speedBucket, turns });
+    }
+    for (const ms of [0, 1, 499, 500, 900, 12_000, 1_000_000, 1_000_000_000]) {
+      valid(dictionary, { ttftMs: ms, turnDurationMs: Math.max(1, ms) });
+    }
+    valid(dictionary, {});
+    valid(dictionary, { speedMethod: "unavailable" });
+    valid(dictionary, { speedMode: "fast", speedModeSource: "turn_context_service_tier", apiServiceTier: "priority" });
+    valid(dictionary, { speedMode: "other", reasoningEffort: "high" });
+    if (PERFORMANCE_DICTIONARY_REGISTRY[dictionary].ultrafastLabels) {
+      valid(dictionary, { speedMode: "ultrafast", apiServiceTier: "ultrafast" });
+    }
+    // A mode/source mismatch is never contract-valid.
+    assert.throws(() => parse(syntheticPerformanceRecord({ day: DAY, fieldDictionaryVersion: dictionary,
+      speedMode: "unknown", speedModeSource: "rollout_thread_settings" }), dictionary),
+    (error) => error?.code === "TELEMETRY_RECORD_INVALID");
+  }
+  // 2026-09-21.1 has no Ultrafast labels: those fixture records exist only to prove the database refuses them.
+  if (dictionaryAware) {
+    for (const fields of [{ speedMode: "ultrafast" }, { apiServiceTier: "ultrafast" }]) {
+      assert.throws(() => parse(syntheticPerformanceRecord({ day: DAY, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_21,
+        ...fields }), PERFORMANCE_DICTIONARY_2026_09_21), (error) => error?.code === "TELEMETRY_RECORD_INVALID");
+    }
+  }
+  assert.ok(parsed >= 2 * 61 + 2 * 61, `parsed ${parsed}`);
+  if (!v2Aware) {
+    assert.ok(relabelled >= 2 * 60, `relabelled ${relabelled}`);
+    t.diagnostic(`v2 records checked with their scheme relabelled v1 (${relabelled}); the v2-only speed buckets `
+      + "60..95 validate once the contract exports the v2 scheme (SPD-G0)");
+  }
+});
 
 test("0079 is the promoted tail: a pre-0079 schema lacks it and is not current; new functions pin search_path", {
   skip, timeout: 240_000,
@@ -605,7 +681,7 @@ test("labels and buckets: 2026-09-21.1 refuses Ultrafast and accepts turn_contex
       field_dictionary_version, bucket_scheme_version, provider, model_id, reasoning_effort, speed_method, speed_mode,
       speed_mode_source, api_service_tier, turns, speed_turns, ttft_turns, completion_turns, timed_responses,
       speed_tokens, speed_duration_ms)
-    VALUES ($1, 5, $2, 'performance-histogram-v1', 'openai', 'gpt-5.5', 'low', 'unavailable', 'standard',
+    VALUES ($1, 5, $2, 'performance-histogram-v1', 'openai_codex', 'gpt-5.5', 'low', 'unavailable', 'standard',
       'rollout_thread_settings', 'standard', 1, 0, 0, 0, 0, 0, 0)`, [v2Report.reportId, PERFORMANCE_DICTIONARY_2026_10_10]),
   "23503");
 });

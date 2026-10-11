@@ -64,8 +64,8 @@ const PRIVACY_CONTRACT_VERSION = "privacy-safe-model-performance-v1";
 const MEASUREMENT_VERSION = "model-performance-samples-v1";
 const METHOD_VERSION = "performance-daily-histogram-v1";
 const SCOPE = "model-performance-daily";
-/** A reviewed provider/model pair of the catalog (synthetic counts only). */
-export const PERFORMANCE_FIXTURE_MODEL = Object.freeze({ provider: "openai", modelId: "gpt-5.5" });
+/** A provider/model pair of the reviewed model catalog (REVIEWED_MODEL_CATALOG; synthetic counts only). */
+export const PERFORMANCE_FIXTURE_MODEL = Object.freeze({ provider: "openai_codex", modelId: "gpt-5.5" });
 
 function fail(code) {
   throw Object.assign(new Error(code), { code });
@@ -271,15 +271,122 @@ export async function insertPerformanceGrant(pool, {
   });
 }
 
-function syntheticHistogram(schemaVersion, metric, buckets, min, max) {
-  const sampleCount = Object.values(buckets).reduce((total, count) => total + count, 0);
-  return { schemaVersion, metric, sampleCount, buckets, min, max };
+function ceilRational(numerator, denominator) {
+  return Number((numerator + denominator - 1n) / denominator);
+}
+
+/** ceil(base * 1.15^k) for k = 1..count, as the contract derives its log edges. */
+function logarithmicEdges(base, count) {
+  return Array.from({ length: count }, (_, index) => {
+    const k = BigInt(index + 1);
+    return ceilRational(base * 115n ** k, 100n ** k);
+  });
 }
 
 /**
+ * The contract's upper-exclusive bucket edges, restated so the fixture can
+ * place samples without a contract that knows every scheme (the v2 speed edges
+ * reach the contract with SPD-G0). The schema spec asserts each list equals
+ * the contract's export whenever the contract exports it.
+ * - v1 speed (centi-tokens/second): 60 edges of 200; bucket 60 overflows.
+ * - v2 speed: the v1 edges, 18 edges of 1,000 through 30,000, then
+ *   ceil(30,000 * 1.15^k) for k = 1..17; bucket 95 overflows.
+ * - ttft and turnDuration (ms): 1, 500, then ceil(500 * 1.15^k) for
+ *   k = 1..55; bucket 0 is TTFT == 0 only, bucket 57 overflows.
+ */
+export const PERFORMANCE_FIXTURE_SPEED_EDGES_V1 = Object.freeze(
+  Array.from({ length: 60 }, (_, index) => (index + 1) * 200),
+);
+export const PERFORMANCE_FIXTURE_SPEED_EDGES_V2 = Object.freeze([
+  ...PERFORMANCE_FIXTURE_SPEED_EDGES_V1,
+  ...Array.from({ length: 18 }, (_, index) => 12_000 + (index + 1) * 1_000),
+  ...logarithmicEdges(30_000n, 17),
+]);
+export const PERFORMANCE_FIXTURE_DURATION_EDGES_MS = Object.freeze([1, 500, ...logarithmicEdges(500n, 55)]);
+
+const SPEED_EDGES_BY_SCHEME = Object.freeze({
+  [PERFORMANCE_BUCKET_SCHEME_V1]: PERFORMANCE_FIXTURE_SPEED_EDGES_V1,
+  [PERFORMANCE_BUCKET_SCHEME_V2]: PERFORMANCE_FIXTURE_SPEED_EDGES_V2,
+});
+
+function speedEdges(scheme) {
+  const edges = SPEED_EDGES_BY_SCHEME[scheme];
+  if (edges === undefined) fail("PERFORMANCE_FIXTURE_SCHEME_INVALID");
+  return edges;
+}
+
+/** The highest bucket index a metric has under a scheme (the overflow bucket). */
+export function performanceFixtureMaxBucket(scheme, metric) {
+  if (metric === "speed") return speedEdges(scheme).length;
+  speedEdges(scheme);
+  if (metric === "ttft" || metric === "turnDuration") return PERFORMANCE_FIXTURE_DURATION_EDGES_MS.length;
+  return fail("PERFORMANCE_FIXTURE_METRIC_INVALID");
+}
+
+/** The contract bucket of one sample: speed in centi-tokens/second, ttft and turnDuration in ms. */
+export function performanceFixtureBucket(scheme, metric, value) {
+  const maximum = performanceFixtureMaxBucket(scheme, metric);
+  if (!Number.isSafeInteger(value) || value < (metric === "turnDuration" ? 1 : 0)) {
+    fail("PERFORMANCE_FIXTURE_SAMPLE_INVALID");
+  }
+  if (metric === "speed") {
+    const index = speedEdges(scheme).findIndex((upper) => value < upper);
+    return index < 0 ? maximum : index;
+  }
+  if (metric === "ttft" && value === 0) return 0;
+  if (value < PERFORMANCE_FIXTURE_DURATION_EDGES_MS[1]) return 1;
+  const index = PERFORMANCE_FIXTURE_DURATION_EDGES_MS.findIndex((upper, edgeIndex) => edgeIndex >= 2 && value < upper);
+  return index < 0 ? maximum : index;
+}
+
+/**
+ * A speed sample (centi-tokens/second) inside `bucket`: the bucket's lower
+ * edge rounded up to a multiple of 10 (at least 10), so a 10 s duration per
+ * turn carries a whole token count and the rate is exact.
+ */
+export function performanceFixtureSpeedForBucket(scheme, bucket) {
+  const edges = speedEdges(scheme);
+  if (!Number.isSafeInteger(bucket) || bucket < 0 || bucket > edges.length) fail("PERFORMANCE_FIXTURE_SPEED_BUCKET_INVALID");
+  const lower = bucket === 0 ? 0 : edges[bucket - 1];
+  const value = Math.ceil(Math.max(lower, 10) / 10) * 10;
+  if (performanceFixtureBucket(scheme, "speed", value) !== bucket) fail("PERFORMANCE_FIXTURE_SPEED_BUCKET_INVALID");
+  return value;
+}
+
+/**
+ * A contract-shaped sparse histogram of integer samples under a scheme: the
+ * buckets are derived from the samples and min/max are their extrema.
+ */
+export function syntheticPerformanceHistogram(scheme, metric, values) {
+  if (!Array.isArray(values)) fail("PERFORMANCE_FIXTURE_SAMPLE_INVALID");
+  const buckets = {};
+  for (const value of values) {
+    const key = String(performanceFixtureBucket(scheme, metric, value));
+    buckets[key] = (buckets[key] ?? 0) + 1;
+  }
+  const sorted = Object.fromEntries(Object.keys(buckets).sort((left, right) => Number(left) - Number(right))
+    .map((key) => [key, buckets[key]]));
+  return {
+    schemaVersion: scheme,
+    metric,
+    sampleCount: values.length,
+    buckets: sorted,
+    min: values.length === 0 ? null : Math.min(...values),
+    max: values.length === 0 ? null : Math.max(...values),
+  };
+}
+
+const SPEED_DURATION_MS_PER_TURN = 10_000;
+
+/**
  * A plain, contract-shaped performance record (model-performance-daily-v1)
- * with synthetic counts. `speedBucket` places the speed samples; overrides
- * replace any field.
+ * with synthetic counts, valid under `fieldDictionaryVersion` whenever its
+ * labels are in that dictionary's vocabulary (2026-09-21.1 has no Ultrafast
+ * labels; such records exist only to prove the database refuses them).
+ * `speedBucket` places every speed sample in that bucket of the dictionary's
+ * scheme and derives the speed extrema, tokens and duration to match;
+ * `ttftMs` and `turnDurationMs` place the latency samples, whose buckets are
+ * derived from the contract edges. Overrides replace any field verbatim.
  */
 export function syntheticPerformanceRecord({
   day,
@@ -290,12 +397,17 @@ export function syntheticPerformanceRecord({
   reasoningEffort = "medium",
   speedMethod = "receipt",
   speedBucket = 30,
+  ttftMs = 900,
+  turnDurationMs = 12_000,
   turns = 3,
   ...overrides
 } = {}) {
-  const scheme = PERFORMANCE_DICTIONARY_REGISTRY[fieldDictionaryVersion]?.bucketSchemeVersion
-    ?? PERFORMANCE_BUCKET_SCHEME_V1;
+  const scheme = PERFORMANCE_DICTIONARY_REGISTRY[fieldDictionaryVersion]?.bucketSchemeVersion;
+  if (scheme === undefined) fail("PERFORMANCE_FIXTURE_DICTIONARY_INVALID");
+  if (!Number.isSafeInteger(turns) || turns < 1) fail("PERFORMANCE_FIXTURE_TURNS_INVALID");
   const speedTurns = speedMethod === "unavailable" ? 0 : turns;
+  const speed = speedTurns === 0 ? null : performanceFixtureSpeedForBucket(scheme, speedBucket);
+  const repeat = (count, value) => Array.from({ length: count }, () => value);
   return {
     schemaVersion: RECORD_SCHEMA_VERSION,
     day,
@@ -313,13 +425,12 @@ export function syntheticPerformanceRecord({
     ttftTurns: turns,
     completionTurns: turns,
     timedResponses: speedTurns,
-    speedTokens: speedTurns === 0 ? 0 : 600 * speedTurns,
-    speedDurationMs: speedTurns === 0 ? 0 : 10_000 * speedTurns,
-    speedHistogram: speedTurns === 0
-      ? syntheticHistogram(scheme, "speed", {}, null, null)
-      : syntheticHistogram(scheme, "speed", { [String(speedBucket)]: speedTurns }, 6_000, 6_000),
-    ttftHistogram: syntheticHistogram(scheme, "ttft", { 20: turns }, 900, 900),
-    completionHistogram: syntheticHistogram(scheme, "turnDuration", { 30: turns }, 12_000, 12_000),
+    // rate = tokens * 100,000 / ms centi-tokens/second, exactly `speed`.
+    speedTokens: speedTurns === 0 ? 0 : (speed / 10) * speedTurns,
+    speedDurationMs: SPEED_DURATION_MS_PER_TURN * speedTurns,
+    speedHistogram: syntheticPerformanceHistogram(scheme, "speed", repeat(speedTurns, speed)),
+    ttftHistogram: syntheticPerformanceHistogram(scheme, "ttft", repeat(turns, ttftMs)),
+    completionHistogram: syntheticPerformanceHistogram(scheme, "turnDuration", repeat(turns, turnDurationMs)),
     ...overrides,
   };
 }

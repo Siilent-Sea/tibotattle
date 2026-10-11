@@ -503,6 +503,7 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
 
 test("migration source requires exact appended 79 and retained 78 prefix before database access", async () => {
   const valid = fakeMigrations();
+  assert.equal(valid[76].name, "0077_analytics_v2_reprice.sql");
   assert.equal(valid[77].name, "0078_classification_link_lookup_indexes.sql");
   assert.equal(valid[78].name, "0079_performance_telemetry.sql");
   const variants = [
