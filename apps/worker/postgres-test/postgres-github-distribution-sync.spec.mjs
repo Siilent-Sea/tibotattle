@@ -225,7 +225,7 @@ test("the injected admin action forces a fresh snapshot and keeps its audit and 
   const handlers = consoleRoutes.createAdminConsoleHandlers({
     requestContext: store.accessor, clock: () => at, env: Object.freeze({ ENVIRONMENT: "production" }),
     pools: { primary: pool }, schemaOptions: { primarySchema: schema },
-    maintenance: host.createLifecyclePassMaintenance({ pool, primarySchema: schema, objectStore: {},
+    maintenance: host.createPostgresOwnerMaintenance({ pool, primarySchema: schema, objectStore: {},
       distributionEnabled: true, clock: () => at, fetcher: fetcher(inventory(20)) }),
   });
   const request = (headers) => new Request("https://admin.example.invalid/api/v1/admin/action", {
@@ -253,7 +253,7 @@ test("the injected admin action forces a fresh snapshot and keeps its audit and 
   const failingHandlers = consoleRoutes.createAdminConsoleHandlers({
     requestContext: store.accessor, clock: () => failedAt, env: Object.freeze({ ENVIRONMENT: "production" }),
     pools: { primary: pool }, schemaOptions: { primarySchema: schema },
-    maintenance: host.createLifecyclePassMaintenance({ pool, primarySchema: schema, objectStore: {},
+    maintenance: host.createPostgresOwnerMaintenance({ pool, primarySchema: schema, objectStore: {},
       distributionEnabled: true, clock: () => failedAt,
       fetcher: async () => { throw new Error("synthetic private upstream detail"); } }),
   });
