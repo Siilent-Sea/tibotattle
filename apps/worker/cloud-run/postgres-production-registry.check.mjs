@@ -40,6 +40,7 @@ let policy;
 let matchWorkerRoute;
 let productionPortedRouteIds;
 let productionAdminRouteIds;
+let communityModelPerformancePath;
 
 before(async () => {
   vite = await createServer({
@@ -54,6 +55,8 @@ before(async () => {
     POSTGRES_PORTED_WORKER_ROUTE_IDS: productionPortedRouteIds,
     POSTGRES_ADMIN_HOST_ROUTE_IDS: productionAdminRouteIds,
   } = await vite.ssrLoadModule("/src/backend-composition.ts"));
+  ({ ANALYTICS_V2_COMMUNITY_MODEL_PERFORMANCE_PATH: communityModelPerformancePath } = await vite.ssrLoadModule(
+    "/src/analytics-v2/community-model-performance-route.ts"));
 });
 
 after(async () => {
@@ -88,6 +91,14 @@ const DECISION_1_PERFORMANCE = Object.freeze([
   "accountless_telemetry_performance_authorization", "telemetry_performance_capabilities",
   "telemetry_performance_reports",
 ]);
+/**
+ * The two owner-decided routes of 2026-10-10 (decision 7 and GATE-Q 5: the
+ * public read, in the performance class; GATE-Q 4: the admin view, in the
+ * admin class), listed independently of the table.
+ */
+const OWNER_DECIDED_2026_10_10 = Object.freeze(["admin_performance_intake", "community_model_performance"]);
+/** The d43c8f92 parity basis before the owner-decided routes. */
+const D43C8F92_POLICY_SHA256 = "905a5496ff777802f05b0d6ef569d73face0a4e160be4f6dd308c26356d1943f";
 /** The smallest ported set the registry accepts: scope and performance. */
 const REQUIRED = Object.freeze([...POSTGRES_SCOPE_ROUTE_IDS, ...PERFORMANCE_ROUTE_IDS]);
 const EFFECTIVE_PAGE_PATH = "/api/v1/me/telemetry-v12/effective-page";
@@ -133,13 +144,24 @@ function policySha256(routePolicy) {
 // ---------------------------------------------------------------------------
 // The pinned table
 
-test("the table is the d43c8f92 policy: 51 routes in Worker order, one class each", () => {
-  assert.equal(policy.length, 51);
+test("the table is the d43c8f92 policy plus two owner-decided routes: 53 routes in Worker order, one class each", () => {
+  assert.equal(policy.length, 53);
   assert.equal(PRODUCTION_ROUTE_PARITY_BASIS.commit, "d43c8f92");
-  assert.equal(PRODUCTION_ROUTE_PARITY_BASIS.routeCount, 51);
+  assert.deepEqual(Object.keys(PRODUCTION_ROUTE_PARITY_BASIS), ["commit", "ownerDecidedRouteIds", "routeCount",
+    "policySha256"]);
+  assert.deepEqual([...PRODUCTION_ROUTE_PARITY_BASIS.ownerDecidedRouteIds], [...OWNER_DECIDED_2026_10_10]);
+  assert.ok(Object.isFrozen(PRODUCTION_ROUTE_PARITY_BASIS.ownerDecidedRouteIds));
+  assert.equal(PRODUCTION_ROUTE_PARITY_BASIS.routeCount, 53);
   assert.equal(policySha256(policy), PRODUCTION_ROUTE_PARITY_BASIS.policySha256,
     "src/route-registry.ts changed: re-derive the table from the new parity basis (OD-CR-9)");
-  assert.equal(PRODUCTION_ROUTE_TABLE.length, 51);
+  // Without the owner-decided routes the policy is still d43c8f92's, byte for byte and in order.
+  const d43c8f92 = policy.filter((route) => !OWNER_DECIDED_2026_10_10.includes(route.id));
+  assert.equal(d43c8f92.length, 51);
+  assert.equal(policySha256(d43c8f92), D43C8F92_POLICY_SHA256);
+  assert.deepEqual(OWNER_DECIDED_2026_10_10.map((id) => policy.findIndex((route) => route.id === id)), [24, 52]);
+  assert.equal(policy[23].id, "admin_action");
+  assert.equal(policy[51].id, "community_daily");
+  assert.equal(PRODUCTION_ROUTE_TABLE.length, 53);
   PRODUCTION_ROUTE_TABLE.forEach((route, index) => {
     assert.equal(route.workerOrder, index + 1);
     assert.equal(route.id, policy[index].id);
@@ -151,8 +173,8 @@ test("the table is the d43c8f92 policy: 51 routes in Worker order, one class eac
   const count = (routeClass) => PRODUCTION_ROUTE_TABLE.filter((route) => route.routeClass === routeClass).length;
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.SCOPE), 21);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.OD_CR_1), 9);
-  assert.equal(count(PRODUCTION_ROUTE_CLASSES.ADMIN), 6);
-  assert.equal(count(PRODUCTION_ROUTE_CLASSES.PERFORMANCE), 3);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.ADMIN), 7);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.PERFORMANCE), 4);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.RETIRED), 10);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.ROOT), 2);
   // Every round-12 question is answered: no route is left undecided, and
@@ -168,12 +190,12 @@ test("the class lists match the brief and the production ported list", () => {
   assert.deepEqual([...ORIGIN_ROOT_ROUTE_IDS], ["apple_domain_association", "sparkle_appcast_guard"]);
   const all = new Set([...POSTGRES_SCOPE_ROUTE_IDS, ...OD_CR_1_CONTESTED_ROUTE_IDS,
     ...ADMIN_HOST_ROUTE_IDS, ...PERFORMANCE_ROUTE_IDS, ...RETIRED_ROUTE_IDS, ...ORIGIN_ROOT_ROUTE_IDS]);
-  assert.equal(all.size, 51, "the six classes are disjoint and cover the policy");
+  assert.equal(all.size, 53, "the six classes are disjoint and cover the policy");
   // The production list (src/backend-composition.ts, OD-CR-1: all nine;
-  // decision 1: the performance intake) is scope, the contested routes and
-  // performance, in Worker order; the edge-test and loopback origins serve
-  // exactly this list too.
-  assert.equal(productionPortedRouteIds.length, 33);
+  // decision 1: the performance intake; decision 7: the public model-performance
+  // read) is scope, the contested routes and performance, in Worker order;
+  // the edge-test and loopback origins serve exactly this list too.
+  assert.equal(productionPortedRouteIds.length, 34);
   assert.deepEqual([...productionPortedRouteIds],
     policy.map((route) => route.id).filter((id) => POSTGRES_SCOPE_ROUTE_IDS.includes(id)
       || OD_CR_1_CONTESTED_ROUTE_IDS.includes(id) || PERFORMANCE_ROUTE_IDS.includes(id)));
@@ -181,9 +203,11 @@ test("the class lists match the brief and the production ported list", () => {
   const admin = policy.filter((route) => route.authority === "admin").map((route) => route.id);
   assert.deepEqual([...ADMIN_HOST_ROUTE_IDS], admin);
   assert.deepEqual([...productionAdminRouteIds], admin);
-  // Round 12's standing retirements and decision 1's performance class, exactly.
+  assert.ok(ADMIN_HOST_ROUTE_IDS.includes("admin_performance_intake"));
+  // Round 12's standing retirements and the performance class (decision 1's
+  // intake and the public read), exactly.
   assert.deepEqual([...RETIRED_ROUTE_IDS].sort(), [...ROUND_12_RETIRED].sort());
-  assert.deepEqual([...PERFORMANCE_ROUTE_IDS], [...DECISION_1_PERFORMANCE]);
+  assert.deepEqual([...PERFORMANCE_ROUTE_IDS], [...DECISION_1_PERFORMANCE, "community_model_performance"]);
   assert.ok(Object.isFrozen(PERFORMANCE_ROUTE_IDS));
   // Round 12 keeps credential renew, disconnect and every OD-CR-1 session-authority port.
   for (const id of ["device_credential_renew", "device_disconnect", "session", "logout", "device_pairing",
@@ -193,15 +217,22 @@ test("the class lists match the brief and the production ported list", () => {
   }
 });
 
-test("decision 1: the performance class is the performance family's three routes, consent stays retired", () => {
-  // The registry class and the family (routes/performance-telemetry.mjs)
-  // name the same ids and pathnames, and each pathname is the policy's.
-  assert.deepEqual([...PERFORMANCE_TELEMETRY_ROUTE_IDS], [...PERFORMANCE_ROUTE_IDS]);
-  for (const id of PERFORMANCE_ROUTE_IDS) {
+test("the performance class is the family's three routes and the public read; consent stays retired", () => {
+  // The registry class is the performance family's (routes/performance-
+  // telemetry.mjs) ids and pathnames plus the public read, whose pathname is
+  // the analytics-v2 route's; each pathname is the policy's.
+  assert.deepEqual([...PERFORMANCE_TELEMETRY_ROUTE_IDS],
+    PERFORMANCE_ROUTE_IDS.filter((id) => id !== "community_model_performance"));
+  for (const id of PERFORMANCE_TELEMETRY_ROUTE_IDS) {
     const route = policy.find((entry) => entry.id === id);
     assert.equal(PERFORMANCE_TELEMETRY_PATHNAMES[id], route.pathname, id);
     assert.equal(matchWorkerRoute(route.pathname).id, id, id);
   }
+  const read = policy.find((entry) => entry.id === "community_model_performance");
+  assert.equal(read.pathname, communityModelPerformancePath);
+  assert.deepEqual([...read.methods], ["GET"]);
+  assert.equal(read.authority, "public");
+  assert.equal(matchWorkerRoute(communityModelPerformancePath).id, "community_model_performance");
   // The signed-in consent route is not the family's and stays retired.
   assert.ok(RETIRED_ROUTE_IDS.includes("telemetry_performance_consent"));
   assert.equal(Object.hasOwn(PERFORMANCE_TELEMETRY_PATHNAMES, "telemetry_performance_consent"), false);
@@ -245,7 +276,7 @@ function assertCoverage(registry, portedIds) {
   assert.deepEqual([...registry.unportedRouteIds], expectedUnported, "sorted");
   assert.deepEqual(Object.keys(registry), ["routePolicy", "parityBasis", "portedRouteIds", "portedPathnames",
     "unportedRouteIds", "rootRouteIds", "coverage", "resolve"], "ported, unported and root only");
-  assert.equal(registry.portedRouteIds.length + registry.unportedRouteIds.length + registry.rootRouteIds.length, 51);
+  assert.equal(registry.portedRouteIds.length + registry.unportedRouteIds.length + registry.rootRouteIds.length, 53);
   for (const route of policy) {
     const resolved = registry.resolve(route.id);
     assert.ok(Object.isFrozen(resolved));
@@ -263,30 +294,31 @@ function assertCoverage(registry, portedIds) {
   }
 }
 
-test("scope and performance only (OD-CR-1 answers none): 24 ported, 25 unported, 2 root", () => {
+test("scope and performance only (OD-CR-1 answers none): 25 ported, 26 unported, 2 root", () => {
   const registry = build();
   assertCoverage(registry, REQUIRED);
-  assert.equal(registry.portedRouteIds.length, 24);
-  assert.equal(registry.unportedRouteIds.length, 25);
+  assert.equal(registry.portedRouteIds.length, 25);
+  assert.equal(registry.unportedRouteIds.length, 26);
   for (const id of OD_CR_1_CONTESTED_ROUTE_IDS) {
     assert.equal(registry.resolve(id).disposition, "unported", id);
   }
   for (const id of PERFORMANCE_ROUTE_IDS) assert.equal(registry.resolve(id).disposition, "ported", id);
 });
 
-test("the production list (scope 21, contested 9, performance 3): 33 ported, 16 unported, 2 root", () => {
+test("the production list (scope 21, contested 9, performance 4): 34 ported, 17 unported, 2 root", () => {
   const registry = build({ portedRouteIds: productionPortedRouteIds });
   assertCoverage(registry, productionPortedRouteIds);
-  assert.equal(registry.portedRouteIds.length, 33);
+  assert.equal(registry.portedRouteIds.length, 34);
   assert.deepEqual([...registry.unportedRouteIds],
     [...ADMIN_HOST_ROUTE_IDS, ...RETIRED_ROUTE_IDS].sort());
 });
 
-test("an open admin host (round 12) adds the six admin routes: 39 ported, 10 retired, 2 root", () => {
+test("an open admin host (round 12) adds the seven admin routes: 41 ported, 10 retired, 2 root", () => {
   const ported = [...productionPortedRouteIds, ...ADMIN_HOST_ROUTE_IDS];
   const registry = build({ portedRouteIds: ported });
   assertCoverage(registry, ported);
-  assert.equal(registry.portedRouteIds.length, 39);
+  assert.equal(registry.portedRouteIds.length, 41);
+  assert.equal(registry.resolve("admin_performance_intake").handler.routeId, "admin_performance_intake");
   assert.deepEqual([...registry.unportedRouteIds], [...RETIRED_ROUTE_IDS].sort());
   const grant = registry.resolve("accountless_telemetry_performance_authorization");
   assert.deepEqual([grant.disposition, grant.handler.routeId],
@@ -324,12 +356,15 @@ test("only issued registries are registries", () => {
 // ---------------------------------------------------------------------------
 // Closed refusals
 
-test("PRODUCTION_ROUTE_COVERAGE_INCOMPLETE: 50 or 52 routes, duplicates, malformed entries", () => {
-  refused(() => build({ routePolicy: policy.slice(0, 50) }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "50 routes");
+test("PRODUCTION_ROUTE_COVERAGE_INCOMPLETE: 52 or 54 routes, duplicates, malformed entries", () => {
+  refused(() => build({ routePolicy: policy.slice(0, 52) }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "52 routes");
+  // d43c8f92's 51 routes without the owner-decided ones are no longer the basis either.
+  refused(() => build({ routePolicy: policy.filter((route) => !OWNER_DECIDED_2026_10_10.includes(route.id)) }),
+    "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "the bare d43c8f92 policy");
   refused(() => build({ routePolicy: policy.slice(1) }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "first route dropped");
   refused(() => build({ routePolicy: [...policy, Object.freeze({
     pathname: "/api/v1/synthetic", id: "synthetic", methods: Object.freeze(["GET"]), authority: "public",
-  })] }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "52 routes");
+  })] }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "54 routes");
   const duplicateId = policy.map((route, index) => index === 4 ? { ...route, id: policy[3].id } : route);
   refused(() => build({ routePolicy: duplicateId }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "duplicate id");
   const duplicatePath = policy.map((route, index) => index === 4 ? { ...route, pathname: policy[3].pathname } : route);
@@ -351,12 +386,16 @@ test("PRODUCTION_ROUTE_COVERAGE_INCOMPLETE: 50 or 52 routes, duplicates, malform
   }
 });
 
-test("PRODUCTION_ROUTE_PARITY_BASIS_DRIFT: 51 routes but not the pinned ones in the pinned order", () => {
+test("PRODUCTION_ROUTE_PARITY_BASIS_DRIFT: 53 routes but not the pinned ones in the pinned order", () => {
   const swapped = [...policy];
   [swapped[1], swapped[2]] = [swapped[2], swapped[1]];
   refused(() => build({ routePolicy: swapped }), "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT", "reordered");
   const renamed = policy.map((route, index) => index === 50 ? { ...route, id: "community_daily_v2" } : route);
   refused(() => build({ routePolicy: renamed }), "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT", "renamed");
+  // The owner-decided routes keep their pinned positions.
+  const moved = [...policy];
+  [moved[51], moved[52]] = [moved[52], moved[51]];
+  refused(() => build({ routePolicy: moved }), "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT", "owner-decided route moved");
 });
 
 test("PRODUCTION_ROUTE_PORTED_SET_INVALID: the ported set is required, a list of distinct ids", () => {

@@ -91,7 +91,7 @@ import {
 } from "../scripts/edge-e2e/google-front-end.mjs";
 import {
   MATRIX_VALUES,
-  PUBLICATION_DISABLED_ROW,
+  PUBLICATION_DISABLED_ROWS,
   SAME_ORIGIN,
   UNKNOWN_DEVICE_BEARER,
   UNKNOWN_UPLOAD_BEARER,
@@ -115,7 +115,7 @@ import {
 } from "../test/helpers/contribution-shipped-client.js";
 import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
 import { liveWriteRows } from "../scripts/edge-live-check.mjs";
-import { PERFORMANCE_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
+import { PERFORMANCE_TELEMETRY_ROUTE_IDS } from "../cloud-run/routes/performance-telemetry.mjs";
 import { goldenSourceIdentity } from "../scripts/gcp-fastpath-seed.mjs";
 import { edgeTestProductionEnv, originSourceEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
 
@@ -888,7 +888,11 @@ test("S1 local: www, assets, unknown API, admin APIs on the apex, Apple, 405s an
   const disabledReference = await createReferenceInstance({ ...f.common, envelope: f.keys,
     overrides: { PUBLIC_ANALYTICS_MODE: "disabled" } });
   disposers.push(() => disabledReference.dispose());
-  await runRow(f, { ...PUBLICATION_DISABLED_ROW, stage: "S1" }, { edge: disabledEdge, reference: disabledReference });
+  // Both public reads (community/daily and the owner-decided model-performance
+  // read of 2026-10-10) answer the pre-gate locally, before any limiter.
+  for (const row of PUBLICATION_DISABLED_ROWS) {
+    await runRow(f, { ...row, stage: "S1" }, { edge: disabledEdge, reference: disabledReference });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -946,12 +950,12 @@ test("S3 forwarded: Worker-comparable refusals match, every forwarded pair is se
   const registry = f.m.registry.WORKER_ROUTE_POLICY;
   for (const row of forwardedRows({ registry })) await runRow(f, { ...row, stage: "S3" });
   for (const row of sweepRows({ registry, servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS,
-    bearerRefusedRouteIds: PERFORMANCE_ROUTE_IDS })) {
+    bearerRefusedRouteIds: PERFORMANCE_TELEMETRY_ROUTE_IDS })) {
     await runRow(f, { ...row, stage: "S3" });
   }
   // Decision 1 (2026-10-10): the restored performance intake without any
   // credential answers the unchanged Worker's 401, never a 5xx first.
-  for (const row of performanceIntakeRows({ registry, routeIds: PERFORMANCE_ROUTE_IDS })) {
+  for (const row of performanceIntakeRows({ registry, routeIds: PERFORMANCE_TELEMETRY_ROUTE_IDS })) {
     await runRow(f, { ...row, stage: "S3" });
   }
   // The verifier reads health and readiness straight through the front end.
@@ -2022,6 +2026,32 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
   }
   await untilLimited(f, byRoute("community_daily"), { ...pair, bound: limits.PUBLIC_READ_RATE_LIMIT + 2,
     limitedCode: "ATTEMPT_LIMIT_REACHED", expectedAllowed: limits.PUBLIC_READ_RATE_LIMIT });
+  await untilLimited(f, byRoute("community_model_performance"), { ...pair, bound: limits.PUBLIC_READ_RATE_LIMIT + 2,
+    limitedCode: "ATTEMPT_LIMIT_REACHED", expectedAllowed: limits.PUBLIC_READ_RATE_LIMIT });
+
+  // A'. Owner decision 2026-10-10: the two public reads share one per-client
+  // budget. From one address in one window, half the budget on community/daily
+  // leaves exactly the other half for community/model-performance.
+  await windowWithRoom(40_000);
+  const sharedIp = nextIp();
+  const half = Math.floor(limits.PUBLIC_READ_RATE_LIMIT / 2);
+  for (let index = 0; index < half; index += 1) {
+    const { edgeAnswer, referenceAnswer } = await pairOnce(f, byRoute("community_daily"), { ...pair, ip: sharedIp });
+    assert.deepEqual(verdictMismatches(edgeAnswer, referenceAnswer), [], `shared daily ${index + 1}`);
+    assert.notEqual(edgeAnswer.status, 429, `shared daily ${index + 1}`);
+  }
+  let sharedAllowed = 0;
+  for (let index = 0; index <= limits.PUBLIC_READ_RATE_LIMIT - half; index += 1) {
+    const { edgeAnswer, referenceAnswer } = await pairOnce(f, byRoute("community_model_performance"),
+      { ...pair, ip: sharedIp });
+    const limited = edgeAnswer.status === 429 || referenceAnswer.status === 429;
+    assert.deepEqual(limited ? workerMismatches(edgeAnswer, referenceAnswer)
+      : verdictMismatches(edgeAnswer, referenceAnswer), [], `shared model-performance ${index + 1}`);
+    if (limited) break;
+    sharedAllowed += 1;
+  }
+  assert.equal(sharedAllowed, limits.PUBLIC_READ_RATE_LIMIT - half, "the two public reads spend one budget");
+  f.rows.push({ stage: "S4", id: "public-read-shared-budget", pairs: half + sharedAllowed + 1 });
 
   // B. Every other attempt-limited route: pairwise equal until the Worker limits.
   for (const row of rows) {

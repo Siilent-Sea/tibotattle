@@ -9,7 +9,7 @@ import { createServer } from "vite";
 // production and staging compose from the CR-3 configuration alone, with
 // the plane's origin-tier limits; the bind address is 0.0.0.0 only for a
 // validated Cloud Run service; refusals happen before any pool and close
-// what opened; the registry ports the production list (plus the six admin
+// what opened; the registry ports the production list (plus the seven admin
 // routes only when the composition root opens the admin host); requests
 // that need no storage (unported routes, the refused or chokepointed admin
 // host, EP-6 refusals) answer through the real EP-6 boundary and the CR-6
@@ -253,11 +253,14 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
     assert.equal(runtime.listenPort, 8080);
     assert.equal(configuration.isProductionConfiguration(runtime.configuration), true);
     // Round 12 (ADMIN-R12): the default composition opens the admin host,
-    // so the six admin routes are ported beside the production list.
+    // so the seven admin routes are ported beside the production list.
     assert.deepEqual([...runtime.registry.portedRouteIds].sort(), [
       ...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS, ...composition.POSTGRES_ADMIN_HOST_ROUTE_IDS].sort());
     assert.deepEqual([...runtime.registry.unportedRouteIds], [...registry.RETIRED_ROUTE_IDS].sort());
-    assert.equal(runtime.registry.portedRouteIds.length, 39, "scope 21, od-cr-1 9, admin 6, performance 3");
+    assert.equal(runtime.registry.portedRouteIds.length, 41, "scope 21, od-cr-1 9, admin 7, performance 4");
+    for (const id of ["community_model_performance", "admin_performance_intake"]) {
+      assert.equal(runtime.registry.resolve(id).disposition, "ported", id);
+    }
     for (const id of registry.PERFORMANCE_ROUTE_IDS) {
       assert.equal(runtime.registry.resolve(id).disposition, "ported", id);
     }
@@ -309,9 +312,18 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
       { hostKind: "admin", headers: { "cf-access-jwt-assertion": "synthetic.access.jwt" } }));
     assert.equal(admin.status, 403);
     assert.equal((await admin.json()).error.code, "ACCESS_REQUIRED");
-    // The six admin ids are 404 on the apex.
+    // The seven admin ids are 404 on the apex.
     const apexAdmin = await runtime.productionDispatch(invokerRequest("/api/v1/admin/overview"));
     assert.equal(apexAdmin.status, 404);
+    const apexIntake = await runtime.productionDispatch(invokerRequest("/api/v1/admin/performance-intake"));
+    assert.equal(apexIntake.status, 404);
+    // The public model-performance read passes the storage gate first: with
+    // no database it is the gate's 503, never a family answer.
+    const read = await runtime.productionDispatch(invokerRequest(
+      "/api/v1/community/model-performance?period=7&speedMode=fast"));
+    assert.equal(read.status, 503);
+    assert.deepEqual(await read.json(), { error: { code: "BACKEND_STORAGE_UNAVAILABLE", requestId: REQUEST_ID } });
+    assert.equal(read.headers.get("cache-control"), "no-store");
     // EP-6 refuses a stranger and a verifier off its read paths: the unmarked 421.
     const stranger = await runtime.productionDispatch(new Request(`${RUN_APP_ORIGIN}/api/health`, {
       headers: { "x-serverless-authorization": token({ email: "stranger@synthetic-project.iam.gserviceaccount.com" }) },
@@ -347,7 +359,7 @@ test("OD-CR-3 'refuse' stays available to a caller that passes it: the admin hos
   }
 });
 
-test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): six more routes, Access before any family", async () => {
+test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): seven more routes, Access before any family", async () => {
   const seams = dependencies();
   const runtime = await host.createPostgresProductionRuntime({
     processEnv: productionEnv(), hostMode: "production",
@@ -363,6 +375,10 @@ test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): six more rout
     const action = await runtime.productionDispatch(invokerRequest("/api/v1/admin/action",
       { method: "POST", hostKind: "admin" }));
     assert.equal(action.status, 403);
+    const intake = await runtime.productionDispatch(invokerRequest("/api/v1/admin/performance-intake",
+      { hostKind: "admin" }));
+    assert.equal(intake.status, 403);
+    assert.equal((await intake.json()).error.code, "ACCESS_REQUIRED");
   } finally {
     for (const pool of runtime.pools) await pool.end();
   }
@@ -525,12 +541,57 @@ test("the composed families register the performance family under its three ids,
     assert.equal(typeof families.handlers.get(id), "function", id);
   }
   assert.equal(families.handlers.get("telemetry_performance_consent"), undefined, "consent stays retired");
+  // The public read is the analytics-v2 route, not the intake family.
+  assert.notEqual(families.handlers.get("community_model_performance"),
+    families.handlers.get("telemetry_performance_reports"));
+  assert.equal(families.dispatchers.communityModelPerformance, families.handlers.get("community_model_performance"));
   assert.deepEqual([...families.dispatchers.performance.pathnames], [
     "/api/v1/accountless/telemetry-performance-authorization",
     "/api/v1/device/telemetry/performance/capabilities",
     "/api/v1/device/telemetry/performance/reports",
   ]);
   assert.equal(Object.hasOwn(families.dispatchers, "retiredPerformanceAuthorization"), false);
+});
+
+test("the composed families serve the public model-performance read through SPD-P4's route", async () => {
+  const storageGate = { async assertCurrent() {}, probe: async () => new Response(null) };
+  const contexts = [];
+  const families = host.composeOriginFamilies({
+    dataPool: { async connect() { throw new Error("offline"); } },
+    primarySchema: "origin_primary",
+    sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
+    admissionEnv: Object.freeze({ PERFORMANCE_TELEMETRY_STORAGE_MODE: "enabled" }),
+    storageGate,
+    dispatchOrigin: "http://127.0.0.1:43017",
+    objectStore: { async head() { return null; }, async put() {}, async delete() {} },
+    envelopePublicJwk: envelopeKeys("key:synthetic").ENVELOPE_PUBLIC_JWK,
+    envelopePrivateJwk: envelopeKeys("key:synthetic").ENVELOPE_PRIVATE_JWK,
+    requestContext: () => undefined,
+    uploadIngress: host.createUploadIngressAuthority(),
+    statusDispatchers: { health: async () => new Response(null), ready: null },
+    routeModuleContext: (request) => {
+      contexts.push(request);
+      return Object.freeze({ requestId: "4f2c8a7e-1b3d-4e5f-9a6b-7c8d9e0f1a2b" });
+    },
+    composeIntake: false,
+  });
+  const handler = families.handlers.get("community_model_performance");
+  assert.equal(typeof handler, "function");
+  // The route's own 405 comes first and reads nothing; the module context
+  // carries the request id into its envelope.
+  const request = new Request("http://127.0.0.1:43017/api/v1/community/model-performance", { method: "POST", body: "{}" });
+  const refused = await handler(request);
+  assert.equal(refused.status, 405);
+  assert.equal(refused.headers.get("allow"), "GET");
+  assert.equal(refused.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await refused.json(), { error: { code: "METHOD_NOT_ALLOWED",
+    requestId: "4f2c8a7e-1b3d-4e5f-9a6b-7c8d9e0f1a2b" } });
+  assert.deepEqual(contexts, [request]);
+  // A GET reaches the publication control read on the pool: offline, it fails closed.
+  const offline = await handler(new Request(
+    "http://127.0.0.1:43017/api/v1/community/model-performance?period=7&speedMode=fast"));
+  assert.equal(offline.status, 503);
+  assert.equal(offline.headers.get("cache-control"), "no-store");
 });
 
 test("composeOriginFamilies refuses an incomplete dependency set", () => {

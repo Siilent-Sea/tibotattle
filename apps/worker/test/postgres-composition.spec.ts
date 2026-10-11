@@ -86,14 +86,17 @@ describe("PostgreSQL migration foundation", () => {
 
   it("names the origin's ported pathnames and keeps the zero-argument call false", () => {
     // OD-CR-1: the 21 scope routes plus all nine contested ones; owner
-    // decision 2026-10-10: the three restored performance intake routes;
-    // OD-CR-2: the six admin routes are admin-host only and the other 10 stay
-    // retired (with the two root routes answered by the origin itself).
-    expect(POSTGRES_PORTED_WORKER_ROUTE_IDS).toHaveLength(33);
+    // decisions 2026-10-10: the three restored performance intake routes and
+    // the public community model-performance read; OD-CR-2: the seven admin
+    // routes (the performance-intake view of 2026-10-10 included) are
+    // admin-host only and the other 10 stay retired (with the two root routes
+    // answered by the origin itself).
+    expect(POSTGRES_PORTED_WORKER_ROUTE_IDS).toHaveLength(34);
     expect(Object.isFrozen(POSTGRES_PORTED_WORKER_ROUTE_IDS)).toBe(true);
     expect(POSTGRES_ADMIN_HOST_ROUTE_IDS).toEqual([
       "admin_overview", "admin_metrics_history", "admin_community_allowance_preview",
       "admin_database_health", "admin_reconstruction_progress", "admin_action",
+      "admin_performance_intake",
     ]);
     const policyOrder = WORKER_ROUTE_POLICY.map((route) => route.id)
       .filter((id) => (POSTGRES_PORTED_WORKER_ROUTE_IDS as readonly string[]).includes(id));
@@ -105,6 +108,7 @@ describe("PostgreSQL migration foundation", () => {
       "/api/v1/accountless/telemetry-performance-authorization",
       "/api/v1/device/telemetry/performance/capabilities",
       "/api/v1/device/telemetry/performance/reports",
+      "/api/v1/community/model-performance",
     ]) {
       expect(isPostgresWorkerRequestPathSupported(pathname)).toBe(true);
     }
@@ -112,6 +116,8 @@ describe("PostgreSQL migration foundation", () => {
       "/api/v1/me/device-telemetry-performance-consents",
       "/api/v1/me/export",
       "/api/v1/admin/overview",
+      "/api/v1/admin/performance-intake",
+      "/api/v1/community/model-performance/",
       "/.well-known/apple-developer-domain-association.txt",
       "/api/v1/me/telemetry-v12/effective-page",
       "/api/v1/enroll",

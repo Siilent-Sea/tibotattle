@@ -93,7 +93,9 @@ const ACCESS_KID = "synthetic-parity-access-key";
 const ALL_METHODS = Object.freeze(["GET", "POST", "DELETE", "PUT", "PATCH", "HEAD"]);
 const ADMIN_IDS: readonly string[] = hostDispatch.ORIGIN_ADMIN_ROUTE_IDS;
 const PERFORMANCE: readonly string[] = productionRegistry.PERFORMANCE_ROUTE_IDS;
-/** The smallest ported set: scope and the restored performance intake (decision 1). */
+/** Decision 1's restored intake: the performance class without the public read. */
+const PERFORMANCE_INTAKE: readonly string[] = PERFORMANCE.filter((id) => id !== "community_model_performance");
+/** The smallest ported set: scope and the performance class (decisions 1 and 7). */
 const SCOPE: readonly string[] = [...productionRegistry.POSTGRES_SCOPE_ROUTE_IDS, ...PERFORMANCE];
 const CONTESTED: readonly string[] = productionRegistry.OD_CR_1_CONTESTED_ROUTE_IDS;
 
@@ -265,10 +267,11 @@ beforeEach(async () => {
 // (A) Pipeline cells
 
 describe("(A) the Worker pipeline before any route handler", () => {
-  it("pins coverage: the registry table is WORKER_ROUTE_POLICY, 51 routes in order", () => {
+  it("pins coverage: the registry table is WORKER_ROUTE_POLICY, 53 routes in order", () => {
     const table: readonly { id: string }[] = productionRegistry.PRODUCTION_ROUTE_TABLE;
     expect(table.map((route) => route.id)).toStrictEqual(WORKER_ROUTE_POLICY.map((route) => route.id));
-    expect(WORKER_ROUTE_POLICY).toHaveLength(51);
+    // d43c8f92's 51 routes plus the two owner-decided routes of 2026-10-10.
+    expect(WORKER_ROUTE_POLICY).toHaveLength(53);
   });
 
   it("apex: www, admin paths and ids, wrong methods, unknown_api and the root routes match", async () => {
@@ -297,7 +300,7 @@ describe("(A) the Worker pipeline before any route handler", () => {
     }
   });
 
-  it("publication disabled: community_daily is the unlogged 503, after the method envelope", async () => {
+  it("publication disabled: both public reads are the unlogged 503, after the method envelope", async () => {
     for (const mode of ["disabled", undefined]) {
       const settings = workerEnv({ PUBLIC_ANALYTICS_MODE: mode });
       const production = origin(settings, "refuse");
@@ -305,9 +308,14 @@ describe("(A) the Worker pipeline before any route handler", () => {
         { origin: PUBLIC_ORIGIN, path: "/api/v1/community/daily", method: "GET" },
         { origin: PUBLIC_ORIGIN, path: "/api/v1/community/daily?date=2026-10-01", method: "GET" },
         { origin: PUBLIC_ORIGIN, path: "/api/v1/community/daily", method: "POST" },
+        { origin: PUBLIC_ORIGIN, path: "/api/v1/community/model-performance", method: "GET" },
+        { origin: PUBLIC_ORIGIN, path: "/api/v1/community/model-performance?period=7&speedMode=fast", method: "GET" },
+        { origin: PUBLIC_ORIGIN, path: "/api/v1/community/model-performance", method: "POST" },
       ], settings, production);
       expect(seen.map((cell) => [cell.status, cell.code])).toStrictEqual([
+        [503, "PUBLICATION_DISABLED"], [503, "PUBLICATION_DISABLED"], [405, "METHOD_NOT_ALLOWED"],
         [503, "PUBLICATION_DISABLED"], [503, "PUBLICATION_DISABLED"], [405, "METHOD_NOT_ALLOWED"]]);
+      expect(production.calls).toStrictEqual([]);
     }
   });
 
@@ -629,11 +637,11 @@ describe("(F) documented deviations from the Worker", () => {
 
   it("decision 1: the restored performance intake reaches its family, never the unported 503", async () => {
     expect([...PERFORMANCE]).toStrictEqual(["accountless_telemetry_performance_authorization",
-      "telemetry_performance_capabilities", "telemetry_performance_reports"]);
+      "telemetry_performance_capabilities", "telemetry_performance_reports", "community_model_performance"]);
     for (const retryAfterSeconds of [60, null] as const) {
       const production = origin(workerEnv(), "refuse", undefined, retryAfterSeconds);
       const sent: string[] = [];
-      for (const id of PERFORMANCE) {
+      for (const id of PERFORMANCE_INTAKE) {
         expect(production.registry.resolve(id).disposition, id).toBe("ported");
         expect(production.registry.unportedRouteIds, id).not.toContain(id);
         const route = WORKER_ROUTE_POLICY.find((entry) => entry.id === id)!;
@@ -651,6 +659,19 @@ describe("(F) documented deviations from the Worker", () => {
       expect(production.registry.resolve("telemetry_performance_consent").disposition).toBe("unported");
     }
   });
+
+  it("decision 7: the public model-performance read reaches its route, and its 200 keeps its own cache policy",
+    async () => {
+      const production = origin(workerEnv(), "refuse");
+      expect(production.registry.resolve("community_model_performance").disposition).toBe("ported");
+      const path = `${PUBLIC_ORIGIN}/api/v1/community/model-performance?period=all&speedMode=standard`;
+      const served = await production.handler(new Request(path));
+      expect(served.status).toBe(200);
+      // The route's own answer passes through unmodified, as community_daily's 200 does.
+      expect(served.headers.get("cache-control")).toBeNull();
+      expect(await served.json()).toStrictEqual({ served: "community_model_performance" });
+      expect(production.calls).toStrictEqual(["community_model_performance"]);
+    });
 
   it("assets are a JSON 404 (the edge serves the site); the admin host under 'refuse' is the unported 503", async () => {
     const production = origin(workerEnv(), "refuse");

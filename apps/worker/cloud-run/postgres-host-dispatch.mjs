@@ -23,12 +23,13 @@
  *    its own 405 after the identity check (C-ADMIN root contract). Any other
  *    route, an unported admin id included, continues through the generic
  *    pipeline below.
- * 3. On the public host, the admin surface paths and the six admin route ids
+ * 3. On the public host, the admin surface paths and the seven admin route ids
  *    answer 404 NOT_FOUND.
  * 4. An exact route checks its registry methods: 405 METHOD_NOT_ALLOWED with
  *    Allow set to the methods joined by ', '.
- * 5. community_daily answers 503 PUBLICATION_DISABLED, unlogged, when
- *    PUBLIC_ANALYTICS_MODE is not enabled.
+ * 5. community_daily and community_model_performance (the public reads,
+ *    ORIGIN_PUBLIC_READ_ROUTE_IDS) answer 503 PUBLICATION_DISABLED, unlogged,
+ *    when PUBLIC_ANALYTICS_MODE is not enabled.
  * 6. unknown_api is 404 NOT_FOUND; an asset is the JSON 404 NOT_FOUND of
  *    EP-6's edgeServedAssets (the edge serves the site), rendered here with
  *    this request's id, unlogged as the Worker's asset fetch is.
@@ -40,7 +41,7 @@
  *    restored performance intake included, owner decision 2026-10-10) runs
  *    its family handler inside the request context store with
  *    {requestId, routeId[, adminIdentityKey]}.
- *    community_daily first passes the storage gate, and its 200 passes
+ *    The two public reads first pass the storage gate, and their 200 passes
  *    through unmodified (public, max-age=300); every other response is
  *    no-store.
  *
@@ -124,7 +125,15 @@ export const ORIGIN_UNAVAILABLE_CODES = Object.freeze([
   "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE",
   "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
   "ADMIN_RECONSTRUCTION_PROGRESS_UNAVAILABLE",
+  "ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE",
 ]);
+
+/**
+ * The public reads (handleRequest's PUBLIC_ANALYTICS_MODE pre-gate and cache
+ * passthrough): community_daily and the owner-decided community
+ * model-performance read (2026-10-10).
+ */
+export const ORIGIN_PUBLIC_READ_ROUTE_IDS = Object.freeze(["community_daily", "community_model_performance"]);
 
 /** The Worker's identity flow-control code, logged as request_pending at info. */
 export const ORIGIN_PENDING_CODE = "IDENTITY_RESULT_PENDING";
@@ -135,7 +144,7 @@ export const ORIGIN_UNCLASSIFIED_CODE = "UNCLASSIFIED";
 /** How much of a JSON error response the root reads for its code. */
 export const ORIGIN_ERROR_CODE_READ_BYTES = 8 * 1024;
 
-/** The six admin route ids: the policy's 'admin' authority (handleRequest's list). */
+/** The seven admin route ids: the policy's 'admin' authority (handleRequest's list). */
 export const ORIGIN_ADMIN_ROUTE_IDS = Object.freeze(WORKER_ROUTE_POLICY
   .filter((route) => route.authority === "admin")
   .map((route) => route.id));
@@ -157,6 +166,7 @@ export const ORIGIN_HANDLER_CONFIGURATION_CODES = Object.freeze([
 ]);
 
 const ADMIN_ROUTE_ID_SET = new Set(ORIGIN_ADMIN_ROUTE_IDS);
+const PUBLIC_READ_ROUTE_ID_SET = new Set(ORIGIN_PUBLIC_READ_ROUTE_IDS);
 const CONTAINMENT_CODE_SET = new Set(ORIGIN_CONTAINMENT_CODES);
 const UNAVAILABLE_CODE_SET = new Set(ORIGIN_UNAVAILABLE_CODES);
 const LOGGED_METHODS = new Set(["GET", "POST", "DELETE", "HEAD", "PUT", "PATCH", "OPTIONS"]);
@@ -424,7 +434,7 @@ export function createProductionRequestHandler({
       const adminRoute = adminIdentityKey !== null && route.kind === "exact" && ADMIN_ROUTE_ID_SET.has(route.id)
         && registry.resolve(route.id).disposition === ORIGIN_ROUTE_DISPOSITIONS.PORTED;
       if (route.kind === "exact" && !adminRoute) assertRouteMethod(request, route);
-      if (route.id === "community_daily" && !publicAnalyticsEnabled(env)) {
+      if (PUBLIC_READ_ROUTE_ID_SET.has(route.id) && !publicAnalyticsEnabled(env)) {
         return noStore(errorResponse(new ApiError(503, "PUBLICATION_DISABLED"), requestId));
       }
       if (route.kind === "unknown_api") throw new ApiError(404, "NOT_FOUND");
@@ -432,14 +442,14 @@ export function createProductionRequestHandler({
       const resolved = registry.resolve(route.id);
       if (resolved.disposition === ORIGIN_ROUTE_DISPOSITIONS.ROOT) throw new ApiError(404, "NOT_FOUND");
       if (resolved.disposition !== ORIGIN_ROUTE_DISPOSITIONS.PORTED) throw routeNotPorted(retryAfterSeconds);
-      if (route.id === "community_daily") await assertStorageCurrent(storageGate);
+      if (PUBLIC_READ_ROUTE_ID_SET.has(route.id)) await assertStorageCurrent(storageGate);
       const context = adminRoute
         ? { requestId, routeId: route.id, adminIdentityKey }
         : { requestId, routeId: route.id };
       const response = await requestContextStore.dispatch(request, context, resolved.handler);
       if (!(response instanceof Response)) throw new TypeError("ORIGIN_FAMILY_RESPONSE_INVALID");
       await reportFamilyResponse(response, route.id, requestId, request.method, route.routeClass);
-      return route.id === "community_daily" && response.status === 200 ? response : noStore(response);
+      return PUBLIC_READ_ROUTE_ID_SET.has(route.id) && response.status === 200 ? response : noStore(response);
     } catch (error) {
       const apiError = error instanceof ApiError ? error : new ApiError(500, "INTERNAL_ERROR");
       await report(classifyOriginOutcome(apiError.code, apiError.status), requestId, request.method,

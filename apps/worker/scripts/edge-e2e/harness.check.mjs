@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { bundleExportNames, readCompatibility, wranglerEnvironment } from "./edge-bundle.mjs";
 import { PERFORMANCE_ROUTE_IDS, RETIRED_ROUTE_IDS } from "../../cloud-run/postgres-production-registry.mjs";
+import { PERFORMANCE_TELEMETRY_ROUTE_IDS } from "../../cloud-run/routes/performance-telemetry.mjs";
 import {
   EDGE_E2E_AUDIENCE,
   EDGE_E2E_INVOKER,
@@ -39,9 +40,11 @@ import {
   verifyTokenAssertion,
 } from "./google-front-end.mjs";
 import {
+  ADMIN_API_ROUTE_IDS,
   BEARER_REFUSAL,
   EDGE_LOCAL_ROUTE_IDS,
-  PUBLICATION_DISABLED_ROW,
+  MATRIX_VALUES,
+  PUBLICATION_DISABLED_ROWS,
   UNKNOWN_DEVICE_BEARER,
   adminRows,
   admissionRows,
@@ -175,7 +178,7 @@ test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair an
   const guard = routes.find((route) => route.id === "sparkle_appcast_guard");
   const rows = [
     ...localRows({ registry: routes }),
-    PUBLICATION_DISABLED_ROW,
+    ...PUBLICATION_DISABLED_ROWS,
     ...adminRows(),
     ...forwardedRows({ registry: routes }),
     ...sweepRows({ registry: routes, servedRouteIds: served }),
@@ -192,7 +195,8 @@ test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair an
     }
   }
   // The policy routes the origin does not serve are swept as unported rows.
-  const sweep = sweepRows({ registry: routes, servedRouteIds: served, bearerRefusedRouteIds: PERFORMANCE_ROUTE_IDS });
+  const sweep = sweepRows({ registry: routes, servedRouteIds: served,
+    bearerRefusedRouteIds: PERFORMANCE_TELEMETRY_ROUTE_IDS });
   for (const route of policyRoutes.filter((candidate) => !served.includes(candidate.id))) {
     assert.ok(sweep.some((row) => row.routeId === route.id && row.comparators.includes("unported")), route.id);
   }
@@ -201,15 +205,16 @@ test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair an
   // every served EP-1 route, and its sweep rows (an unknown device bearer)
   // and no-bearer rows compare with the unchanged Worker: BEARER_REFUSAL,
   // never the unported 503 and never a storage or runtime 5xx.
-  assert.deepEqual([...PERFORMANCE_ROUTE_IDS], ["accountless_telemetry_performance_authorization",
+  assert.deepEqual([...PERFORMANCE_TELEMETRY_ROUTE_IDS], ["accountless_telemetry_performance_authorization",
     "telemetry_performance_capabilities", "telemetry_performance_reports"]);
+  assert.deepEqual([...PERFORMANCE_ROUTE_IDS], [...PERFORMANCE_TELEMETRY_ROUTE_IDS, "community_model_performance"]);
   assert.deepEqual({ ...BEARER_REFUSAL }, { status: 401, code: "DEVICE_AUTH_INVALID" });
-  const intake = performanceIntakeRows({ registry: routes, routeIds: PERFORMANCE_ROUTE_IDS });
+  const intake = performanceIntakeRows({ registry: routes, routeIds: PERFORMANCE_TELEMETRY_ROUTE_IDS });
   assert.deepEqual(intake.map((row) => `${row.routeId} ${row.method}`), [
     "accountless_telemetry_performance_authorization POST", "telemetry_performance_capabilities GET",
     "telemetry_performance_reports GET", "telemetry_performance_reports POST",
   ]);
-  for (const id of PERFORMANCE_ROUTE_IDS) {
+  for (const id of PERFORMANCE_TELEMETRY_ROUTE_IDS) {
     assert.ok(served.includes(id), id);
     assert.ok(policyRoutes.some((route) => route.id === id), `${id} is an EP-1 policy route`);
     assert.ok(s4.some((row) => row.routeId === id), `${id} is in S4`);
@@ -227,6 +232,57 @@ test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair an
   }
   assert.throws(() => sweepRows({ registry: routes, servedRouteIds: served, bearerRefusedRouteIds: ["enroll"] }),
     /REQUEST_MATRIX_BEARER_ROUTE_UNSERVED enroll/u);
+  // Owner decisions 2026-10-10: the public model-performance read is a served
+  // EP-1 public read with the valid default slot in S3's sweep and S4, its
+  // strict-query refusals and unpublished 404 compare with the Worker, and its
+  // PUBLICATION_DISABLED rows are local; the admin performance-intake view is
+  // an admin API id with apex-404 rows and Access rows.
+  const read = "community_model_performance";
+  const performancePath = `/api/v1/community/model-performance${MATRIX_VALUES.performanceQuery}`;
+  assert.ok(served.includes(read));
+  assert.equal(policy.edgeAdmissionPolicyFor(read).purpose, "public_aggregate_read");
+  const readS4 = s4.filter((row) => row.routeId === read);
+  assert.deepEqual(readS4.map((row) => [row.method, row.path, row.purpose, row.clientBinding, row.coarseBinding]),
+    [["GET", performancePath, "public_aggregate_read", "PUBLIC_READ_RATE_LIMIT", null]]);
+  const readSweep = sweep.filter((row) => row.routeId === read);
+  assert.deepEqual(readSweep.map((row) => [row.path, [...row.comparators], row.expect]),
+    [[performancePath, ["transparency"], { served: true }]]);
+  const forwarded = forwardedRows({ registry: routes }).filter((row) => row.routeId === read);
+  assert.deepEqual(forwarded.map((row) => [row.id, row.expect.status, row.expect.code]), [
+    ["community-model-performance-unknown-parameter", 400, "BODY_INVALID"],
+    ["community-model-performance-bad-period", 400, "BODY_INVALID"],
+    ["community-model-performance-bad-speed-mode", 400, "BODY_INVALID"],
+    ["community-model-performance-unpublished", 404, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED"],
+  ]);
+  for (const row of forwarded) assert.deepEqual([...row.comparators], ["worker", "transparency"], row.id);
+  assert.deepEqual(PUBLICATION_DISABLED_ROWS.map((row) => [row.routeId, row.expect.code, [...row.comparators]]), [
+    ["community_daily", "PUBLICATION_DISABLED", ["worker", "local"]],
+    [read, "PUBLICATION_DISABLED", ["worker", "local"]],
+    [read, "PUBLICATION_DISABLED", ["worker", "local"]],
+  ]);
+  assert.ok(ADMIN_API_ROUTE_IDS.includes("admin_performance_intake"));
+  assert.deepEqual([...ADMIN_API_ROUTE_IDS].sort(),
+    routes.filter((route) => route.authority === "admin").map((route) => route.id).sort());
+  const local = localRows({ registry: routes });
+  assert.ok(local.some((row) => row.id === "apex-admin_performance_intake-GET"
+    && row.expect.status === 404 && row.comparators.includes("local")));
+  const admin = adminRows();
+  for (const label of ["none", "malformed", "wrong-audience", "wrong-key", "non-owner"]) {
+    for (const path of ["/api/v1/admin/performance-intake", "/api/v1/community/model-performance"]) {
+      assert.ok(admin.some((row) => row.id === `admin-${label}-GET-${path}` && row.expect.status === 403), `${label} ${path}`);
+    }
+  }
+  for (const carrier of ["header", "cookie"]) {
+    for (const id of [`admin-owner-performance-intake-get-${carrier}`, `admin-owner-performance-intake-post-${carrier}`,
+      `admin-owner-model-performance-${carrier}`]) {
+      const row = admin.find((candidate) => candidate.id === id);
+      assert.ok(row !== undefined, id);
+      assert.deepEqual([...row.comparators], ["transparency", "unported"], id);
+      assert.equal(row.expect.forwardedHostKind, "admin", id);
+    }
+  }
+  assert.equal(sweep.some((row) => row.routeId === "admin_performance_intake"), false,
+    "the admin view is never swept on the apex");
   assert.deepEqual([...EDGE_LOCAL_ROUTE_IDS].sort(), ["apple_domain_association", "sparkle_appcast_guard"]);
   // Removing one sweep row is detected.
   const short = routeMethodCoverage({ registry: routes, rows: rows.filter((row) => row.id !== "sweep-envelope_key-GET"

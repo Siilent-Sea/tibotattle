@@ -34,7 +34,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { PERFORMANCE_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
+import { PERFORMANCE_TELEMETRY_ROUTE_IDS } from "../cloud-run/routes/performance-telemetry.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -50,6 +50,7 @@ const AUDIENCE = "https://edge-test-origin.synthetic.example";
 const SESSION_COOKIE = "__Host-usage_monitor_session=synthetic-edge-session";
 const UNRELATED_COOKIE = "theme=dark";
 const DAILY_QUERY = "?from=2026-09-01&to=2026-09-02";
+const PERFORMANCE_QUERY = "?period=7&speedMode=fast";
 const ADMISSION_CODES = Object.freeze([
   "ATTEMPT_LIMIT_REACHED", "UPLOAD_INGRESS_LIMIT_REACHED",
   "ADMISSION_RATE_LIMIT_UNAVAILABLE", "UPLOAD_INGRESS_UNAVAILABLE", "ADMISSION_CONFIGURATION_INVALID",
@@ -422,7 +423,9 @@ function assertAdmissionAnswer(answer, status, code, label) {
 /** A request that reaches route's admission call point when admitted. */
 function reachableRequest(route, method, { hostKind = "apex", admission = null, extra = {} } = {}) {
   const post = method !== "GET" && method !== "HEAD";
-  const path = route.pathname + (route.id === "community_daily" ? DAILY_QUERY : "");
+  const query = route.id === "community_daily" ? DAILY_QUERY
+    : route.id === "community_model_performance" ? PERFORMANCE_QUERY : "";
+  const path = route.pathname + query;
   return {
     method,
     path,
@@ -557,6 +560,7 @@ test("served routes: every production ported pair is served; every other forward
   let servedPairs = 0;
   let unportedPairs = 0;
   let performancePairs = 0;
+  let publicReadPairs = 0;
   const observedServedIds = new Set();
   for (const route of m.registry.WORKER_ROUTE_POLICY) {
     if (EDGE_LOCAL_ROUTE_IDS.has(route.id)) continue;
@@ -564,7 +568,7 @@ test("served routes: every production ported pair is served; every other forward
     const policy = m.policy.edgeAdmissionPolicyFor(route.id);
     const admission = policy === null ? null : `v1;${policy.purpose};allowed`;
     for (const method of route.methods) {
-      // The six admin API ids are edge-local 404s on the apex (E4); every
+      // The seven admin API ids are edge-local 404s on the apex (E4); every
       // other pair reaches the origin on the apex.
       if (!route.id.startsWith("admin_")) {
         const label = `${method} ${route.pathname} (${route.id}) on the apex`;
@@ -576,13 +580,20 @@ test("served routes: every production ported pair is served; every other forward
           assert.ok(!ADMISSION_CODES.includes(errorCode(answer)), `${label}: admitted (${answer.text})`);
           observedServedIds.add(route.id);
           servedPairs += 1;
-          if (PERFORMANCE_ROUTE_IDS.includes(route.id)) {
+          if (PERFORMANCE_TELEMETRY_ROUTE_IDS.includes(route.id)) {
             // Decision 1: the restored performance intake. This allowed
             // request's unknown device bearer is the Worker's 401, never a
             // storage or runtime 5xx first.
             assertApiError(answer, 401, "DEVICE_AUTH_INVALID", label);
             assert.equal(answer.headers["retry-after"], undefined, label);
             performancePairs += 1;
+          }
+          if (route.id === "community_model_performance") {
+            // Decision 7: nothing is published yet, so the valid slot is the
+            // Worker's 404, never a 5xx.
+            assertApiError(answer, 404, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED", label);
+            assert.equal(answer.headers["cache-control"], "no-store", label);
+            publicReadPairs += 1;
           }
         } else {
           assertUnported(m, answer, label, request.headers["x-tibotattle-edge-request-id"]);
@@ -597,9 +608,10 @@ test("served routes: every production ported pair is served; every other forward
     }
   }
   assert.deepEqual([...observedServedIds].sort(), [...served].sort(), "every served id was probed");
-  assert.equal(servedPairs, 36, "33 served ids, three with GET and POST");
+  assert.equal(servedPairs, 37, "34 served ids, three with GET and POST");
   assert.ok(unportedPairs > 0);
   assert.equal(performancePairs, 4, "grant POST, capabilities GET, reports GET and POST");
+  assert.equal(publicReadPairs, 1, "the model-performance GET");
 }));
 
 // ---------------------------------------------------------------------------
@@ -614,7 +626,7 @@ test("replay parity: each served EP-1 policy route answers the Worker helper's 4
   assert.deepEqual(routes.map((route) => route.id).sort(), [
     "accountless_enrollment", "accountless_ownership", "accountless_renewal",
     "accountless_telemetry_performance_authorization",
-    "accountless_telemetry_v12_authorization", "community_daily", "contributions",
+    "accountless_telemetry_v12_authorization", "community_daily", "community_model_performance", "contributions",
     "device_credential_renew", "device_disconnect", "device_sync_capabilities",
     "device_sync_capabilities_v12", "device_sync_manifest", "device_sync_state",
     "telemetry_performance_capabilities", "telemetry_performance_reports",
@@ -671,6 +683,40 @@ test("community/daily: a limited public read is 429 before its parameters are va
   });
   assert.equal(daily.status, 200, daily.text);
   assert.deepEqual(JSON.parse(daily.text).days, []);
+}));
+
+test("community/model-performance: a limited public read is 429 before its slot is validated; unpublished is 404", {
+  skip: SKIP, timeout: 300_000,
+}, () => withOrigin({ edge: true }, async ({ port }) => {
+  const path = "/api/v1/community/model-performance";
+  for (const query of ["?period=14&speedMode=fast", "?unexpected=1", "", PERFORMANCE_QUERY]) {
+    assertAdmissionAnswer(await send(port, {
+      path: `${path}${query}`,
+      headers: edgeHeaders({ admission: "v1;public_aggregate_read;limited" }),
+    }), 429, "ATTEMPT_LIMIT_REACHED", `limited ${query}`);
+  }
+  // Admitted, the same parameters keep the route's own answers.
+  for (const query of ["?period=14&speedMode=fast", "?period=7&speedMode=priority", "?period=7&speedMode=fast&x=1",
+    "?period=7", ""]) {
+    const refused = await send(port, {
+      path: `${path}${query}`,
+      headers: edgeHeaders({ admission: "v1;public_aggregate_read;allowed" }),
+    });
+    assertApiError(refused, 400, "BODY_INVALID", `allowed ${query}`);
+    assert.equal(refused.headers["cache-control"], "no-store", query);
+  }
+  // Every valid slot is the unpublished 404 before the first publication (GATE-Q 12).
+  for (const period of ["1", "7", "30", "all"]) {
+    for (const speedMode of ["standard", "fast", "ultrafast"]) {
+      const answer = await send(port, {
+        path: `${path}?period=${period}&speedMode=${speedMode}`,
+        headers: edgeHeaders({ admission: "v1;public_aggregate_read;allowed" }),
+      });
+      assertApiError(answer, 404, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED", `${period} ${speedMode}`);
+      assert.equal(answer.headers["cache-control"], "no-store", `${period} ${speedMode}`);
+      assertMarked(answer, `${period} ${speedMode}`);
+    }
+  }
 }));
 
 test("contributions: the ingress limiter answers before a byte of the body is read; the preflight comes first", {
