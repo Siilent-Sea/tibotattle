@@ -27,7 +27,9 @@
 // the admin run_maintenance task reports and audits the lifecycle pass's
 // folded purges under the Worker's keys (MAINT-PURGE); and the retired
 // accountless performance authorization answers d43c8f92's sequence (owner
-// round 19) for a really enrolled accountless device, then its definite 403.
+// round 19) for a really enrolled accountless device, then its definite 403,
+// leaving 0079's performance tables present, the runtime staged and the
+// publication heads empty.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
 import { createHash, randomBytes, randomUUID, webcrypto } from "node:crypto";
@@ -519,7 +521,7 @@ function deviceSecretHash(deviceId, secret) {
 
 test("round 19: the performance authorization answers d43c8f92's sequence for a real accountless device, then 403", {
   skip: SKIP, timeout: 300_000,
-}, () => withProductionHost(async ({ base, t, port }) => {
+}, () => withProductionHost(async ({ base, t, port, primarySchema }) => {
   const PATH = "/api/v1/accountless/telemetry-performance-authorization";
   const validBody = JSON.stringify({ schemaVersion: "accountless-performance-owner-v1",
     policyVersion: "accountless-telemetry-performance-policy-v1", authorizationBasis: "accountless-performance-policy-v1" });
@@ -591,11 +593,30 @@ test("round 19: the performance authorization answers d43c8f92's sequence for a 
   await base.query(`UPDATE ${t("device_credentials")} SET state = 'revoked', revoked_at = $2 WHERE id = $1`,
     [deviceId, new Date().toISOString()]);
   assert.deepEqual(await ask(), { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null });
-  // Nothing was granted anywhere: the origin has no performance authorization
-  // table, and no row names this device outside its enrollment graph.
+  // Nothing was granted anywhere. Primary 0079 created the performance intake
+  // tables and publication heads, but the runtime is still staged at its
+  // seeded revision, no grant, capability, report or receipt names this
+  // device, and no publication head exists.
   const performanceTables = await base.query(`SELECT table_name FROM information_schema.tables
-    WHERE table_schema = current_schema() AND table_name LIKE '%performance%'`);
-  assert.deepEqual(performanceTables.rows, []);
+    WHERE table_schema = $1 AND table_name LIKE '%performance%'`, [primarySchema]);
+  assert.deepEqual(performanceTables.rows.map((row) => row.table_name).sort(), [
+    "accountless_telemetry_performance_authorizations",
+    "analytics_v2_published_performance",
+    "telemetry_performance_buckets",
+    "telemetry_performance_cohorts",
+    "telemetry_performance_device_capabilities",
+    "telemetry_performance_field_dictionaries",
+    "telemetry_performance_receipts",
+    "telemetry_performance_refusal_counts",
+    "telemetry_performance_reports",
+    "telemetry_performance_runtime",
+  ]);
+  assert.deepEqual((await base.query(`SELECT state, policy_revision FROM ${t("telemetry_performance_runtime")}`)).rows,
+    [{ state: "staged", policy_revision: 1 }]);
+  for (const table of ["accountless_telemetry_performance_authorizations", "telemetry_performance_device_capabilities",
+    "telemetry_performance_reports", "telemetry_performance_receipts", "analytics_v2_published_performance"]) {
+    assert.equal((await base.query(`SELECT count(*)::int AS n FROM ${t(table)}`)).rows[0].n, 0, table);
+  }
 }));
 
 test("contributions take an ingress lease and release it on a refused body", {

@@ -109,5 +109,6 @@ export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
     ["0076_classification_correction_links.sql", "1abacf93fbda4b76d5044f3ecaab5c53e7942ce82b679534ed7120a8ae4188b3"],
     ["0077_analytics_v2_reprice.sql", "b74ef463ed18174912ceaec48347ceb87f1ae97c7020ac052046bef179add8b7"],
     ["0078_classification_link_lookup_indexes.sql", "e42c24f99b027ef1f313a685a5212ec4b2a0243cc61204877d6de5a68f06054e"],
+    ["0079_performance_telemetry.sql", "4b321c4068d674dabc5717a03557f653a560d7430141c7aa3862ae44258772ff"],
   ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
 });
