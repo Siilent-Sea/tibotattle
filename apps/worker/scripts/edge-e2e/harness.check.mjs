@@ -279,6 +279,10 @@ test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair an
       assert.ok(row !== undefined, id);
       assert.deepEqual([...row.comparators], ["transparency", "unported"], id);
       assert.equal(row.expect.forwardedHostKind, "admin", id);
+      // The forwarded-assertion rows also prove the admin host forwards the cookie.
+      if (row.expect.forwardsAccessAssertion !== undefined) {
+        assert.equal(row.headers.cookie, MATRIX_VALUES.unrelatedCookie, id);
+      }
     }
   }
   assert.equal(sweep.some((row) => row.routeId === "admin_performance_intake"), false,
