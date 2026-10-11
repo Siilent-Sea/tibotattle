@@ -97,9 +97,9 @@ import {
   UNKNOWN_UPLOAD_BEARER,
   adminRows,
   admissionRows,
-  definiteSweepAnswers,
   forwardedRows,
   localRows,
+  performanceIntakeRows,
   sweepRows,
 } from "../scripts/edge-e2e/request-matrix.mjs";
 import { runTelemetryV11Sync } from "../test/helpers/contribution-v11-runner.js";
@@ -115,7 +115,7 @@ import {
 } from "../test/helpers/contribution-shipped-client.js";
 import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
 import { liveWriteRows } from "../scripts/edge-live-check.mjs";
-import { RETIRED_DEFINITE_PREAMBLE_STEPS } from "../cloud-run/postgres-production-registry.mjs";
+import { PERFORMANCE_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
 import { goldenSourceIdentity } from "../scripts/gcp-fastpath-seed.mjs";
 import { edgeTestProductionEnv, originSourceEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
 
@@ -520,20 +520,6 @@ function assertUnported(answer, label) {
   assert.equal(answer.header("cache-control"), "no-store", label);
 }
 
-/**
- * A retired-definite route's answer through the edge (round 12; round 19
- * runs production's earlier answers first): the expected step's status and
- * code in the Worker envelope, no-store, and no retry-after, never the
- * unported 503.
- */
-function assertDefinite(answer, expect, label) {
-  assert.equal(answer.status, expect.status, `${label}: ${answer.text}`);
-  assert.deepEqual(errorEnvelope(answer), { keys: ["error"], errorKeys: ["code", "requestId"], code: expect.code },
-    label);
-  assert.equal(answer.header("retry-after"), null, `${label}: no retry-after`);
-  assert.equal(answer.header("cache-control"), "no-store", label);
-}
-
 function errorEnvelope(answer) {
   const value = answer.json();
   if (value === null || typeof value !== "object" || value.error === null || typeof value.error !== "object") {
@@ -723,7 +709,6 @@ async function runRow(f, row, { edge = f.edge, reference = f.reference, ip = nex
     assert.deepEqual(transparencyMismatches(f, edgeAnswer, exchanges[0]), [], `${row.id}: transparency`);
   }
   if (row.comparators.includes("unported")) assertUnported(edgeAnswer, row.id);
-  if (row.comparators.includes("definite")) assertDefinite(edgeAnswer, row.expect, row.id);
   const expect = row.expect ?? {};
   if (expect.status !== undefined) assert.equal(edgeAnswer.status, expect.status, `${row.id}: ${edgeAnswer.text.slice(0, 300)}`);
   if (expect.code !== undefined) assert.equal(errorEnvelope(edgeAnswer)?.code, expect.code, row.id);
@@ -961,7 +946,12 @@ test("S3 forwarded: Worker-comparable refusals match, every forwarded pair is se
   const registry = f.m.registry.WORKER_ROUTE_POLICY;
   for (const row of forwardedRows({ registry })) await runRow(f, { ...row, stage: "S3" });
   for (const row of sweepRows({ registry, servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS,
-    definiteAnswers: definiteSweepAnswers(RETIRED_DEFINITE_PREAMBLE_STEPS) })) {
+    bearerRefusedRouteIds: PERFORMANCE_ROUTE_IDS })) {
+    await runRow(f, { ...row, stage: "S3" });
+  }
+  // Decision 1 (2026-10-10): the restored performance intake without any
+  // credential answers the unchanged Worker's 401, never a 5xx first.
+  for (const row of performanceIntakeRows({ registry, routeIds: PERFORMANCE_ROUTE_IDS })) {
     await runRow(f, { ...row, stage: "S3" });
   }
   // The verifier reads health and readiness straight through the front end.
@@ -1326,6 +1316,42 @@ test("S5 v1.1: a shipped social client and a shipped accountless client sync thr
   assert.ok(laboratory.state.originRewrites >= 2, "only the capability answers' destinationOrigin was mapped");
   assert.deepEqual(await v11Counts(f, device.participantId),
     { chunks: accountlessFirst.chunksUploaded, records: q1b.recordCount, domains: 1, head: 1 });
+});
+
+test("S5 performance: an accountless device enrolled through the edge is refused 403 while the runtime is staged", {
+  skip: SKIP, timeout: LONG,
+}, async () => {
+  const f = await fixture();
+  const log = [];
+  const fetchImpl = edgeClientFetch(f, { log });
+  const device = await accountlessEnroll(f, fetchImpl, EDGE_E2E_PUBLIC_ORIGIN);
+  // Decision 1 (2026-10-10), before the owner's activation (decision 2): the
+  // grant and the capability read pass every earlier step for a real
+  // accountless device and answer 403 TELEMETRY_TRANSPORT_BLOCKED through the
+  // edge, marked and no-store, never a storage or runtime 5xx.
+  const grant = await post(fetchImpl, EDGE_E2E_PUBLIC_ORIGIN, "/api/v1/accountless/telemetry-performance-authorization", {
+    schemaVersion: "accountless-performance-owner-v1",
+    policyVersion: "accountless-telemetry-performance-policy-v1",
+    authorizationBasis: "accountless-performance-policy-v1",
+  }, { authorization: device.deviceAuthorization });
+  const capabilities = await fetchImpl(new URL("/api/v1/device/telemetry/performance/capabilities",
+    EDGE_E2E_PUBLIC_ORIGIN), { headers: { authorization: device.deviceAuthorization } });
+  for (const [label, answer] of [["grant", grant], ["capabilities", capabilities]]) {
+    assert.equal(answer.status, 403, `${label}: ${await answer.clone().text()}`);
+    assert.equal((await answer.json()).error.code, "TELEMETRY_TRANSPORT_BLOCKED", label);
+    assert.equal(answer.headers.get("cache-control"), "no-store", label);
+    assert.equal(answer.headers.get("retry-after"), null, label);
+  }
+  for (const path of ["/api/v1/accountless/telemetry-performance-authorization",
+    "/api/v1/device/telemetry/performance/capabilities"]) {
+    assert.ok(log.some((entry) => entry.path === path && entry.status === 403), `${path} went through the edge`);
+  }
+  assert.deepEqual((await f.base.query(`SELECT state FROM ${f.t("telemetry_performance_runtime")}`)).rows,
+    [{ state: "staged" }]);
+  assert.equal((await f.base.query(`SELECT count(*)::int AS n
+      FROM ${f.t("accountless_telemetry_performance_authorizations")} WHERE participant_id = $1`,
+  [device.participantId])).rows[0].n, 0);
+  f.rows.push({ stage: "S5", id: "performance-staged", answers: 2 });
 });
 
 test("S5 v1.2: a shipped social client and a shipped accountless client sync through the edge and re-run idempotently", {

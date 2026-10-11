@@ -36,15 +36,9 @@
  *    method was enforced in step 4); unported routes (every route owner
  *    round 12 retired, and an admin route the root did not port) answer
  *    503 POSTGRES_ROUTE_NOT_PORTED, with the injected OD-CR-6(iv)
- *    retry-after or none, and never reach a family; a retired-definite
- *    route (the accountless performance authorization) runs its preamble
- *    inside the request context store with {requestId, routeId}: the
- *    preamble's error answer (production's earlier codes, owner round 19)
- *    is logged as a family's and returned, and when it answers null the
- *    registry's terminal answer (403 TELEMETRY_TRANSPORT_BLOCKED, as
- *    production answers it) is thrown with no retry-after. Nothing is ever
- *    granted. A ported route runs its
- *    family handler inside the request context store with
+ *    retry-after or none, and never reach a family. A ported route (the
+ *    restored performance intake included, owner decision 2026-10-10) runs
+ *    its family handler inside the request context store with
  *    {requestId, routeId[, adminIdentityKey]}.
  *    community_daily first passes the storage gate, and its 200 passes
  *    through unmodified (public, max-age=300); every other response is
@@ -437,20 +431,6 @@ export function createProductionRequestHandler({
       if (route.kind === "asset") return noStore(errorResponse(new ApiError(404, "NOT_FOUND"), requestId));
       const resolved = registry.resolve(route.id);
       if (resolved.disposition === ORIGIN_ROUTE_DISPOSITIONS.ROOT) throw new ApiError(404, "NOT_FOUND");
-      if (resolved.disposition === ORIGIN_ROUTE_DISPOSITIONS.DEFINITE) {
-        // Round 19: production's earlier answers first, then the terminal one.
-        const refusal = await requestContextStore.dispatch(request, { requestId, routeId: route.id },
-          resolved.handler);
-        if (refusal !== null) {
-          // A preamble only refuses: anything but an error answer is a defect.
-          if (!(refusal instanceof Response) || refusal.status < 400) {
-            throw new TypeError("ORIGIN_DEFINITE_PREAMBLE_RESPONSE_INVALID");
-          }
-          await reportFamilyResponse(refusal, route.id, requestId, request.method, route.routeClass);
-          return noStore(refusal);
-        }
-        throw new ApiError(resolved.answer.status, resolved.answer.code);
-      }
       if (resolved.disposition !== ORIGIN_ROUTE_DISPOSITIONS.PORTED) throw routeNotPorted(retryAfterSeconds);
       if (route.id === "community_daily") await assertStorageCurrent(storageGate);
       const context = adminRoute

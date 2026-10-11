@@ -81,18 +81,18 @@ export function createPostgresWorkerBackend(
 
 /**
  * The WORKER_ROUTE_POLICY ids the Cloud Run origin serves on the public host
- * (CR-6/CR-7, D-CRB): the 21 routes of the wave-3 host scope plus all nine
+ * (CR-6/CR-7, D-CRB): the 21 routes of the wave-3 host scope, all nine
  * contested routes (owner decision OD-CR-1, 2026-10-02: session, logout,
  * devices, revocation, pairing, pairing claim, v1.2 consent, disconnect and
- * credential renew), in policy order. The six admin console routes are
- * served only on the admin host, behind the Access chokepoint
- * (POSTGRES_ADMIN_HOST_ROUTE_IDS). Every other route is retired at the
- * switch by owner round 12 (2026-10-02): legacy enroll, Google and Apple
- * sign-in, security reset, participant export and the three performance
- * device and consent routes answer 503 POSTGRES_ROUTE_NOT_PORTED, and the
- * accountless performance authorization answers production's definite
- * 403 TELEMETRY_TRANSPORT_BLOCKED; the two root routes are answered by the
- * origin itself. The Worker's own D1
+ * credential renew) and the three restored performance intake routes (owner
+ * decision 2026-10-10, decision 1: the accountless performance
+ * authorization, capabilities and reports), in policy order. The six admin
+ * console routes are served only on the admin host, behind the Access
+ * chokepoint (POSTGRES_ADMIN_HOST_ROUTE_IDS). Every other route is retired at
+ * the switch by owner round 12 (2026-10-02): legacy enroll, Google and Apple
+ * sign-in, security reset, participant export and the signed-in performance
+ * consent route answer 503 POSTGRES_ROUTE_NOT_PORTED; the two root routes are
+ * answered by the origin itself. The Worker's own D1
  * handler never serves the PostgreSQL backend: the cloud-run registry
  * (postgres-production-registry.mjs) validates this list against its pinned
  * route classes.
@@ -103,6 +103,7 @@ export const POSTGRES_PORTED_WORKER_ROUTE_IDS = Object.freeze([
   "accountless_enrollment",
   "accountless_ownership",
   "accountless_telemetry_v12_authorization",
+  "accountless_telemetry_performance_authorization",
   "accountless_renewal",
   "session",
   "logout",
@@ -114,6 +115,8 @@ export const POSTGRES_PORTED_WORKER_ROUTE_IDS = Object.freeze([
   "device_sync_state",
   "device_sync_capabilities",
   "device_sync_capabilities_v12",
+  "telemetry_performance_capabilities",
+  "telemetry_performance_reports",
   "telemetry_v11_consent",
   "telemetry_v12_consent",
   "telemetry_v11_day_manifests",

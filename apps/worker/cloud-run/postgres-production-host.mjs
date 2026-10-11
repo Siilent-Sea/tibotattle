@@ -32,7 +32,10 @@
  * createPostgresAdminAccessChokepoint once over the env, registers C-ADMIN's
  * six routes (no analytics pool while analytics_v2 lives in primary,
  * migration 0059) and injects C-MAINT's lifecycle pass as their
- * run_maintenance task. No overview source is injected: the synthetic
+ * run_maintenance task, with SPD-G5's owner-only performance runtime
+ * activation as its telemetryRuntimeActivation task (owner decision
+ * 2026-10-10, decision 2; GATE-Q 23: no UI control). No overview source is
+ * injected: the synthetic
  * contribution counts, historical publication and deletion-ledger blocks
  * answer their explicit unavailable state ('admin-overview-v0.6'), and the
  * database health reports the removed ledger not_applicable
@@ -84,10 +87,18 @@ import {
 } from "../src/accountless-ownership.ts";
 import { parseTelemetryV12AccountlessAuthorizationJson } from "../src/telemetry-transport-policy.ts";
 import {
-  ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
-  ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
-  ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
-} from "../src/telemetry-performance-policy.ts";
+  assertPostgresTelemetryPerformanceStorage,
+  grantPostgresTelemetryPerformanceAccountlessAuthorization,
+  parsePostgresTelemetryPerformanceGrantRequest,
+  readPostgresTelemetryPerformanceCapability,
+} from "../src/postgres-telemetry-performance-policy.ts";
+import {
+  admitPostgresTelemetryPerformanceReport,
+  readPostgresTelemetryPerformanceReports,
+} from "../src/postgres-telemetry-performance-reports.ts";
+import { recordPostgresTelemetryPerformanceRefusal } from "../src/postgres-performance-refusal-counts.ts";
+import { createPostgresTelemetryRuntimeActivationTask } from "../src/postgres-telemetry-runtime-activation.ts";
+import { validateTelemetryPerformanceEnvelope } from "../src/telemetry-performance-envelope.ts";
 import {
   ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
   parseAccountlessRenewalJson,
@@ -166,6 +177,7 @@ import { createAnalyticsV2CommunityDailyRoute } from "../src/analytics-v2/commun
 import { closeCloudSqlResources, createGoogleAccessTokenProvider, createIamPool } from "./cloud-sql.mjs";
 import { createOriginIntakeComposition } from "./origin-intake-composition.mjs";
 import { createAdminConsoleHandlers } from "./routes/admin-console.mjs";
+import { createPerformanceTelemetryDispatch } from "./routes/performance-telemetry.mjs";
 import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "./origin-route-modules.mjs";
 import { logOriginBoundaryRefusal } from "./origin-node-request.mjs";
 import { createEdgeAdmissionLimiters, EDGE_ADMISSION_REPLAY_BINDINGS } from "./postgres-edge-admission-limiters.mjs";
@@ -174,7 +186,7 @@ import { requestIdFrom, createRequestContextStore } from "./postgres-request-con
 import { createProductionRequestHandler } from "./postgres-host-dispatch.mjs";
 import {
   ADMIN_HOST_ROUTE_IDS,
-  RETIRED_DEFINITE_ROUTE_IDS,
+  PERFORMANCE_ROUTE_IDS,
   assertIdentityLinkConsumersRetired,
   createProductionRouteRegistry,
 } from "./postgres-production-registry.mjs";
@@ -191,7 +203,6 @@ import {
   revealProductionSecret,
 } from "./postgres-production-configuration.mjs";
 import {
-  createPostgresRetiredPerformanceAuthorizationPreamble,
   createPostgresStorageGate,
   createPostgresTestCommunityDailyDispatch,
   createPostgresTestDevicePairingClaimDispatch,
@@ -421,6 +432,69 @@ export function createLifecyclePassMaintenance({ pool, objectStore, primarySchem
   });
 }
 
+/**
+ * The origin's performance storage switch (PERFORMANCE_TELEMETRY_STORAGE_MODE,
+ * an origin-only var pinned 'enabled' in production and staging, and the
+ * edge-test and fastpath default): the only value that serves.
+ */
+export const PERFORMANCE_TELEMETRY_STORAGE_ENABLED = "enabled";
+
+/**
+ * SPD-G2's policy as the performance family's `policy` dependency
+ * (routes/performance-telemetry.mjs). The family passes its storage switch
+ * as `mode` (the string PERFORMANCE_TELEMETRY_STORAGE_MODE), while
+ * assertPostgresTelemetryPerformanceStorage wants the Worker's parsed typed
+ * storage mode ({kind:'typed', sourceNamespace}, the shape
+ * parseTelemetryStorageMode returns for the Worker's
+ * requireTelemetryPerformanceStorageMode). This binding adapts the one to the
+ * other: any switch value but 'enabled' is 503 BACKEND_STORAGE_UNAVAILABLE
+ * before any read, and 'enabled' checks the performance runtime row under
+ * the composition's own typed namespace (every PostgreSQL origin mode stores
+ * typed evidence under sourceIdentity.sourceNamespace). Bound as-is, the
+ * plain string would make every route answer 503 after authentication.
+ */
+export function createPerformanceTelemetryPolicy({ sourceNamespace } = {}) {
+  if (typeof sourceNamespace !== "string" || sourceNamespace.length === 0) refuse(ORIGIN_COMPOSITION_INVALID);
+  const typedStorageMode = Object.freeze({ kind: "typed", sourceNamespace });
+  return Object.freeze({
+    async assertStorage(pool, { schema, mode } = {}) {
+      if (mode !== PERFORMANCE_TELEMETRY_STORAGE_ENABLED) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+      await assertPostgresTelemetryPerformanceStorage(pool, { schema, mode: typedStorageMode });
+    },
+    parseGrantRequest: (value) => parsePostgresTelemetryPerformanceGrantRequest(value),
+    grant: (pool, options) => grantPostgresTelemetryPerformanceAccountlessAuthorization(pool, options),
+    readCapability: (pool, options) => readPostgresTelemetryPerformanceCapability(pool, options),
+  });
+}
+
+/** SPD-G3's admission and read as the performance family's `reports` dependency. */
+export const PERFORMANCE_TELEMETRY_REPORTS = Object.freeze({
+  admit: (pool, options) => admitPostgresTelemetryPerformanceReport(pool, options),
+  read: (pool, options) => readPostgresTelemetryPerformanceReports(pool, options),
+});
+
+/**
+ * The admin maintenance tasks: C-MAINT's lifecycle pass as run_maintenance
+ * and SPD-G5's owner-only performance runtime activation as
+ * telemetryRuntimeActivation (routes/admin-action.mjs passes it
+ * {body, identityKey}). The activation compares the request's deployment
+ * block with this image's DEPLOYMENT_SOURCE_COMMIT and the history digest of
+ * POSTGRES_RUNTIME_MIGRATIONS.primary; without a source commit every
+ * activation answers 503 TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE.
+ */
+export function createOriginAdminMaintenance({ pool, objectStore, primarySchema, sourceCommit = null, clock }) {
+  return Object.freeze({
+    ...createLifecyclePassMaintenance({ pool, objectStore, primarySchema }),
+    telemetryRuntimeActivation: createPostgresTelemetryRuntimeActivationTask({
+      pool,
+      schema: primarySchema,
+      sourceCommit,
+      expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS.primary,
+      ...(clock === undefined ? {} : { clock }),
+    }),
+  });
+}
+
 function isPool(value) {
   return value !== null && typeof value === "object" && typeof value.connect === "function";
 }
@@ -448,10 +522,11 @@ function isPool(value) {
  * Returns {handlers, routeModules, routeModuleContext, dispatchers}: handlers
  * maps every route id the composition serves to its built-in (the registry
  * folds the route modules over community_daily and
- * device_upload_authorization; createOriginRouteRegistry), and the retired
- * accountless performance authorization to its preamble (owner round 19:
- * production's earlier answers, never a grant); dispatchers are the families
- * themselves (the loopback fallback is the v1.2 dispatch).
+ * device_upload_authorization; createOriginRouteRegistry), the three
+ * performance intake ids included (owner decision 2026-10-10, decision 1:
+ * the performance family over SPD-G2's policy, SPD-G3's reports and SPD-G4's
+ * refusal counter); dispatchers are the families themselves (the loopback
+ * fallback is the v1.2 dispatch).
  */
 export function composeOriginFamilies(deps) {
   if (deps === null || typeof deps !== "object") refuse(ORIGIN_COMPOSITION_INVALID);
@@ -636,28 +711,40 @@ export function composeOriginFamilies(deps) {
   // serves.
   const intakeThenV12 = async (request) => (intake === null ? null : await intake.dispatch(request))
     ?? v12Dispatch(request);
-  // Round 19: the retired performance authorization's d43c8f92 preamble
-  // (session cookie, ownership mode, admission bindings, upload-registration
-  // control, the replayed accountless_ownership limiter, the accountless
-  // device bearer under the Worker's generic gate, then the body); the
-  // request handler answers its terminal 403 when the preamble passes.
-  const retiredPerformanceAuthorization = createPostgresRetiredPerformanceAuthorizationPreamble({
-    requestContext,
+  // Owner decision 2026-10-10 (decision 1): the restored performance intake
+  // (grant, capabilities, reports), in the Worker's order through the same
+  // adapters as its v1.2 and v1.1 siblings. The grant authenticates against
+  // the base v1.1 graph and must be accountless; the device routes take the
+  // generic bearer at v1.1 (performance is an independent dialect). Every
+  // refusal after authentication is counted, bounded and best-effort.
+  const performance = createPerformanceTelemetryDispatch({
     primaryPool: dataPool,
-    schemaOptions,
-    storageGate,
+    schema: schemaOptions,
     admissionEnv,
+    maxRequestBytes: MAX_REQUEST_BYTES,
+    envelopePublicJwk,
+    envelopePrivateJwk,
+    requestContext,
+    assertStorageCurrent: () => storageGate.assertCurrent(),
     assertAdmissionBindings,
     assertAttemptAllowed,
-    authenticateAccountlessDevice: postgresDeviceBearerAuth.authenticatePostgresAccountlessForV12Grant,
+    assertCollectionControl: postgresCollectionControls.assertPostgresCollectionControlFromPool,
+    authenticateGrantDevice: postgresDeviceBearerAuth.authenticatePostgresAccountlessForV12Grant,
+    authenticateDevice: postgresDeviceBearerAuth.authenticatePostgresDeviceBearer,
     readBoundedRequestBody,
-    maxRequestBytes: MAX_REQUEST_BYTES,
-    requestShape: Object.freeze({
-      schemaVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
-      policyVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
-      authorizationBasis: ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+    validateTelemetryPerformanceEnvelope,
+    decryptSyntheticEnvelope,
+    sha256Hex,
+    policy: createPerformanceTelemetryPolicy({ sourceNamespace: sourceIdentity?.sourceNamespace }),
+    reports: PERFORMANCE_TELEMETRY_REPORTS,
+    recordRefusal: ({ routeId, code, status }) => recordPostgresTelemetryPerformanceRefusal(dataPool, {
+      schema: schemaOptions, routeId, code, status, nowEpoch: Date.now(),
     }),
   });
+  // The family answers every method of its three pathnames and null for
+  // anything else, so it is mounted before the v1.2 dispatch (as the v1.1
+  // intake is).
+  const performanceThenV12 = async (request) => (await performance.dispatch(request)) ?? v12Dispatch(request);
   const handlers = new Map();
   for (const id of V12_ROUTE_IDS) handlers.set(id, v12Dispatch);
   for (const id of V11_ROUTE_IDS) handlers.set(id, intakeThenV12);
@@ -671,7 +758,7 @@ export function composeOriginFamilies(deps) {
   handlers.set("device_pairing_claim", devicePairingClaim);
   handlers.set("telemetry_v12_consent", telemetryV12Consent);
   handlers.set("community_daily", communityDaily);
-  handlers.set("accountless_telemetry_performance_authorization", retiredPerformanceAuthorization);
+  for (const id of PERFORMANCE_ROUTE_IDS) handlers.set(id, performanceThenV12);
   handlers.set("health", statusDispatchers.health);
   // The legacy chain has no RD-2: its /api/ready is the v1.2 dispatch's
   // unsupported 503, as before.
@@ -692,18 +779,17 @@ export function composeOriginFamilies(deps) {
     routeModuleContext,
     dispatchers: Object.freeze({
       communityDaily, participantDevices, personalSession, devicePairing, devicePairingClaim,
-      telemetryV12Consent, v12Dispatch, intake, retiredPerformanceAuthorization,
+      telemetryV12Consent, v12Dispatch, intake, performance,
     }),
   });
 }
 
 /**
  * The CR-6 registry over composed families: the handlers of exactly the
- * ported ids and the retired-definite preambles, with the route modules
- * folded in.
+ * ported ids, with the route modules folded in.
  */
 export function createOriginRouteRegistry(families, portedRouteIds) {
-  const ported = new Set([...portedRouteIds, ...RETIRED_DEFINITE_ROUTE_IDS]);
+  const ported = new Set(portedRouteIds);
   return createProductionRouteRegistry({
     routePolicy: WORKER_ROUTE_POLICY,
     handlers: new Map([...families.handlers].filter(([id]) => ported.has(id))),
@@ -902,7 +988,13 @@ export async function createPostgresProductionRuntime({
         // analytics_v2 lives in primary (0059): no separate analytics pool.
         pools: { primary: dataPool },
         schemaOptions: { primarySchema },
-        maintenance: createLifecyclePassMaintenance({ pool: dataPool, objectStore, primarySchema }),
+        maintenance: createOriginAdminMaintenance({
+          pool: dataPool,
+          objectStore,
+          primarySchema,
+          sourceCommit: env.DEPLOYMENT_SOURCE_COMMIT ?? null,
+          clock,
+        }),
       })
       : null;
     const families = composeOriginFamilies({

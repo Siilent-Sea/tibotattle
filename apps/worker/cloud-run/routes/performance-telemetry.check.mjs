@@ -442,6 +442,16 @@ test("grant: each refusal answers at its own step, in order, and only post-authe
       }),
     },
     {
+      // Defence in depth (SPD-X1a): an absent authority kind is not accountless.
+      label: "no authority kind", status: 401, code: "DEVICE_AUTH_INVALID", steps: GRANT_STEPS.slice(0, 5),
+      overrides: ({ log }) => ({
+        async authenticateGrantDevice(pool, header, options) {
+          log.push(`authenticate_grant:${options.accountlessAuthorizationVersion}`);
+          return { ...PRINCIPAL };
+        },
+      }),
+    },
+    {
       label: "query string", status: 503, code: "POSTGRES_TEST_ROUTE_UNSUPPORTED", counted: true,
       steps: GRANT_STEPS.slice(0, 5), req: () => request(`${GRANT}?debug=1`, { body }),
     },
@@ -708,7 +718,8 @@ test("reports POST refusals: envelope, key id, capability before RSA work, and i
     },
   }));
   await expectError(await send(viaAlias, request(REPORTS, { body: raw }), DEVICE_SYNC), 409, "TELEMETRY_RECORD_INVALID");
-  assert.deepEqual(viaAlias.refusals, reportsCode("TELEMETRY_RECORD_INVALID_ORDER", 409));
+  // SPD-G3 names the detail `detail`; no other property is read (SPD-X1a).
+  assert.deepEqual(viaAlias.refusals, reportsCode("TELEMETRY_RECORD_INVALID", 409));
 
   const conflict = harness(({ defaults }) => ({
     reports: { ...defaults.reports, async admit() { throw closed(409, "TELEMETRY_MANIFEST_CONFLICT", { detail: "SIZE" }); } },

@@ -18,11 +18,14 @@
 // closed unported answer under the root's request id, and the admin host's
 // OD-CR-3 refusal); that every EP-1 policy route it serves replays the edge's
 // outcome at the Worker's own call point; the d43c8f92 order fixes that only
-// show under a limited outcome or a cookie; and that fastpath-test without
-// the edge charges its PostgreSQL limiters at the same points.
+// show under a limited outcome or a cookie; that the restored performance
+// intake (owner decision 2026-10-10) answers the Worker's 401 without or with
+// an unknown bearer and 403 TELEMETRY_TRANSPORT_BLOCKED to an enrolled device
+// while the runtime is staged; and that fastpath-test without the edge
+// charges its PostgreSQL limiters at the same points.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
-import { randomBytes, randomUUID, webcrypto } from "node:crypto";
+import { createHash, randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import http from "node:http";
 import { createServer as createNetServer } from "node:net";
@@ -31,10 +34,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import {
-  RETIRED_DEFINITE_PREAMBLE_STEPS,
-  RETIRED_ROUTE_DEFINITE_ANSWERS,
-} from "../cloud-run/postgres-production-registry.mjs";
+import { PERFORMANCE_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -556,7 +556,7 @@ test("served routes: every production ported pair is served; every other forward
   const served = new Set(m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS);
   let servedPairs = 0;
   let unportedPairs = 0;
-  let definitePairs = 0;
+  let performancePairs = 0;
   const observedServedIds = new Set();
   for (const route of m.registry.WORKER_ROUTE_POLICY) {
     if (EDGE_LOCAL_ROUTE_IDS.has(route.id)) continue;
@@ -576,16 +576,14 @@ test("served routes: every production ported pair is served; every other forward
           assert.ok(!ADMISSION_CODES.includes(errorCode(answer)), `${label}: admitted (${answer.text})`);
           observedServedIds.add(route.id);
           servedPairs += 1;
-        } else if (Object.hasOwn(RETIRED_ROUTE_DEFINITE_ANSWERS, route.id)) {
-          // Rounds 12 and 19: the retired-definite route runs production's
-          // sequence, never the 503. This allowed request's unknown device
-          // bearer stops at the device-bearer step, as the Worker's does.
-          const [, status, code] = RETIRED_DEFINITE_PREAMBLE_STEPS[route.id]
-            .find(([step]) => step === "device_bearer");
-          assert.equal(answer.status, status, `${label}: ${answer.text}`);
-          assert.equal(errorCode(answer), code, label);
-          assert.equal(answer.headers["retry-after"], undefined, label);
-          definitePairs += 1;
+          if (PERFORMANCE_ROUTE_IDS.includes(route.id)) {
+            // Decision 1: the restored performance intake. This allowed
+            // request's unknown device bearer is the Worker's 401, never a
+            // storage or runtime 5xx first.
+            assertApiError(answer, 401, "DEVICE_AUTH_INVALID", label);
+            assert.equal(answer.headers["retry-after"], undefined, label);
+            performancePairs += 1;
+          }
         } else {
           assertUnported(m, answer, label, request.headers["x-tibotattle-edge-request-id"]);
           unportedPairs += 1;
@@ -599,9 +597,9 @@ test("served routes: every production ported pair is served; every other forward
     }
   }
   assert.deepEqual([...observedServedIds].sort(), [...served].sort(), "every served id was probed");
-  assert.equal(servedPairs, 32, "30 served ids, two with GET and POST");
+  assert.equal(servedPairs, 36, "33 served ids, three with GET and POST");
   assert.ok(unportedPairs > 0);
-  assert.equal(definitePairs, 1, "the accountless performance authorization, POST only");
+  assert.equal(performancePairs, 4, "grant POST, capabilities GET, reports GET and POST");
 }));
 
 // ---------------------------------------------------------------------------
@@ -615,9 +613,11 @@ test("replay parity: each served EP-1 policy route answers the Worker helper's 4
     .filter((route) => served.has(route.id) && m.policy.edgeAdmissionPolicyFor(route.id) !== null);
   assert.deepEqual(routes.map((route) => route.id).sort(), [
     "accountless_enrollment", "accountless_ownership", "accountless_renewal",
+    "accountless_telemetry_performance_authorization",
     "accountless_telemetry_v12_authorization", "community_daily", "contributions",
     "device_credential_renew", "device_disconnect", "device_sync_capabilities",
     "device_sync_capabilities_v12", "device_sync_manifest", "device_sync_state",
+    "telemetry_performance_capabilities", "telemetry_performance_reports",
     "telemetry_v11_day_manifests", "telemetry_v11_domain_activate", "telemetry_v11_domain_predecessor",
     "telemetry_v12_day_manifests", "telemetry_v12_domain_activate", "telemetry_v12_domain_predecessor",
   ]);
@@ -781,6 +781,7 @@ test("accountless routes refuse only the session cookie, with AUTH_INVALID", {
     ["/api/v1/accountless/enrollment", "enrollment"],
     ["/api/v1/accountless/ownership", "accountless_ownership"],
     ["/api/v1/accountless/telemetry-v1.2-authorization", "accountless_ownership"],
+    ["/api/v1/accountless/telemetry-performance-authorization", "accountless_ownership"],
     ["/api/v1/accountless/renewal", "accountless_renewal"],
   ]) {
     const request = (cookie, outcome) => ({
@@ -799,7 +800,8 @@ test("accountless routes refuse only the session cookie, with AUTH_INVALID", {
     assertAdmissionAnswer(await send(port, request(UNRELATED_COOKIE, "limited")),
       429, "ATTEMPT_LIMIT_REACHED", `${path} unrelated cookie, limited`);
     const admitted = await send(port, request(UNRELATED_COOKIE, "allowed"));
-    if (path === "/api/v1/accountless/telemetry-v1.2-authorization") {
+    if (path === "/api/v1/accountless/telemetry-v1.2-authorization"
+        || path === "/api/v1/accountless/telemetry-performance-authorization") {
       assertApiError(admitted, 401, "DEVICE_AUTH_INVALID", `${path} unrelated cookie, admitted`);
       assertApiError(await send(port, request(undefined, "allowed")), 401, "DEVICE_AUTH_INVALID",
         `${path} no cookie, admitted`);
@@ -809,6 +811,65 @@ test("accountless routes refuse only the session cookie, with AUTH_INVALID", {
       assertApiError(admitted, 400, "BODY_INVALID", `${path} unrelated cookie, admitted`);
     }
   }
+}));
+
+/** src/device-auth.ts deviceHash: the stored hash of an enrolled bearer's secret. */
+function deviceSecretHash(deviceId, secret) {
+  return createHash("sha256").update(`app-usagemonitor/device/v1\0${deviceId}\0`).update(secret).digest();
+}
+
+test("decision 1: the performance intake answers 401 without a bearer and 403 to an enrolled device while staged", {
+  skip: SKIP, timeout: 300_000,
+}, () => withOrigin({ edge: true }, async ({ base, t, port }) => {
+  const GRANT = "/api/v1/accountless/telemetry-performance-authorization";
+  const CAPABILITIES = "/api/v1/device/telemetry/performance/capabilities";
+  const REPORTS = "/api/v1/device/telemetry/performance/reports";
+  const grantBody = JSON.stringify({ schemaVersion: "accountless-performance-owner-v1",
+    policyVersion: "accountless-telemetry-performance-policy-v1", authorizationBasis: "accountless-performance-policy-v1" });
+  const performance = [
+    ["POST", GRANT, "accountless_ownership", grantBody],
+    ["GET", CAPABILITIES, "device_sync"],
+    ["GET", REPORTS, "device_sync"],
+    ["POST", REPORTS, "device_sync", "{}"],
+  ];
+  const request = (method, path, purpose, body, authorization) => ({
+    method, path, ...(body === undefined ? {} : { body }),
+    headers: { ...edgeHeaders({ admission: `v1;${purpose};allowed` }),
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      ...(authorization === undefined ? {} : { authorization }) },
+  });
+  // No credential at all: the Worker's 401 on every route and method.
+  for (const [method, path, purpose, body] of performance) {
+    const answer = await send(port, request(method, path, purpose, body));
+    assertMarked(answer, `${method} ${path}`);
+    assertApiError(answer, 401, "DEVICE_AUTH_INVALID", `${method} ${path} without a bearer`);
+    assert.equal(answer.headers["cache-control"], "no-store", path);
+  }
+  // A shipped accountless installation enrolls and binds its owner through the edge-test origin.
+  const deviceId = randomUUID();
+  const secret = randomBytes(32);
+  const bearer = `Device um_device_${deviceId}.${secret.toString("base64url")}`;
+  const enrolled = await send(port, request("POST", "/api/v1/accountless/enrollment", "enrollment",
+    JSON.stringify({ schemaVersion: "accountless-enrollment-v0.1", deviceId,
+      deviceSecretHash: deviceSecretHash(deviceId, secret).toString("hex"),
+      policyVersion: "accountless-opt-out-v1", authorizationBasis: "accountless-policy-v1" })));
+  assert.equal(enrolled.status, 201, enrolled.text);
+  const owned = await send(port, request("POST", "/api/v1/accountless/ownership", "accountless_ownership",
+    JSON.stringify({ schemaVersion: "accountless-upload-owner-v0.1", policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1" }), bearer));
+  assert.equal(owned.status, 201, owned.text);
+  // The runtime is staged (0079's seed): the grant and the capability read
+  // answer 403 TELEMETRY_TRANSPORT_BLOCKED, never a 5xx; nothing is granted.
+  for (const [method, path, purpose, body] of [performance[0], performance[1]]) {
+    const answer = await send(port, request(method, path, purpose, body, bearer));
+    assertMarked(answer, `${method} ${path}`);
+    assertApiError(answer, 403, "TELEMETRY_TRANSPORT_BLOCKED", `${method} ${path} while staged`);
+    assert.equal(answer.headers["retry-after"], undefined, path);
+  }
+  assert.deepEqual((await base.query(`SELECT state FROM ${t("telemetry_performance_runtime")}`)).rows,
+    [{ state: "staged" }]);
+  assert.equal((await base.query(`SELECT count(*)::int AS n FROM ${t("accountless_telemetry_performance_authorizations")}`))
+    .rows[0].n, 0);
 }));
 
 // ---------------------------------------------------------------------------

@@ -28,8 +28,8 @@
  *  5. the uploadRegistration collection control;
  *  6. assertAttemptAllowed(RECOVERY, CLIENT_ATTEMPT, accountless_ownership);
  *  7. the accountless device bearer against the base v1.1 graph (the grant
- *     is what is being requested); a non-accountless principal is 401
- *     DEVICE_AUTH_INVALID;
+ *     is what is being requested); a principal whose authorityKind is not
+ *     exactly 'accountless' (absent included) is 401 DEVICE_AUTH_INVALID;
  *  8. a query string: 503 POSTGRES_TEST_ROUTE_UNSUPPORTED, the v1.2
  *     dispatch's owner-accepted OD-CR-6 (ii) refusal for its POST routes;
  *  9. deps.policy.assertStorage (the Worker's
@@ -73,7 +73,8 @@
  * where code is the closed response code, or for 409 TELEMETRY_RECORD_INVALID
  * the code joined to the report parser's closed detail (for example
  * TELEMETRY_RECORD_INVALID_MODEL_UNREVIEWED). The detail is read from the
- * refused error's `detail` (or `refusalDetail`) property and appended only
+ * refused error's `detail` property (SPD-G3's
+ * PostgresTelemetryPerformanceRecordInvalidError) and appended only
  * when it is one of the parser's closed details; it never reaches the
  * response body. Recording is awaited for at most
  * PERFORMANCE_TELEMETRY_REFUSAL_BOUND_MILLISECONDS, any failure is ignored,
@@ -187,8 +188,8 @@ function closedAnswer(error) {
 /** The counter code: the closed code, plus the parser's closed detail for an invalid record. */
 function refusalCode(error, answer) {
   if (answer.status !== 409 || answer.code !== "TELEMETRY_RECORD_INVALID") return answer.code;
-  const detail = typeof error?.detail === "string" ? error.detail : error?.refusalDetail;
-  return PERFORMANCE_TELEMETRY_RECORD_INVALID_DETAILS.includes(detail)
+  const detail = error?.detail;
+  return typeof detail === "string" && PERFORMANCE_TELEMETRY_RECORD_INVALID_DETAILS.includes(detail)
     ? `${answer.code}_${detail}` : answer.code;
 }
 
@@ -306,8 +307,9 @@ export function createPerformanceTelemetryDispatch(dependencies) {
     const device = await deps.authenticateGrantDevice(deps.primaryPool, request.headers.get("authorization"), {
       ...schemaOption, accountlessAuthorizationVersion: "v1.1",
     });
-    if (device !== null && typeof device === "object" && device.authorityKind !== undefined
-        && device.authorityKind !== "accountless") {
+    // Defence in depth: the bound authenticator already refuses any other
+    // authority, but the grant requires an explicit accountless principal.
+    if (device === null || typeof device !== "object" || device.authorityKind !== "accountless") {
       throw routeFailure(401, "DEVICE_AUTH_INVALID");
     }
     return principalOf(device);

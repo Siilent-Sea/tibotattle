@@ -188,10 +188,17 @@ test("constants: mode and origins; the served set is the production list, with n
     assert.equal(mode[retired], undefined, retired);
   }
   const ids = composition.POSTGRES_PORTED_WORKER_ROUTE_IDS;
-  assert.equal(ids.length, 30);
+  assert.equal(ids.length, 33, "scope 21, od-cr-1 9, performance 3");
   const registryIds = new Set(registry.WORKER_ROUTE_POLICY.map((route) => route.id));
   for (const id of ids) assert.ok(registryIds.has(id), `${id} is a WORKER_ROUTE_POLICY id`);
   assert.ok(ids.includes("ready"), "edge-test serves RD-2 /api/ready, as production does");
+  // Owner decision 2026-10-10: edge-test serves the restored performance
+  // intake as production does; the signed-in consent route stays retired.
+  for (const id of ["accountless_telemetry_performance_authorization", "telemetry_performance_capabilities",
+    "telemetry_performance_reports"]) {
+    assert.ok(ids.includes(id), `${id} is served on the apex`);
+  }
+  assert.ok(!ids.includes("telemetry_performance_consent"), "the consent route stays retired");
   for (const id of ["apple_domain_association", "sparkle_appcast_guard", "admin_overview",
     "admin_action", "enroll", "identity_google_start", "participant_export"]) {
     assert.ok(!ids.includes(id), `${id} is not served on the apex`);
