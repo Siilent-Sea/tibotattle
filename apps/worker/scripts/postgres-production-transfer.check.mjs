@@ -468,7 +468,14 @@ test("round 16: P8-R needs the rotation; the new pin alone, a wrong label or ano
   // The consumer refusal's default ported set is everything a registry may port: no consumer is in it,
   // so at preflight the refusal is the registry classification (the boot refusal checks the real set).
   for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.includes(id), false, id);
-  assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.length, 36, "21 scope, 9 contested, 6 admin");
+  assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.length, 39, "21 scope, 9 contested, 6 admin, 3 performance");
+  // Owner decision 2026-10-10 (decision 1): the restored performance intake
+  // is admissible; the signed-in consent route stays retired and is not.
+  for (const id of ["accountless_telemetry_performance_authorization", "telemetry_performance_capabilities",
+    "telemetry_performance_reports"]) {
+    assert.ok(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.includes(id), id);
+  }
+  assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.includes("telemetry_performance_consent"), false);
 });
 
 test("round 16: the sealed-pin file is the wrangler SELECT of one D1 row, nothing more", () => {

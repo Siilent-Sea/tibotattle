@@ -22,13 +22,12 @@
 //   answer: 503 POSTGRES_ROUTE_NOT_PORTED in the Worker envelope, no-store,
 //   no retry-after (OD-CR-6 (iv)). Its body carries the request id, so the
 //   comparator reads fields, never bytes.
-// - definite: a route owner round 12 retired with a definite answer instead
-//   of the unported 503. Since round 19 it answers production's sequence
-//   before its terminal answer, so a sweep row expects the answer of the step
-//   its request stops at (definiteSweepAnswers, from the registry's
-//   RETIRED_DEFINITE_PREAMBLE_STEPS, passed in): that status and code in the
-//   Worker envelope, no-store, no retry-after. Its sweep rows also carry the
-//   worker comparator: the unchanged Worker answers the same request alike.
+//
+// The restored performance intake (owner decision 2026-10-10, decision 1) is
+// served like any other ported route; its sweep rows and its unauthenticated
+// rows (performanceIntakeRows) also carry the worker comparator and expect
+// the bearer refusal (BEARER_REFUSAL): the origin must answer what the
+// unchanged Worker answers, never a storage or runtime 5xx first (S4 parity).
 
 /** Fixed synthetic values the rows use; none is a real credential. */
 export const MATRIX_VALUES = Object.freeze({
@@ -53,6 +52,12 @@ export const ADMIN_API_ROUTE_IDS = Object.freeze([
   "admin_reconstruction_progress",
   "admin_action",
 ]);
+
+/**
+ * The answer a forwarded request with no or an unknown device bearer gets
+ * from a bearer-authenticated route, at the Worker and the origin alike.
+ */
+export const BEARER_REFUSAL = Object.freeze({ status: 401, code: "DEVICE_AUTH_INVALID" });
 
 /** Routes the edge answers itself in every mode; never forwarded. */
 export const EDGE_LOCAL_ROUTE_IDS = Object.freeze(["apple_domain_association", "sparkle_appcast_guard"]);
@@ -286,30 +291,19 @@ export function forwardedRows({ registry }) {
 }
 
 /**
- * The answer a sweep row gets from each retired-definite route (round 19):
- * an allowed, same-origin, cookie-free request with a well-formed but unknown
- * device bearer passes every earlier step and stops at the device bearer.
- * preambleSteps is the registry's RETIRED_DEFINITE_PREAMBLE_STEPS (route id
- * -> [[step, status, code], ...]).
- */
-export function definiteSweepAnswers(preambleSteps) {
-  return Object.freeze(Object.fromEntries(Object.entries(preambleSteps).map(([routeId, steps]) => {
-    const step = steps.find(([name]) => name === "device_bearer");
-    if (step === undefined) throw new Error(`REQUEST_MATRIX_DEFINITE_STEP_UNKNOWN ${routeId}`);
-    return [routeId, Object.freeze({ status: step[1], code: step[2] })];
-  })));
-}
-
-/**
  * S3's sweep: one request for every forwarded (route, method) pair, each
- * expected to be served (servedRouteIds: the production ported list), to
- * answer as the Worker does at its retired-definite route (definiteAnswers:
- * route id -> {status, code}, from definiteSweepAnswers) or to answer the
- * closed unported 503, and to carry the admission header exactly when EP-1
- * names the route.
+ * expected to be served (servedRouteIds: the production ported list) or to
+ * answer the closed unported 503, and to carry the admission header exactly
+ * when EP-1 names the route. bearerRefusedRouteIds (the performance intake)
+ * are served routes whose sweep request, an unknown device bearer, must also
+ * answer as the unchanged Worker does: BEARER_REFUSAL.
  */
-export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
+export function sweepRows({ registry, servedRouteIds, bearerRefusedRouteIds = [] }) {
   const served = new Set(servedRouteIds);
+  const bearerRefused = new Set(bearerRefusedRouteIds);
+  for (const id of bearerRefused) {
+    if (!served.has(id)) throw new Error(`REQUEST_MATRIX_BEARER_ROUTE_UNSERVED ${id}`);
+  }
   const rows = [];
   for (const route of registry) {
     if (EDGE_LOCAL_ROUTE_IDS.includes(route.id) || ADMIN_API_ROUTE_IDS.includes(route.id)) continue;
@@ -329,15 +323,41 @@ export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
           ...(post ? { "content-type": "application/json" } : {}),
         },
         ...(post ? { body: "{}" } : {}),
-        ...(Object.hasOwn(definiteAnswers, route.id)
-          ? {
-            comparators: ["transparency", "worker", "definite"],
-            expect: { status: definiteAnswers[route.id].status, code: definiteAnswers[route.id].code },
-          }
+        ...(bearerRefused.has(route.id)
+          ? { comparators: ["transparency", "worker"], expect: { served: true, ...BEARER_REFUSAL } }
           : {
             comparators: served.has(route.id) ? ["transparency"] : ["transparency", "unported"],
             expect: { served: served.has(route.id) },
           }),
+      }));
+    }
+  }
+  return Object.freeze(rows);
+}
+
+/**
+ * The restored performance intake without a credential (decision 1): one
+ * request per (route, method) of routeIds with no authorization header,
+ * forwarded (the edge's only pre-admission guard for these routes is the
+ * grant's session cookie) and answered BEARER_REFUSAL by the origin and the
+ * unchanged Worker alike.
+ */
+export function performanceIntakeRows({ registry, routeIds }) {
+  const rows = [];
+  for (const id of routeIds) {
+    const route = routeById(registry, id);
+    if (!Array.isArray(route.methods)) throw new Error(`REQUEST_MATRIX_METHODS_UNEXPECTED ${route.id}`);
+    for (const method of route.methods) {
+      const post = method !== "GET";
+      rows.push(row({
+        id: `performance-${route.id}-${method}-no-bearer`,
+        routeId: route.id,
+        method,
+        path: route.pathname,
+        headers: post ? { "content-type": "application/json" } : {},
+        ...(post ? { body: "{}" } : {}),
+        comparators: ["transparency", "worker"],
+        expect: { served: true, ...BEARER_REFUSAL },
       }));
     }
   }

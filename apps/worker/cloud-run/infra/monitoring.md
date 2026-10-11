@@ -219,21 +219,23 @@ query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
     them, `PRODUCTION_ROUTE_PORT_RETIRED`): the native social chain (Google
     start, callback and result; Apple start, callback and result; the
     legacy `/api/v1/enroll`), `/api/v1/me/security-reset`, and the
-    performance device and consent routes:
-    - `/api/v1/device/telemetry/performance/capabilities`;
-    - `/api/v1/device/telemetry/performance/reports`;
-    - `/api/v1/me/device-telemetry-performance-consents`;
+    signed-in performance consent route,
+    `/api/v1/me/device-telemetry-performance-consents`;
   - OD-CR-2: `/api/v1/me/export` (participant export is retired);
   - C-ADMIN: `/api/v1/admin/action`, whose unported admin tasks answer this
     code.
 - **Never excluded.** `originFiveXxExclusions` refuses these paths:
-  `/api/v1/contributions`, `/api/v1/device/upload-authorizations`,
-  `/api/v1/accountless/telemetry-performance-authorization` (round 19:
-  production's answer sequence, then a definite 403
-  `TELEMETRY_TRANSPORT_BLOCKED`, never the unported 503; its 5xx answers
-  are the Worker's own configuration, containment, storage and admission
-  ones and count like any live route's), and the renew and disconnect
-  routes round 12 keeps. It also refuses any path that is not an exact
+  `/api/v1/contributions`, `/api/v1/device/upload-authorizations`, the
+  three restored performance intake routes
+  (`/api/v1/accountless/telemetry-performance-authorization`,
+  `/api/v1/device/telemetry/performance/capabilities` and
+  `/api/v1/device/telemetry/performance/reports`; owner decision
+  2026-10-10, decision 1: served by the performance family, which answers
+  an authenticated request `403 TELEMETRY_TRANSPORT_BLOCKED` until the
+  owner activates the runtime, never a 5xx; any 5xx they give is the
+  Worker's own configuration, containment, storage or admission answer and
+  counts like any live route's), and the renew and disconnect routes round
+  12 keeps. It also refuses any path that is not an exact
   `WORKER_ROUTE_POLICY` pathname, any
   code other than `POSTGRES_ROUTE_NOT_PORTED`, and two codes by name, as a
   guard only:

@@ -85,9 +85,11 @@ describe("PostgreSQL migration foundation", () => {
   });
 
   it("names the origin's ported pathnames and keeps the zero-argument call false", () => {
-    // OD-CR-1: the 21 scope routes plus all nine contested ones; OD-CR-2: the
-    // six admin routes are admin-host only and the other 13 stay unported.
-    expect(POSTGRES_PORTED_WORKER_ROUTE_IDS).toHaveLength(30);
+    // OD-CR-1: the 21 scope routes plus all nine contested ones; owner
+    // decision 2026-10-10: the three restored performance intake routes;
+    // OD-CR-2: the six admin routes are admin-host only and the other 10 stay
+    // retired (with the two root routes answered by the origin itself).
+    expect(POSTGRES_PORTED_WORKER_ROUTE_IDS).toHaveLength(33);
     expect(Object.isFrozen(POSTGRES_PORTED_WORKER_ROUTE_IDS)).toBe(true);
     expect(POSTGRES_ADMIN_HOST_ROUTE_IDS).toEqual([
       "admin_overview", "admin_metrics_history", "admin_community_allowance_preview",
@@ -100,6 +102,14 @@ describe("PostgreSQL migration foundation", () => {
     expect(isPostgresWorkerRequestPathSupported("/api/ready")).toBe(true);
     expect(isPostgresWorkerRequestPathSupported("/api/v1/device/credential/renew")).toBe(true);
     for (const pathname of [
+      "/api/v1/accountless/telemetry-performance-authorization",
+      "/api/v1/device/telemetry/performance/capabilities",
+      "/api/v1/device/telemetry/performance/reports",
+    ]) {
+      expect(isPostgresWorkerRequestPathSupported(pathname)).toBe(true);
+    }
+    for (const pathname of [
+      "/api/v1/me/device-telemetry-performance-consents",
       "/api/v1/me/export",
       "/api/v1/admin/overview",
       "/.well-known/apple-developer-domain-association.txt",

@@ -51,11 +51,12 @@ import { createPostgresAdminAccessChokepoint } from "../src/postgres-admin-acces
  * Phase B (D-CRB) pinned the composition root's answers; round 12 opened the
  * production admin host (OD-CR-3 'chokepoint', ADMIN-R12; the 'refuse' cells
  * here run the switch's other position, which the edge-test origin keeps), and
- * there is no unported retry-after (OD-CR-6(iv)). Round 12 also answers the
- * accountless performance authorization with production's definite 403;
- * round 19 runs production's earlier answers first, through an injected
- * preamble (stubbed to pass here; the real one is proved by
- * cloud-run/retired-performance-authorization.check.mjs and over PostgreSQL).
+ * there is no unported retry-after (OD-CR-6(iv)). Owner decision 2026-10-10
+ * (decision 1) restored the accountless performance intake: the grant,
+ * capabilities and reports are ported like scope (stub families here; the
+ * real family is proved by cloud-run/routes/performance-telemetry.check.mjs
+ * and, over PostgreSQL, by the production-host, origin edge-test and E12
+ * specs), and only the signed-in consent route stays retired.
  */
 
 interface TestBindings extends Env {
@@ -71,7 +72,6 @@ interface TestBindings extends Env {
 interface ResolvedRoute {
   readonly disposition: string;
   readonly handler: ((request: Request) => Promise<Response>) | null;
-  readonly answer: { readonly status: number; readonly code: string } | null;
 }
 interface ProductionRegistry {
   readonly unportedRouteIds: readonly string[];
@@ -92,7 +92,9 @@ const ACCESS_AUD = "b".repeat(64);
 const ACCESS_KID = "synthetic-parity-access-key";
 const ALL_METHODS = Object.freeze(["GET", "POST", "DELETE", "PUT", "PATCH", "HEAD"]);
 const ADMIN_IDS: readonly string[] = hostDispatch.ORIGIN_ADMIN_ROUTE_IDS;
-const SCOPE: readonly string[] = productionRegistry.POSTGRES_SCOPE_ROUTE_IDS;
+const PERFORMANCE: readonly string[] = productionRegistry.PERFORMANCE_ROUTE_IDS;
+/** The smallest ported set: scope and the restored performance intake (decision 1). */
+const SCOPE: readonly string[] = [...productionRegistry.POSTGRES_SCOPE_ROUTE_IDS, ...PERFORMANCE];
 const CONTESTED: readonly string[] = productionRegistry.OD_CR_1_CONTESTED_ROUTE_IDS;
 
 function workerEnv(overrides: Record<string, unknown> = {}): Env {
@@ -115,17 +117,10 @@ function origin(
   unportedRetryAfterSeconds: number | null = 60,
 ): Origin {
   const calls: string[] = [];
-  const handlers = new Map<string, () => Promise<Response | null>>(ported.map((id) => [id, async () => {
+  const handlers = new Map<string, () => Promise<Response>>(ported.map((id) => [id, async () => {
     calls.push(id);
     return Response.json({ served: id });
   }]));
-  // Round 19: each retired-definite route takes its preamble; this one passes.
-  for (const id of productionRegistry.RETIRED_DEFINITE_ROUTE_IDS) {
-    handlers.set(id, async () => {
-      calls.push(`preamble:${id}`);
-      return null;
-    });
-  }
   const registry: ProductionRegistry = productionRegistry.createProductionRouteRegistry({
     routePolicy: WORKER_ROUTE_POLICY,
     handlers,
@@ -632,18 +627,28 @@ describe("(F) documented deviations from the Worker", () => {
       }
     });
 
-  it("round 19: once its preamble passes, the accountless performance authorization is production's definite 403, never the 503", async () => {
+  it("decision 1: the restored performance intake reaches its family, never the unported 503", async () => {
+    expect([...PERFORMANCE]).toStrictEqual(["accountless_telemetry_performance_authorization",
+      "telemetry_performance_capabilities", "telemetry_performance_reports"]);
     for (const retryAfterSeconds of [60, null] as const) {
       const production = origin(workerEnv(), "refuse", undefined, retryAfterSeconds);
-      const id = "accountless_telemetry_performance_authorization";
-      expect(production.registry.resolve(id).disposition).toBe("definite");
-      expect(production.registry.unportedRouteIds).not.toContain(id);
-      const route = WORKER_ROUTE_POLICY.find((entry) => entry.id === id)!;
-      const response = await production.handler(new Request(PUBLIC_ORIGIN + route.pathname, { method: "POST" }));
-      expect(await snapshot(response)).toStrictEqual({ status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED", allow: null,
-        cacheControl: "no-store", location: null });
-      expect(response.headers.get("retry-after")).toBeNull();
-      expect(production.calls).toStrictEqual([`preamble:${id}`]);
+      const sent: string[] = [];
+      for (const id of PERFORMANCE) {
+        expect(production.registry.resolve(id).disposition, id).toBe("ported");
+        expect(production.registry.unportedRouteIds, id).not.toContain(id);
+        const route = WORKER_ROUTE_POLICY.find((entry) => entry.id === id)!;
+        for (const method of routeMethods(id)) {
+          const response = await production.handler(new Request(PUBLIC_ORIGIN + route.pathname, { method }));
+          expect(response.status, `${method} ${id}`).toBe(200);
+          expect(response.headers.get("cache-control"), id).toBe("no-store");
+          expect(response.headers.get("retry-after"), id).toBeNull();
+          expect(await response.json(), id).toStrictEqual({ served: id });
+          sent.push(id);
+        }
+      }
+      expect(production.calls).toStrictEqual(sent);
+      // The signed-in consent route stays retired: the unported 503.
+      expect(production.registry.resolve("telemetry_performance_consent").disposition).toBe("unported");
     }
   });
 
