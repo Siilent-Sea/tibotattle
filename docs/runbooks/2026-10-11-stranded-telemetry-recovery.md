@@ -56,8 +56,8 @@ with an existing v1.1 head and READY days beyond that head. It:
 1. Requires current v1.1 authority and enabled processing.
 2. Leaves any participant with v1.2 manifests, a v1.2 head, or active typed
    v1.2 authorization to the successor protocol.
-3. Leaves a participant with a recently minted, unused predecessor to its
-   client. The quiet interval is ten minutes.
+3. Leaves an unused predecessor to its client for its full 24-hour lifetime.
+   Preview uses the same 24-hour cutoff as execution.
 4. Excludes a newer READY replacement of any covered day, including the six
    re-identification heads. It never chooses a smaller replacement or edits a
    head in place.
@@ -104,7 +104,10 @@ the actual origin bundle and admin assets. Verify the kernel identity and
 migration prefix remain unchanged. Preserve separate source, packaged image,
 staging, production and public aggregate evidence.
 
-The local candidate on 2026-10-11 passed all 18 PostgreSQL domain tests without
+The added aged-predecessor regression requires a fresh PostgreSQL 17 run for the
+24-hour preview correction; the earlier results below do not qualify it.
+
+The earlier local candidate on 2026-10-11 passed all 18 PostgreSQL domain tests without
 skips, the 97 production-host checks, the affected route/admin tests, typecheck,
 architecture, documentation and preflight checks. The origin bundle retained
 kernel 16 and the migration chain. Cursor tampering and reuse under a different
@@ -159,9 +162,11 @@ only if durable schema changes; this candidate adds neither.
    or counts change materially, stop and review a fresh preview.
 4. Run the same action with `dryRun:false` through the owner UI or reviewed API
    caller. Never reuse a preview cursor for execution. A refused or partial page
-   is not a completed repair. On 5xx or lost acknowledgement, stop and re-preview
-   after the quiet interval. Do not edit heads, mark staged rows READY, delete
-   tokens, backfill missing records, or rerun a diagnostic to force progress.
+   is not a completed repair. On 5xx or lost acknowledgement, stop and re-preview.
+   A still-unused predecessor remains client-owned for its 24-hour lifetime;
+   wait for that fence before retrying execution. Do not edit heads, mark staged
+   rows READY, delete tokens, backfill missing records, or rerun a diagnostic to
+   force progress.
 5. Under approved aggregate postcheck reads, confirm adopted day counts, head
    advances, consumed tokens and one journal append per accepted activation.
    Let the existing analytics-refresh path consume the journal. Confirm its
