@@ -4,7 +4,7 @@ import { test } from "node:test";
 
 import { formatReportingTime } from "../public/ui-format.js";
 import { ADMIN_MODEL_CONFIG } from "../public/telemetry-shared.generated.js";
-import { createAdminAllowancePreviewPayload } from "./fixtures/admin-allowance.js";
+import { createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload } from "./fixtures/admin-allowance.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
   new URL(`./fixtures/${name}`, import.meta.url),
@@ -2217,6 +2217,33 @@ test("database checks remain independent, label stale data and recover", async (
   }, {}, () => reply());
 });
 
+test("round 12: the Google Cloud origin's v0.2 health shows the removed ledger, and v0.6 an unavailable history", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.schemaVersion = "admin-overview-v0.6";
+  overview.service.telemetryStorageMode = "typed";
+  overview.snapshots = [];
+  overview.pendingHistoricalRebuilds = null;
+  overview.pendingHistoricalRebuildsBounded = null;
+  overview.historicalPublication = { status: "unavailable" };
+  overview.deletionLedger = { status: "unavailable" };
+  overview.counts.contributions.synthetic = { status: "unavailable" };
+  const health = await fixture("admin-database-health-valid.json");
+  health.schemaVersion = "admin-database-health-v0.2";
+  health.databases[1] = { role: "deletion_ledger", status: "not_applicable", responseMs: null, databaseBytes: null };
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[0] ? response(overview) : unavailableResponse(),
+    async documentRef => {
+      const status = documentRef.byId.get("database-health-status");
+      await waitFor(() => status.textContent === "All required API databases readable");
+      assert.deepEqual(tableTexts(documentRef, "database-health-rows")[1],
+        ["Deletion ledger", "Removed (append-only)", "Not applicable", "Not applicable"]);
+      await waitFor(() => /Historical model publication/u.test(allText(documentRef.byId.get("lifecycle-status"))));
+      const lifecycle = allText(documentRef.byId.get("lifecycle-status"));
+      assert.match(lifecycle, /unavailable on this host/u);
+      assert.doesNotMatch(lifecycle, /Historical model days/u, "no invented count");
+      assert.ok(documentRef.byId.get("counts").children.length > 0, "the rest of the overview renders");
+    }, {}, () => response(health));
+});
+
 test("database failures reach attention and older Workers show unavailable without losing overview", async () => {
   const overview = await fixture("admin-overview-valid.json");
   const degraded = await fixture("admin-database-health-valid.json");
@@ -2294,5 +2321,167 @@ test("distribution quality summary labels retained evidence after a failed refre
     failed = false;
     await documentRef.byId.get("refresh").listeners.get("click")();
     await waitFor(() => !documentRef.byId.get("distribution-source-summary").textContent.startsWith("Refresh failed"));
+  });
+});
+
+
+// Explicit synthetic historical/current identities; keep the shared main
+// fixture's immutable v0.4 Pro10 contract unchanged.
+function createAdminLegacyAllowancePreviewPayload(spanFloorPp = 25) {
+  const preview = createAdminAllowancePreviewPayload();
+  preview.schemaVersion = "admin-community-allowance-preview-v0.3";
+  preview.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+  preview.models.basis = "seven_day_codex_pro20x_equivalent_per_model_composition";
+  preview.qualification = `shared_reset_fit_gates_${spanFloorPp}pp_span_floor`;
+  preview.spanFloorPp = spanFloorPp;
+  preview.plans = [
+    { planType: "pro", label: "Pro 20x", multiplier: 1 },
+    { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+    { planType: "plus", label: "Plus", multiplier: 20 },
+  ];
+  for (const day of preview.days) delete day.byPlanType.promax;
+  return preview;
+}
+
+function createAdminPro20AllowancePreviewPayload() {
+  const preview = createAdminPro10AllowancePreviewPayload();
+  preview.schemaVersion = "admin-community-allowance-preview-v0.5";
+  preview.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview";
+  preview.models.basis = "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
+  preview.plans = [
+    { planType: "pro", label: "Pro 20x", multiplier: 1 },
+    { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+    { planType: "promax", label: "Pro Max 25x", multiplier: 0.8 },
+    { planType: "plus", label: "Plus", multiplier: 20 },
+  ];
+  return preview;
+}
+
+test("admin v0.4 renders declared Pro10 reference values and correct own-plan values without changing old v0.3", async () => {
+  for (const [preview, reference, labels, ownValues] of [
+    [createAdminLegacyAllowancePreviewPayload(), "Pro 20×", ["Pro 20×", "Pro 5×", "Plus"], ["$2,119", "$479", "$95"]],
+    [createAdminPro10AllowancePreviewPayload(), "Pro 10×", ["Pro 10×", "Pro 5×", "Pro Max 25×", "Plus"], ["$2,119", "$959", "$5,298", "$190"]],
+  ]) {
+    await withAllowancePage(preview, async documentRef => {
+      assert.equal(documentRef.byId.get("admin-community-basis-heading").textContent, `${reference}-equivalent allowance`);
+      assert.equal(allowanceNodes(documentRef, ".admin-allowance-unit")[0].textContent, `API-equivalent USD / ${reference} week`);
+      assert.equal(allowanceNodes(documentRef, ".admin-allowance-value")[0].textContent, "$2,169");
+      for (const mode of ["plans", "models"]) {
+        selectAllowanceControl(documentRef, "admin-community-mode-controls", `button[data-allowance-mode="${mode}"]`);
+        const svg = allowanceNodes(documentRef, 'svg[role="img"]')[0];
+        assert.match(svg.getAttribute("aria-description"), new RegExp(`${reference} basis`, "u"));
+        assert.ok(svg.getAttribute("aria-label").includes(`${reference}-equivalent`));
+        assert.equal(allowanceNodes(documentRef, ".allowance-summary-caption")[0].textContent, `API-equivalent USD / ${reference} week`);
+        assert.ok(allowanceNodes(documentRef, ".admin-allowance-dot").every(dot => dot.getAttribute("aria-label").includes(`/${reference} week`)));
+        if (mode === "models") {
+          const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+          assert.equal(cards.find(card => card.querySelector("h3").textContent === "GPT-5.6 Sol").querySelector(".allowance-summary-value").textContent, "$2,469");
+          continue;
+        }
+        const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+        assert.deepEqual(cards.map(card => card.querySelector("h3").textContent), labels);
+        assert.deepEqual(cards.map(card => card.querySelector(".allowance-plan-value").textContent), ownValues.map(value => `This plan: ${value}/week at API prices`));
+        assert.deepEqual(cards.map(card => card.querySelector(".allowance-summary-value").textContent),
+          preview.plans.map(plan => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(preview.days.at(-1).byPlanType[plan.planType].centralUsd)));
+        const text = descendantNodes(documentRef.byId.get("admin-community-allowance-result")).map(node => node.textContent).join(" ");
+        assert.ok(text.includes(`Chart scaled to ${reference}`));
+        if (preview.schemaVersion.endsWith("v0.4")) {
+          assert.ok(cards[2].classList.contains("allowance-series-2"), "Pro Max retains the main branch's reviewed color");
+          assert.ok(cards[3].classList.contains("allowance-series-3"), "Plus retains the main branch's reviewed color");
+          assert.match(text, /Pro 5× ×2, Pro Max 25× ×0.4, Plus ×10/u);
+          assert.doesNotMatch(text, /Pro 20[×x]/u);
+          const container = documentRef.byId.get("admin-community-allowance-result");
+          const legend = container.querySelector('button[data-allowance-plan="promax"]');
+          container.listeners.get("click")({ target: legend });
+          assert.equal(container.querySelector('button[data-allowance-plan="promax"]').getAttribute("aria-pressed"), "true");
+          assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 30);
+          assert.equal(container.querySelector(".admin-allowance-dot").getAttribute("aria-label").includes("Pro Max 25×"), true);
+          assert.ok(container.querySelectorAll(".admin-allowance-dot").at(-1).getAttribute("aria-label").includes("$2,119/Pro 10× week"), "chart retains the published reference amount, separate from the $5,298 own-plan card value");
+        }
+      }
+    });
+  }
+});
+
+
+test("admin v0.4 leaves unavailable Pro Max evidence explicit without an invented own-plan value", async () => {
+  const preview = createAdminPro10AllowancePreviewPayload();
+  for (const day of preview.days) day.byPlanType.promax = {
+    fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null,
+  };
+  await withAllowancePage(preview, async documentRef => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const card = allowanceNodes(documentRef, ".admin-allowance-plan-summary")[2];
+    assert.equal(card.querySelector("h3").textContent, "Pro Max 25×");
+    assert.equal(card.querySelector(".allowance-summary-value").textContent, "—");
+    assert.equal(card.querySelector(".allowance-plan-value"), null);
+    assert.match(descendantNodes(card).map(node => node.textContent).join(" "), /No qualifying fits/u);
+    assert.equal(allowanceNodes(documentRef, ".admin-allowance-dot").some(dot => dot.classList.contains("allowance-series-2")), false);
+  });
+});
+
+
+test("current admin v0.5 renders Pro20 reference values and exact own-plan conversions", async () => {
+  const preview = createAdminPro20AllowancePreviewPayload();
+  await withAllowancePage(preview, async documentRef => {
+    assert.equal(documentRef.byId.get("admin-community-basis-heading").textContent, "Pro 20×-equivalent allowance");
+    assert.equal(allowanceNodes(documentRef, ".admin-allowance-unit")[0].textContent, "API-equivalent USD / Pro 20× week");
+    assert.equal(allowanceNodes(documentRef, ".admin-allowance-value")[0].textContent, "$2,169");
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+    assert.deepEqual(cards.map(card => card.querySelector("h3").textContent), ["Pro 20×", "Pro 5×", "Pro Max 25×", "Plus"]);
+    assert.deepEqual(cards.map(card => card.querySelector(".allowance-summary-value").textContent), ["$2,119", "$1,918", "$2,119", "$1,900"]);
+    assert.deepEqual(cards.map(card => card.querySelector(".allowance-plan-value").textContent), [
+      "This plan: $2,119/week at API prices", "This plan: $479/week at API prices",
+      "This plan: $2,649/week at API prices", "This plan: $95/week at API prices",
+    ], "divide the unrounded reference amount by the declared plan factor before formatting");
+    assert.ok(cards[2].classList.contains("allowance-series-2"));
+    assert.ok(cards[3].classList.contains("allowance-series-3"));
+    assert.equal(allowanceNodes(documentRef, ".allowance-summary-caption")[0].textContent, "API-equivalent USD / Pro 20× week");
+    const text = descendantNodes(container).map(node => node.textContent).join(" ");
+    assert.match(text, /Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Pro Max 25× ×0.8, Plus ×20/u);
+    assert.doesNotMatch(text, /Pro 10[×x]/u);
+    const svg = allowanceNodes(documentRef, 'svg[role="img"]')[0];
+    assert.match(svg.getAttribute("aria-description"), /Pro 20× basis/u);
+    assert.match(svg.getAttribute("aria-label"), /Pro 20×-equivalent/u);
+    const legend = container.querySelector('button[data-allowance-plan="promax"]');
+    container.listeners.get("click")({ target: legend });
+    assert.equal(container.querySelector('button[data-allowance-plan="promax"]').getAttribute("aria-pressed"), "true");
+    assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 30);
+    assert.match(container.querySelectorAll(".admin-allowance-dot").at(-1).getAttribute("aria-label"), /\$2,119\/Pro 20× week/u,
+      "the plotted reference amount stays separate from the $2,649 own-plan card");
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="models"]');
+    const modelCards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+    assert.equal(modelCards.find(card => card.querySelector("h3").textContent === "GPT-5.6 Sol")
+      .querySelector(".allowance-summary-value").textContent, "$2,469");
+    assert.equal(allowanceNodes(documentRef, ".allowance-summary-caption")[0].textContent, "API-equivalent USD / Pro 20× week");
+  });
+});
+
+test("current admin v0.5 keeps unavailable Pro Max and missing days as explicit evidence gaps", async () => {
+  const preview = createAdminPro20AllowancePreviewPayload();
+  for (const day of preview.days) day.byPlanType.promax = {
+    fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null,
+  };
+  const missingDay = preview.days.at(-15);
+  missingDay.byPlanType.pro = {
+    fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null,
+  };
+  await withAllowancePage(preview, async documentRef => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+    const proMax = cards[2];
+    assert.equal(proMax.querySelector("h3").textContent, "Pro Max 25×");
+    assert.equal(proMax.querySelector(".allowance-summary-value").textContent, "—");
+    assert.equal(proMax.querySelector(".allowance-plan-value"), null);
+    assert.match(descendantNodes(proMax).map(node => node.textContent).join(" "), /No qualifying fits/u);
+    assert.equal(allowanceNodes(documentRef, ".admin-allowance-dot").some(dot => dot.classList.contains("allowance-series-2")), false);
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    container.listeners.get("click")({ target: container.querySelector('button[data-allowance-plan="pro"]') });
+    const dots = allowanceNodes(documentRef, ".admin-allowance-dot");
+    assert.equal(dots.length, 29, "the missing day never gains a synthetic point");
+    assert.equal(dots.some(dot => dot.getAttribute("aria-label").includes(missingDay.day)), false);
+    assert.equal(allowanceNodes(documentRef, ".admin-allowance-line").length, 2, "the line breaks across the missing day");
   });
 });

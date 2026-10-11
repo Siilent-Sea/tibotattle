@@ -14,7 +14,7 @@ import {
   V11_ADOPTION_OUTCOMES,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
-import { planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION, planWeeklyApiEquivalentUsd } from "./community-data.js";
 import { allowanceModelPresentation, modelThemeIcon } from "./community-view.js";
 
 const state = {
@@ -1365,9 +1365,15 @@ function renderDatabaseHealth() {
     : "No usable database check loaded. Refresh to retry; older deployments may not provide this endpoint.";
   const labels = { primary: "Primary service and telemetry", deletion_ledger: "Deletion ledger", analytics: "Separate analytics" };
   const statuses = { reachable: "Readable", unavailable: "Read failed", timeout: "Timed out (5 seconds)", not_configured: "Binding unavailable", not_applicable: "Not used in JSON mode" };
+  // The removed ledger (admin-database-health-v0.2) is not a JSON-mode role.
+  const statusLabel = row => row.role === "deletion_ledger" && row.status === "not_applicable"
+    ? "Removed (append-only)" : statuses[row.status];
+  const measurement = (row, value) => row.status === "not_applicable" ? "Not applicable"
+    : value === null ? "Unavailable" : value;
   $("#database-health-rows").replaceChildren(...(snapshot?.databases ?? []).map(row => tableRow([
-    labels[row.role], statuses[row.status], row.responseMs === null ? "Unavailable" : `${formatNumber(row.responseMs)} ms`,
-    row.databaseBytes === null ? "Unavailable" : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`,
+    labels[row.role], statusLabel(row),
+    measurement(row, row.responseMs === null ? null : `${formatNumber(row.responseMs)} ms`),
+    measurement(row, row.databaseBytes === null ? null : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`),
   ])));
 }
 
@@ -2167,7 +2173,10 @@ function renderOperational(overview) {
   const reconciliation = overview.reconciliation;
   const daily = overview.dailyPublication;
   const historical = overview.historicalPublication;
-  const publicationRows = historical
+  const historicalUnavailable = historical?.status === "unavailable";
+  const publicationRows = historicalUnavailable
+    ? [["Historical model publication", "unavailable on this host (no source yet)"]]
+    : historical
     ? [
       ["Historical model days", count(
         historical.publishedDays,
@@ -2547,11 +2556,20 @@ const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
-  pro: Object.freeze({ label: "Pro 10×", className: "allowance-series-0" }),
+  pro: Object.freeze({ label: "Pro 20×", className: "allowance-series-0" }),
   prolite: Object.freeze({ label: "Pro 5×", className: "allowance-series-1" }),
   promax: Object.freeze({ label: "Pro Max 25×", className: "allowance-series-2" }),
   plus: Object.freeze({ label: "Plus", className: "allowance-series-3" }),
 });
+
+function adminAllowanceReference(preview) {
+  return preview.basis === "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview"
+    ? "Pro 10×" : "Pro 20×";
+}
+
+function adminAllowancePlanLabel(plan) {
+  return plan.label.replace(/x$/u, "×");
+}
 
 function adminAllowanceTickStep(span, target = 4) {
   if (!Number.isFinite(span) || span <= 0) return 1;
@@ -2587,7 +2605,7 @@ function adminAllowanceSegments(points) {
 
 /**
  * Pure geometry for the admin-only merge preview. Every line shares the same
- * UTC date and Pro-10x-equivalent dollar axes, so switching views changes the
+ * UTC date and declared reference-equivalent dollar axes, so switching views changes the
  * evidence shown rather than the meaning of the scale.
  */
 export function adminAllowanceChartModel(preview, {
@@ -2615,6 +2633,7 @@ export function adminAllowanceChartModel(preview, {
   const planSeries = preview.plans.map((plan) => ({
     key: plan.planType,
     ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
+    label: adminAllowancePlanLabel(plan),
   }));
   const modelDayByDay = new Map(
     (preview.models?.days ?? []).map((day) => [day.day, day]),
@@ -2925,6 +2944,7 @@ function appendAdminAllowanceChart(container, preview) {
     container.append(empty);
     return;
   }
+  const reference = adminAllowanceReference(preview);
   const figure = document.createElement("div");
   figure.className = "community-daily-chart community-allowance-chart";
   if (model.activeSeriesKey !== null) {
@@ -2935,14 +2955,14 @@ function appendAdminAllowanceChart(container, preview) {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
     tabindex: 0,
-    "aria-description": "Weekly API-equivalent USD on a Pro 10× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
+    "aria-description": `Weekly API-equivalent USD on a ${reference} basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.`,
     "aria-label": state.allowanceMode === "combined"
-      ? "Combined Pro 10x-equivalent community allowance by day"
+      ? `Combined ${reference}-equivalent community allowance by day`
       : state.allowanceMode === "models"
-        ? "Pro 10x-equivalent per-model allowance by day"
+        ? `${reference}-equivalent per-model allowance by day`
         : model.activePlanFilter === null
-          ? "Pro 10x-equivalent community allowance by plan and day"
-          : `${model.series[0].label} Pro 10x-equivalent community allowance by day`,
+          ? `${reference}-equivalent community allowance by plan and day`
+          : `${model.series[0].label} ${reference}-equivalent community allowance by day`,
   });
   for (const tick of model.dollarTicks) {
     svg.append(adminAllowanceSvg("line", "chart-grid", {
@@ -3018,7 +3038,7 @@ function appendAdminAllowanceChart(container, preview) {
     }
     const markers = new Set(series.markerPoints);
     for (const point of series.points) {
-      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 10× week at API prices`
+      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/${reference} week at API prices`
         + ` · ${allowanceCountLabel(point.participantCount, "account")}`
         + (model.mode === "models" ? "" : ` · ${allowanceCountLabel(point.fitCount, "fit")}`);
       const dot = adminAllowanceSvg(
@@ -3064,7 +3084,7 @@ function appendAdminAllowanceChart(container, preview) {
   if (model.mode === "plans") {
     const method = document.createElement("p");
     method.className = "admin-allowance-meta";
-    method.textContent = "Chart scaled to Pro 10×: Pro 10× ×1, Pro 5× ×2, Pro Max 25× ×0.4, Plus ×10."
+    method.textContent = `Chart scaled to ${reference}: ${preview.plans.map(plan => `${adminAllowancePlanLabel(plan)} ×${plan.multiplier}`).join(", ")}.`
       + " Smaller card values show each plan’s own week at API prices."
       + " Shading: middle 80% of qualifying reset fits. Missing days stay gaps.";
     container.append(method);
@@ -3081,7 +3101,7 @@ function appendCombinedAllowanceSummary(container, preview) {
   value.textContent = allowanceUsd(latest.summary.centralUsd);
   const unit = document.createElement("span");
   unit.className = "admin-allowance-unit";
-  unit.textContent = "API-equivalent USD / Pro 10× week";
+  unit.textContent = `API-equivalent USD / ${adminAllowanceReference(preview)} week`;
   const meta = document.createElement("p");
   meta.className = "admin-allowance-meta";
   const evidence = document.createElement("span");
@@ -3108,7 +3128,7 @@ function appendCombinedAllowanceSummary(container, preview) {
 }
 
 function appendPlanAllowanceSummaries(container, preview) {
-  appendAllowanceCardsCaption(container);
+  appendAllowanceCardsCaption(container, preview);
   const list = document.createElement("div");
   list.className = "admin-allowance-plan-summaries allowance-summary-cards";
   for (const plan of preview.plans) {
@@ -3120,7 +3140,7 @@ function appendPlanAllowanceSummaries(container, preview) {
       item.classList.add("admin-allowance-plan-summary-selected");
     }
     const label = document.createElement("h3");
-    label.textContent = style.label;
+    label.textContent = adminAllowancePlanLabel(plan);
     const value = document.createElement("strong");
     value.className = "allowance-summary-value";
     value.textContent = latest === null ? "—" : allowanceUsd(latest.summary.centralUsd);
@@ -3134,7 +3154,8 @@ function appendPlanAllowanceSummaries(container, preview) {
       ? `Middle 80% ${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)}`
       : "Middle 80% unavailable";
     item.append(label, value);
-    const planUsd = planWeeklyApiEquivalentUsd(latest?.summary.centralUsd, plan.planType);
+    const planUsd = planWeeklyApiEquivalentUsd(latest?.summary.centralUsd, plan.planType,
+      adminAllowanceReference(preview) === "Pro 10×" ? COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION : undefined);
     if (planUsd !== null) {
       const actual = document.createElement("p");
       actual.className = "allowance-plan-value";
@@ -3147,10 +3168,10 @@ function appendPlanAllowanceSummaries(container, preview) {
   container.append(list);
 }
 
-function appendAllowanceCardsCaption(container) {
+function appendAllowanceCardsCaption(container, preview) {
   const caption = document.createElement("p");
   caption.className = "allowance-summary-caption";
-  caption.textContent = "API-equivalent USD / Pro 10× week";
+  caption.textContent = `API-equivalent USD / ${adminAllowanceReference(preview)} week`;
   container.append(caption);
 }
 
@@ -3232,7 +3253,7 @@ function appendModelAllowanceSummaries(container, preview) {
       + " Qualified historical points fill in as background calculations complete.";
     container.append(empty);
   }
-  appendAllowanceCardsCaption(container);
+  appendAllowanceCardsCaption(container, preview);
   const grid = document.createElement("div");
   grid.className = "admin-allowance-plan-summaries allowance-summary-cards";
   for (const model of modelConfig) {
@@ -3295,6 +3316,9 @@ function renderAdminCommunityAllowance(preview) {
   const badge = $("#admin-community-status");
   if (!container || !badge) return;
   container.replaceChildren();
+  const heading = $("#admin-community-basis-heading");
+  if (heading) heading.textContent = preview === null
+    ? "Allowance estimates" : `${adminAllowanceReference(preview)}-equivalent allowance`;
   if (preview === null) {
     badge.className = "admin-source-badge admin-source-partial";
     badge.textContent = "Preview unavailable";
