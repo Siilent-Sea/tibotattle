@@ -39,6 +39,9 @@ import { promisify } from "node:util";
 import {
   ANALYTICS_KERNEL_CLOSURE_PLUMBING,
   ANALYTICS_KERNEL_FACADE_COMMIT_MASK,
+  ANALYTICS_REFRESH_JOB_ENTRY,
+  ANALYTICS_REFRESH_WORKER_ENTRY,
+  ANALYTICS_REPRICE_JOB_ENTRY,
   analyticsKernelFacadeComputeText,
   computeAnalyticsKernelIdentity,
   resolveAnalyticsKernelRegistryEntry,
@@ -97,6 +100,10 @@ const REGISTRY_PINS = Object.freeze([
   // breakdowns v1.5) beside the retained Pro 10x v0.4 contract; pricing
   // identity unchanged.
   "871135e33844da3f2142da76da1429d0cd02a1b0544c1eba264680ce47a8447f",
+  // Kernel 17: current main's unused allowance-speed barrel export and the
+  // Pro Max source-evidence comment join the GCP closure; vendored pricing,
+  // analytics computations, pricing class and orchestration method are unchanged.
+  "09c3b697114e550855d5c5e7c57001a097a970306a4293422054b6cfd8582212",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -186,6 +193,95 @@ test("an entry names the code this checkout builds, and its vendored kernels", a
   assert.equal(current[0].productionCommit, manifest.sourceCommit);
   assert.equal(current[0].priceRegistrySha256, prices.APP_PRICE_REGISTRY_SHA256);
   assert.equal(current[0].priceRegistryVersion, prices.APP_PRICE_REGISTRY_VERSION);
+});
+
+test("main convergence adds only unused immutable Job policy initialization; Worker and pricing stay unchanged", async () => {
+  // Reconstruct only the two reviewed GCP entry-file differences in memory.
+  // No Git-history dependency: the Worker CI job intentionally has depth 1.
+  // The original kernel and this source convergence keep their identities;
+  // removing a runtime-used export would fail compilation or byte equivalence.
+  const repositoryRoot = resolve(WORKER_ROOT, "../..");
+  const exportBlock = [
+    "export {", "  CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY,",
+    "  includedAllowanceSpeedWeight,", '} from "./src/included-allowance-speed.js";', "", "",
+  ].join("\n");
+  const currentComment = "// promax is verified in reviewed source and installed binary plan vocabulary.\n"
+    + "// Provider allowance and window semantics remain unverified.";
+  const priorComment = "// promax is source-verified but remains provisional until binary and allowance\n"
+    + "// semantics are reviewed for release.";
+  const quotaPath = "packages/quota-analysis/index.js";
+  const constantsPath = "packages/telemetry-contract/src/constants.js";
+  const quota = await readFile(join(repositoryRoot, quotaPath), "utf8");
+  const constants = await readFile(join(repositoryRoot, constantsPath), "utf8");
+  assert.equal(quota.split(exportBlock).length, 2, "the reviewed unused export occurs once");
+  assert.equal(constants.split(currentComment).length, 2, "the source-evidence comment occurs once");
+  const sources = new Map([
+    [quotaPath, Buffer.from(quota.replace(exportBlock, ""))],
+    [constantsPath, Buffer.from(constants.replace(currentComment, priorComment))],
+  ]);
+  const priorBytes = (path) => {
+    const normalized = String(path).split(sep).join("/");
+    for (const [sourcePath, bytes] of sources) {
+      const [, packageName, ...inside] = sourcePath.split("/");
+      if (normalized.endsWith(`/${sourcePath}`)
+          || normalized.endsWith(`/node_modules/@app-usagemonitor/${packageName}/${inside.join("/")}`)) return bytes;
+    }
+    return undefined;
+  };
+  const virtual = { name: "reviewed-main-convergence-baseline", setup(builder) {
+    builder.onLoad({ filter: /\.js$/ }, (args) => {
+      const bytes = priorBytes(args.path);
+      return bytes === undefined ? undefined : { contents: bytes.toString("utf8"), loader: "js", resolveDir: dirname(args.path) };
+    });
+  } };
+  const build = (options) => esbuild().build({ ...options, plugins: [virtual, ...(options.plugins ?? [])] });
+  const cwd = join(WORKER_ROOT, "cloud-run");
+  const prior = await computeAnalyticsKernelIdentity({ build, options: BUILD_OPTIONS, vendorRoot: VENDOR_ROOT, cwd,
+    read: (path, ...rest) => priorBytes(path) ?? readFile(path, ...rest) });
+  const current = await identityWith();
+  assert.notEqual(current.computeClosureSha256, prior.computeClosureSha256);
+  assert.equal(current.vendorManifestSha256, prior.vendorManifestSha256);
+  assert.equal(current.pricerSha256, prior.pricerSha256, "the pricing class is unchanged");
+  assert.equal(current.pricingMethodVersion, prior.pricingMethodVersion);
+  const entries = (await registry()).kernels;
+  const previous = entries[15];
+  const convergence = entries[16];
+  assert.equal(previous.kernelId, 16);
+  assert.equal(convergence.kernelId, 17);
+  for (const key of ENTRY_KEYS.filter((key) => !["kernelId", "computeClosureSha256"].includes(key))) {
+    assert.equal(convergence[key], previous[key], `kernel 17 preserves ${key}`);
+  }
+  const options = { ...BUILD_OPTIONS, absWorkingDir: cwd, write: false, metafile: true,
+    entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY, ANALYTICS_REPRICE_JOB_ENTRY],
+    outdir: join(cwd, "dist") };
+  const [oldBundle, currentBundle] = await Promise.all([build(options), esbuild().build(options)]);
+  const outputs = (result) => new Map(result.outputFiles.map(({ path, text }) => [path.split(sep).at(-1), text]));
+  const oldOutputs = outputs(oldBundle);
+  const currentOutputs = outputs(currentBundle);
+  assert.deepEqual([...currentOutputs.keys()].sort(),
+    ["analytics-refresh-worker.js", "analytics-refresh.js", "analytics-reprice.js"].sort());
+  assert.equal(currentOutputs.get("analytics-refresh-worker.js"), oldOutputs.get("analytics-refresh-worker.js"),
+    "the compute Worker's complete emitted runtime is byte-identical");
+  for (const name of ["analytics-refresh.js", "analytics-reprice.js"]) {
+    const code = currentOutputs.get(name);
+    // The Job import barrel initializes this private constant even though
+    // no Job consumes it. Keep that real byte change in the registered
+    // closure; compare every other emitted byte rather than calling it equal.
+    const blocks = [...code.matchAll(/\n\/\/ [^\n]*\/quota-analysis\/src\/included-allowance-speed\.js\n[\s\S]*?(?=\n\/\/ )/gu)];
+    assert.equal(blocks.length, 1, `${name} has one reviewed policy initializer`);
+    const initializer = blocks[0][0];
+    const calls = [...initializer.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$.]*)\(/gu)].map((match) => match[1]);
+    assert.deepEqual([...new Set(calls)].sort(), ["Object.freeze", "__esm"],
+      `${name} adds only module initialization and immutable literal construction`);
+    let rest = code.replace(initializer, "");
+    assert.doesNotMatch(rest, /\b(?:FAST_MODELS|CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY|includedAllowanceSpeedWeight)\b/u,
+      `${name} never reads or invokes the newly reachable policy`);
+    const call = "    init_included_allowance_speed();\n";
+    assert.equal(rest.split(call).length, 2, `${name} initializes the unused module once`);
+    rest = rest.replace(call, "");
+    assert.doesNotMatch(rest, /\binit_included_allowance_speed\b/u);
+    assert.equal(rest, oldOutputs.get(name), `${name} preserves all remaining emitted runtime bytes`);
+  }
 });
 
 test("the closure holds every module that decides a stored value and no I/O plumbing", async () => {

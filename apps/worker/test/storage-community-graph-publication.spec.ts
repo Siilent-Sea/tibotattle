@@ -365,8 +365,13 @@ describe('isolated allowance graph publication',()=>{
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT method FROM analytics_community_model_publications').first('method'))
     .toBe(STORAGE_GRAPH_PROJECTION_METHOD);
   const preview=await readPublishedStorageCommunityAdminPreview(bindings());
+  expect(preview).toMatchObject({
+    schemaVersion:'admin-community-allowance-preview-v0.5',
+    basis:'seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview',
+    models:{basis:'seven_day_codex_pro20x_equivalent_per_model_composition_promax25'},
+  });
   expect(preview?.plans.map(plan=>[plan.planType,plan.multiplier])).toEqual([
-    ['pro',1],['prolite',2],['promax',0.4],['plus',10]]);
+    ['pro',1],['prolite',4],['promax',0.8],['plus',20]]);
  });
  it('fits allowance for an owner who has only ever uploaded v1.2',async()=>{
   const f=await v12Fixture();

@@ -6,7 +6,9 @@
  * and digests, so two different files numbered 0012 in one directory would
  * otherwise pass every existing check. Within each directory the NNNN_
  * prefixes must be unique (MIGRATION_NUMBER_DUPLICATE) and form one
- * contiguous run (MIGRATION_NUMBER_GAP) starting at 0001, except
+ * contiguous run (MIGRATION_NUMBER_GAP) starting at 0001. The sole reviewed
+ * collision is the immutable ingestion-isolation 0013 pair, accepted only
+ * with its exact full names and SHA-256 digests. The run-start exception is
  * legacy-migrations, which starts at 0046. A staged PostgreSQL directory
  * (postgres/staged-migrations/<role>) continues postgres/migrations/<role>:
  * its run may start anywhere, but none of its numbers may already be promoted.
@@ -21,7 +23,8 @@
  */
 
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
@@ -32,6 +35,36 @@ const MIGRATION_FILE_PATTERN = /^(\d{4})_[A-Za-z0-9][A-Za-z0-9_.-]*\.sql$/u;
 const RUN_START_EXCEPTIONS = Object.freeze({ "legacy-migrations": 46 });
 const EXCLUDED_SQL_DIRECTORIES = Object.freeze(["postgres/proposals"]);
 const SKIPPED_WALK_DIRECTORIES = new Set(["node_modules", "dist", ".git"]);
+
+// Independently published main/GCP files use full bare ledger names. Renaming
+// either would misrepresent applied history. Keep this exception aligned with
+// ingestion-isolation-sequence.check.mjs; every other prefix collision fails.
+const IMMUTABLE_ISOLATION_COLLISION = Object.freeze({
+  directory: "ingestion-isolation-migrations",
+  number: 13,
+  pins: Object.freeze([
+    Object.freeze({
+      name: "0013_performance_ultrafast.sql",
+      sha256: "88ac498493c869009e322e029ccff805236afd8d08ef299c39a3befda72d4aad",
+    }),
+    Object.freeze({
+      name: "0013_v12_quarantine_admission.sql",
+      sha256: "01f7b2f75dcbe9de8d42fb194702504db39f7ea8dbc475e28d09604230152344",
+    }),
+  ]),
+});
+
+async function isImmutableIsolationCollision(workerRoot, directory, number, files) {
+  const reviewed = IMMUTABLE_ISOLATION_COLLISION;
+  if (directory !== reviewed.directory || number !== reviewed.number
+      || files.length !== reviewed.pins.length
+      || files.some((name, index) => name !== reviewed.pins[index].name)) return false;
+  const matches = await Promise.all(reviewed.pins.map(async ({ name, sha256 }) => {
+    const bytes = await readFile(join(workerRoot, directory, name));
+    return createHash("sha256").update(bytes).digest("hex") === sha256;
+  }));
+  return matches.every(Boolean);
+}
 
 function toPosix(path) {
   return path.split(sep).join("/");
@@ -120,7 +153,7 @@ export async function inspectMigrationNumbering(workerRoot = WORKER_ROOT) {
       failures.push({ code: "MIGRATION_NAME_INVALID", directory, file });
     }
     for (const [number, files] of byNumber) {
-      if (files.length > 1) {
+      if (files.length > 1 && !(await isImmutableIsolationCollision(workerRoot, directory, number, files))) {
         failures.push({ code: "MIGRATION_NUMBER_DUPLICATE", directory, number: pad(number), files });
       }
     }
@@ -187,7 +220,7 @@ async function withWorkerCopy(directories, callback) {
 
 const codes = (result) => result.failures.map(({ code }) => code);
 
-test("every migration directory in this checkout is uniquely and contiguously numbered", async () => {
+test("every migration directory in this checkout has reviewed and contiguous numbering", async () => {
   const result = await inspectMigrationNumbering(WORKER_ROOT);
   assert.deepEqual(result.failures, []);
   const covered = result.directories.map(({ directory }) => directory);
@@ -218,6 +251,79 @@ test("two files numbered 0012 in a copy of ingestion-isolation-migrations fail M
     assert.equal(result.failures[0].directory, "ingestion-isolation-migrations");
     assert.equal(result.failures[0].number, "0012");
     assert.equal(result.failures[0].files.length, 2);
+  });
+});
+
+test("changing either immutable 0013 file fails MIGRATION_NUMBER_DUPLICATE", async () => {
+  for (const { name } of IMMUTABLE_ISOLATION_COLLISION.pins) {
+    await withWorkerCopy(["ingestion-isolation-migrations"], async (root) => {
+      const file = join(root, "ingestion-isolation-migrations", name);
+      const bytes = await readFile(file);
+      await writeFile(file, Buffer.concat([bytes, Buffer.from("-- synthetic changed bytes\n")]));
+      const result = await inspectMigrationNumbering(root);
+      assert.deepEqual(result.failures, [{
+        code: "MIGRATION_NUMBER_DUPLICATE",
+        directory: "ingestion-isolation-migrations",
+        number: "0013",
+        files: ["0013_performance_ultrafast.sql", "0013_v12_quarantine_admission.sql"],
+      }], `${name} must retain its exact reviewed bytes`);
+    });
+  }
+});
+
+test("swapping the immutable 0013 files' bytes fails MIGRATION_NUMBER_DUPLICATE", async () => {
+  await withWorkerCopy(["ingestion-isolation-migrations"], async (root) => {
+    const files = IMMUTABLE_ISOLATION_COLLISION.pins
+      .map(({ name }) => join(root, "ingestion-isolation-migrations", name));
+    const [first, second] = await Promise.all(files.map((file) => readFile(file)));
+    await writeFile(files[0], second);
+    await writeFile(files[1], first);
+    const result = await inspectMigrationNumbering(root);
+    assert.deepEqual(result.failures, [{
+      code: "MIGRATION_NUMBER_DUPLICATE",
+      directory: "ingestion-isolation-migrations",
+      number: "0013",
+      files: ["0013_performance_ultrafast.sql", "0013_v12_quarantine_admission.sql"],
+    }], "each full ledger name must retain its own reviewed digest");
+  });
+});
+
+test("an unknown replacement or third file with prefix 0013 fails MIGRATION_NUMBER_DUPLICATE", async () => {
+  for (const replace of [true, false]) {
+    await withWorkerCopy(["ingestion-isolation-migrations"], async (root) => {
+      const directory = join(root, "ingestion-isolation-migrations");
+      const original = join(directory, "0013_v12_quarantine_admission.sql");
+      // Even byte-identical SQL under an unreviewed full name is a new ledger
+      // entry, and adding it must not inherit the reviewed pair's exception.
+      await cp(original, join(directory, "0013_v12_quarantine_admission_extra.sql"));
+      if (replace) await rm(original);
+      const result = await inspectMigrationNumbering(root);
+      assert.deepEqual(result.failures, [{
+        code: "MIGRATION_NUMBER_DUPLICATE",
+        directory: "ingestion-isolation-migrations",
+        number: "0013",
+        files: replace ? [
+          "0013_performance_ultrafast.sql", "0013_v12_quarantine_admission_extra.sql",
+        ] : [
+          "0013_performance_ultrafast.sql", "0013_v12_quarantine_admission.sql",
+          "0013_v12_quarantine_admission_extra.sql",
+        ],
+      }]);
+    });
+  }
+});
+
+test("the immutable 0013 pair is not an exception in another migration directory", async () => {
+  await withWorkerCopy([], async (root) => {
+    await cp(join(WORKER_ROOT, "ingestion-isolation-migrations"), join(root, "synthetic-migrations"),
+      { recursive: true });
+    const result = await inspectMigrationNumbering(root);
+    assert.deepEqual(result.failures, [{
+      code: "MIGRATION_NUMBER_DUPLICATE",
+      directory: "synthetic-migrations",
+      number: "0013",
+      files: ["0013_performance_ultrafast.sql", "0013_v12_quarantine_admission.sql"],
+    }]);
   });
 });
 

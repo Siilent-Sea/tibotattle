@@ -124,7 +124,9 @@ const DYNAMIC_HEADER_READS: readonly Readonly<{
     "afterHeaders.get(`${input.format}:${newRecord.recordId}`)",
     "headers.get(`10:${record.recordId}`)",
   ].map((expression) => ({
-    file: "../src/postgres-classification-links.ts",
+    file: expression === "headers.get(`${format}:${record.recordId}`)"
+      ? "../src/postgres-classification-links.ts"
+      : "../src/postgres-classification-activation.ts",
     expression,
     reason: "a Map of stored classification header proofs keyed by format and record id, not an HTTP header read",
   })),
