@@ -61,26 +61,34 @@
  * exceeded run budget, SOURCE_UNAVAILABLE for a missing snapshot or storage
  * drift. No value, identifier or SQL appears in an error.
  *
- * Statement tags: every statement carries `/* analytics_v2:<family> *\/`.
- * owners.ts analyticsV2Statement accepts only its closed family list, which
- * this module does not edit (the kernel closure is frozen until SPD-P3), so
- * the two performance families are tagged here through a local wrapper and
- * exported as PERFORMANCE_SOURCE_STATEMENT_FAMILIES for SPD-P3 to fold in.
- * The snapshot guard uses the existing snapshot.read_only family.
+ * Statement tags: every statement carries `/* analytics_v2:<family> *\/`
+ * through owners.ts analyticsV2Statement, whose closed family list holds the
+ * two performance families (PERFORMANCE_SOURCE_STATEMENT_FAMILIES); the
+ * refresh Job's statement ledger and failure projection name them. The
+ * snapshot guard uses the existing snapshot.read_only family.
  *
- * No closure root imports this module yet (SPD-P3 registers it). Nothing here
- * writes.
+ * A kernel closure root (cloud-run/analytics-kernel-closure.mjs): the
+ * refresh Job streams these pages into the fold (compute-performance.ts)
+ * through cloud-run/analytics-refresh-read.mjs, page by page, while the
+ * run's snapshot is open. Nothing here writes.
  */
 
 import type { TelemetryPerformanceRecord } from "@app-usagemonitor/telemetry-contract";
 import type { PostgresClient } from "../postgres-client";
-import { analyticsV2Statement, dayNumber, quotedSchema, safeInteger, sourceFail } from "./owners";
+import {
+  analyticsV2Statement,
+  dayNumber,
+  quotedSchema,
+  safeInteger,
+  sourceFail,
+  type AnalyticsV2StatementFamily,
+} from "./owners";
 
-/** The statement families of this reader; SPD-P3 adds them to ANALYTICS_V2_STATEMENT_FAMILIES. */
+/** The statement families of this reader (members of owners.ts ANALYTICS_V2_STATEMENT_FAMILIES). */
 export const PERFORMANCE_SOURCE_STATEMENT_FAMILIES = Object.freeze([
   "performance.reports",
   "performance.cohorts",
-] as const);
+] as const satisfies readonly AnalyticsV2StatementFamily[]);
 export type PerformanceSourceStatementFamily = (typeof PERFORMANCE_SOURCE_STATEMENT_FAMILIES)[number];
 
 /** Reports per page: the default and the ceiling. */
@@ -184,14 +192,6 @@ const HISTOGRAMS = Object.freeze([
   ["ttftHistogram", "ttft", "ttft_buckets", "ttft_min", "ttft_max"],
   ["completionHistogram", "turnDuration", "turn_duration_buckets", "completion_min", "completion_max"],
 ] as const);
-
-/** `sql` with its family tag (see PERFORMANCE_SOURCE_STATEMENT_FAMILIES). */
-function performanceStatement(family: PerformanceSourceStatementFamily, sql: string): string {
-  if (!(PERFORMANCE_SOURCE_STATEMENT_FAMILIES as readonly string[]).includes(family)) {
-    sourceFail("ANALYTICS_V2_SOURCE_INVALID");
-  }
-  return `/* analytics_v2:${family} */ ${sql}`;
-}
 
 function boundedOption(value: unknown, fallback: number, maximum: number): number {
   if (value === undefined) return fallback;
@@ -436,7 +436,7 @@ export async function readAnalyticsV2PerformanceSource(
   let deferredFutureDays: number;
   if (prior === null) {
     const deferred = await client.query<{ days: unknown }>(
-      performanceStatement("performance.reports", deferredDaysSql(s)), [throughDay]);
+      analyticsV2Statement("performance.reports", deferredDaysSql(s)), [throughDay]);
     if (deferred.rows.length !== 1) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
     deferredFutureDays = safeInteger(deferred.rows[0]?.days);
   } else {
@@ -444,9 +444,9 @@ export async function readAnalyticsV2PerformanceSource(
   }
 
   const page = prior === null
-    ? await client.query<ReportRow>(performanceStatement("performance.reports", firstPageSql(s)),
+    ? await client.query<ReportRow>(analyticsV2Statement("performance.reports", firstPageSql(s)),
       [throughDay, pageSize + 1])
-    : await client.query<ReportRow>(performanceStatement("performance.reports", nextPageSql(s)),
+    : await client.query<ReportRow>(analyticsV2Statement("performance.reports", nextPageSql(s)),
       [throughDay, pageSize + 1, prior.afterDay, prior.afterReportKey]);
   if (page.rows.length > pageSize + 1) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
   const complete = page.rows.length <= pageSize;
@@ -473,7 +473,7 @@ export async function readAnalyticsV2PerformanceSource(
 
   const records: AnalyticsV2PerformanceSourceRecord[] = [];
   if (reports.length > 0) {
-    const cohorts = await client.query<CohortRow>(performanceStatement("performance.cohorts", cohortsSql(s)),
+    const cohorts = await client.query<CohortRow>(analyticsV2Statement("performance.cohorts", cohortsSql(s)),
       [reports.map((report) => report.reportKey), pageCohorts + 1]);
     // One snapshot serves every statement, so any count mismatch is storage
     // drift: never return a partial reconstruction.

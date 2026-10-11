@@ -51,7 +51,6 @@ import {
   analyticsV2PerformanceContentSha256,
   analyticsV2PerformanceSlotKey,
   type AnalyticsV2PerformanceCandidate,
-  type AnalyticsV2PerformancePublicationSummary,
   type AnalyticsV2PerformanceStoreErrorCode,
   type AnalyticsV2PerformanceSummary,
   type AnalyticsV2PerformanceWithheld,
@@ -701,6 +700,7 @@ export async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: An
     : assertNonNegativeSafeInteger(outputs.journal.lastSequence, "journal.lastSequence");
   const timings = validTimings(outputs.timings, "timings");
   const resources = validResources(outputs.resources, effective, refusedOwners);
+  const performance = await validPerformance(outputs.performance, nowMs, resources);
 
   return {
     mode: outputs.mode,
@@ -714,9 +714,25 @@ export async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: An
     refusals,
     lastSequence,
     timings,
-    resources,
-    performance: await validPerformance((outputs as { readonly performance?: unknown }).performance, nowMs, resources),
+    resources: chargedResources(resources, performance),
+    performance,
   };
+}
+
+/**
+ * The resource record the run row stores: compute's, with the performance
+ * candidates' bytes added to the output account. validPerformance is their
+ * one charge (the Job runs the fold without an account) and checked that the
+ * account had room for them; this records the same bytes once, so
+ * timings.account.accountBytes is everything the run held until its write.
+ * Unchanged without performance outputs (or with a withheld fold, which
+ * charges nothing).
+ */
+function chargedResources(resources: AnalyticsV2RunResources | null,
+  performance: PreparedPerformance | null): AnalyticsV2RunResources | null {
+  if (resources === null || performance === null || performance.chargedBytes === 0) return resources;
+  return Object.freeze({ ...resources, account: Object.freeze({ ...resources.account,
+    accountBytes: resources.account.accountBytes + performance.chargedBytes }) });
 }
 
 const PERFORMANCE_KEYS = "candidates,summary,withheld";
@@ -738,9 +754,10 @@ function invalidPerformance(field: string): never {
  * generatedAt the fold writes, parses as community-model-performance-v1 and
  * digests to its payloadSha256 (refused, never re-derived). Each candidate is
  * charged to the run's output account (resources.ts analyticsV2OutputRowBytes),
- * which must stay within its budget; a run without a resource record has no
- * account to charge. Absent outputs (a pipeline without the performance
- * stage) are null.
+ * which must stay within its budget; this is the candidates' only charge
+ * (chargedResources records it in the run row). A run without a resource
+ * record has no account to charge. Absent outputs (a pipeline without the
+ * performance stage) are null.
  */
 async function validPerformance(value: unknown, nowMs: number,
   resources: AnalyticsV2RunResources | null): Promise<PreparedPerformance | null> {
@@ -1009,13 +1026,12 @@ export interface AnalyticsV2WriteReceipt {
 }
 
 /**
- * The run row's publication summary: contract.ts AnalyticsV2PublicationSummary
- * and, only when the run carried performance outputs, the content-free
- * performance block (0059's CHECK accepts extra keys).
+ * The run row's publication summary: contract.ts AnalyticsV2PublicationSummary,
+ * whose optional performance block (content-free) is present only when the
+ * run carried performance outputs (0059's CHECK accepts extra keys). Kept as
+ * a name for the store's callers.
  */
-export type AnalyticsV2RunPublicationSummary = AnalyticsV2PublicationSummary & {
-  readonly performance?: AnalyticsV2PerformancePublicationSummary;
-};
+export type AnalyticsV2RunPublicationSummary = AnalyticsV2PublicationSummary;
 
 export interface StoredHeadRow {
   readonly day: string;
