@@ -213,15 +213,27 @@ test("production renders from its committed file (PROD-PREP) and refuses one wit
   const rendered = JSON.parse(result.out);
   assert.deepEqual([rendered.environment, rendered.project, rendered.notificationChannel],
     ["production", "tibotattle-prod", "unassigned"]);
+  const committed = JSON.parse(readFileSync(committedDesiredStatePath("production"), "utf8"));
+  assert.equal(committed.scheduler["analytics-refresh"].schedule, "0 3 * * *");
   // The committed refresh cadence is assigned, but its trigger remains PAUSED.
   assert.deepEqual(rendered.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
   // A missing cadence takes precedence over PAUSED; this fixture changes no committed desired state.
-  const unset = JSON.parse(readFileSync(committedDesiredStatePath("production"), "utf8"));
+  const unset = structuredClone(committed);
   unset.scheduler["analytics-refresh"].schedule = null;
   const unsetText = `${JSON.stringify(unset, null, 2)}\n`;
-  const unscheduled = JSON.parse((await run(["render", "--environment=production"], {
-    readFile: (path) => (path === committedDesiredStatePath("production") ? unsetText : readFileSync(path, "utf8")) })).out);
-  assert.deepEqual(unscheduled.policies.find(({ id }) => id === "scheduler-quiet").deferred, "SCHEDULER_CADENCE_UNSET");
+  const unscheduled = await run(["render", "--environment=production"], {
+    readFile: (path) => (path === committedDesiredStatePath("production") ? unsetText : readFileSync(path, "utf8")) });
+  assert.equal(unscheduled.code, 0, unscheduled.err);
+  assert.deepEqual(JSON.parse(unscheduled.out).policies.find(({ id }) => id === "scheduler-quiet").deferred,
+    "SCHEDULER_CADENCE_UNSET");
+  // A different assigned cadence remains deferred while the trigger is PAUSED.
+  // The cadence is synthetic and lives in this test only.
+  const cadenced = structuredClone(committed);
+  cadenced.scheduler["analytics-refresh"].schedule = "40 6 * * 2";
+  const cadencedText = `${JSON.stringify(cadenced, null, 2)}\n`;
+  const scheduled = JSON.parse((await run(["render", "--environment=production"], {
+    readFile: (path) => (path === committedDesiredStatePath("production") ? cadencedText : readFileSync(path, "utf8")) })).out);
+  assert.deepEqual(scheduled.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
   const unfilledText = unfilledProductionText();
   const unfilled = await run(["render", "--environment=production"], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? unfilledText : readFileSync(path, "utf8")) });
