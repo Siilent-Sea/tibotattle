@@ -21,10 +21,15 @@
 --
 -- APPEND-ONLY. Grants, capabilities, cohorts, buckets and receipts are
 -- immutable; a grant or capability moves only active/accepted -> revoked, and
--- a report only current -> superseded. The registry rows are immutable. The
+-- a report only current -> superseded. The three registry rows are the only
+-- ones: INSERT, UPDATE and DELETE are all refused once they are seeded, so the
+-- runtime role (which holds DML on every table) cannot add a dictionary that
+-- the foreign keys would then accept. A later migration that registers a new
+-- dictionary disables and re-enables that trigger around its own INSERT. The
 -- runtime moves only staged -> active, one policy revision at a time, inside
--- an owner run_maintenance transaction. A publication head only moves
--- forward (0059's analytics_v2_published_daily rule).
+-- the owner run_maintenance transaction that began its audit row. A
+-- publication head only moves forward (0059's analytics_v2_published_daily
+-- rule).
 --
 -- ERASURE. Accepted evidence is not withdrawn (decision D2, Variant B). A
 -- direct DELETE of a grant, capability, report, cohort, bucket or receipt is
@@ -93,7 +98,7 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- (a) Field dictionary registry: three immutable seeded rows.
+-- (a) Field dictionary registry: three immutable seeded rows, and no others.
 -- ---------------------------------------------------------------------------
 CREATE TABLE telemetry_performance_field_dictionaries (
   field_dictionary_version text PRIMARY KEY
@@ -117,8 +122,12 @@ BEGIN
   RAISE EXCEPTION 'telemetry_performance_row_immutable' USING ERRCODE = 'P1005';
 END;
 $$;
+-- INSERT is refused too: the seed above runs before the trigger exists, and
+-- every later row would widen the dictionary foreign keys of grants,
+-- capabilities and reports. (TRUNCATE is refused by those foreign keys, and
+-- the runtime role holds no TRUNCATE privilege.)
 CREATE TRIGGER telemetry_performance_field_dictionaries_immutable
-BEFORE UPDATE OR DELETE ON telemetry_performance_field_dictionaries
+BEFORE INSERT OR UPDATE OR DELETE ON telemetry_performance_field_dictionaries
 FOR EACH ROW EXECUTE FUNCTION telemetry_performance_row_immutable();
 
 -- ---------------------------------------------------------------------------
@@ -147,7 +156,13 @@ INSERT INTO telemetry_performance_runtime (
 -- later updated_at, and only inside a transaction that names a 'started'
 -- run_maintenance audit row in tibotattle.telemetry_performance_activation
 -- (the activation task sets it with set_config(..., true) after beginning
--- that audit row in the same transaction). There is no pause and no delete.
+-- that audit row in the same transaction). The audit row must have been
+-- inserted by this very transaction, at its top level (xmin equals the
+-- current transaction id, 0035's idiom): a 'started' row left behind by a
+-- crashed or earlier activation can never be named again. There is no pause
+-- and no delete. The runtime role can insert audit rows and set the GUC, so
+-- owner-only activation stays an application-layer guarantee; this guard
+-- makes every activation carry its own fresh audit row.
 CREATE FUNCTION telemetry_performance_runtime_guard() RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
@@ -167,7 +182,8 @@ BEGIN
         SELECT 1 FROM admin_action_audit audit_row
          WHERE audit_row.operation_id = current_setting('tibotattle.telemetry_performance_activation', true)
            AND audit_row.action = 'run_maintenance'
-           AND audit_row.outcome = 'started') THEN
+           AND audit_row.outcome = 'started'
+           AND audit_row.xmin = pg_current_xact_id()::xid) THEN
     RAISE EXCEPTION 'telemetry_performance_runtime_guarded' USING ERRCODE = 'P1005';
   END IF;
   RETURN NEW;
@@ -281,7 +297,19 @@ CREATE TRIGGER accountless_telemetry_performance_authorization_admission
 BEFORE INSERT ON accountless_telemetry_performance_authorizations
 FOR EACH ROW EXECUTE FUNCTION accountless_telemetry_performance_authorization_admission();
 
--- Immutable but for the revocation that follows a revoked enrollment.
+-- Immutable but for the revocation that follows a revoked enrollment
+-- (D1 ingestion-isolation 0009's rule, kept on purpose). The Worker never
+-- revokes a performance grant on its own: its enrollment revocation batch
+-- (src/accountless-enrollment.ts) revokes the ledger, then the owner and the
+-- v1.1/v1.2 grants behind that revoked ledger, and leaves performance grants
+-- and capabilities untouched. They go inert instead, because every
+-- admission, capability and report fence requires the active owner graph.
+-- So the reasons user_opt_out and operator_containment apply to a grant only
+-- with its whole enrollment. The capability chain runs beside the grant
+-- chain (D1 parity too): a writer appends a grant and its capability in one
+-- transaction, and revokes them together, because a grant committed or
+-- revoked without its capability leaves the capability head unable to follow
+-- the grant head for that device.
 CREATE FUNCTION accountless_telemetry_performance_authorization_immutable() RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
@@ -453,6 +481,9 @@ CREATE TABLE telemetry_performance_reports (
     REFERENCES telemetry_performance_field_dictionaries(field_dictionary_version, bucket_scheme_version),
   UNIQUE (participant_id, device_id, report_day, report_revision),
   UNIQUE (id, field_dictionary_version, bucket_scheme_version),
+  -- The receipts' composite foreign key: a receipt names its report's owner,
+  -- day and revision exactly.
+  UNIQUE (id, participant_id, device_id, report_day, report_revision),
   CHECK ((state = 'current' AND superseded_at IS NULL)
     OR (state = 'superseded' AND superseded_at IS NOT NULL AND superseded_at >= created_at))
 );
@@ -639,16 +670,25 @@ CREATE TABLE telemetry_performance_buckets (
     OR (metric = 'turnDuration' AND bucket_index BETWEEN 1 AND 57))
 );
 
+-- One receipt per admitted report. Its participant, device, day and revision
+-- are its report's (composite foreign key), so with the report's own
+-- UNIQUE (participant_id, device_id, report_day, report_revision) a report has
+-- at most one receipt. An idempotent replay names an existing report revision
+-- and writes nothing, so the outcome is accepted or replaced only (D1 0009
+-- also allowed 'idempotent', which no writer ever stored).
 CREATE TABLE telemetry_performance_receipts (
   id text PRIMARY KEY CHECK (length(id) = 36),
   participant_id text NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
   device_id text NOT NULL REFERENCES device_credentials(id) ON DELETE CASCADE,
-  report_id text NOT NULL REFERENCES telemetry_performance_reports(id) ON DELETE CASCADE,
+  report_id text NOT NULL,
   report_day date NOT NULL,
   report_revision text NOT NULL CHECK (report_revision ~ '^[0-9a-f]{64}$'),
   envelope_digest text NOT NULL CHECK (envelope_digest ~ '^[0-9a-f]{64}$'),
-  outcome text NOT NULL CHECK (outcome IN ('accepted', 'replaced', 'idempotent')),
+  outcome text NOT NULL CHECK (outcome IN ('accepted', 'replaced')),
   created_at timestamptz NOT NULL,
+  FOREIGN KEY (report_id, participant_id, device_id, report_day, report_revision)
+    REFERENCES telemetry_performance_reports(id, participant_id, device_id, report_day, report_revision)
+    ON DELETE CASCADE,
   UNIQUE (participant_id, device_id, report_day, report_revision),
   UNIQUE (participant_id, device_id, envelope_digest)
 );

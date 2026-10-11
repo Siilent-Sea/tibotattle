@@ -171,6 +171,10 @@ export async function slidePerformanceOwnerLease(db, { schema, owner, expiresAtE
 /**
  * Begin a 'started' run_maintenance audit row (content-free details) and
  * return its operation id. The audit lifecycle guard keeps it append-only.
+ * The runtime guard accepts it only inside the transaction that inserted it,
+ * at that transaction's top level (no savepoint): pass the activation's own
+ * client, as activatePerformanceRuntime does. Called with a Pool, it commits
+ * at once and models a 'started' row a crashed activation left behind.
  */
 export async function beginPerformanceActivationAudit(db, { schema, nowEpoch = Date.now() }) {
   const operationId = randomUUID();
@@ -445,6 +449,9 @@ const HISTOGRAM_METRICS = Object.freeze([
  * from plain contract-shaped records. By default an existing current row for
  * the device-day is superseded first, as the report writer does. The
  * capability tuple and dictionary come from `grant` (insertPerformanceGrant).
+ * The receipt repeats the report's participant, device, day and revision,
+ * which its composite foreign key requires; an idempotent replay writes no
+ * receipt, so 'idempotent' is never an outcome.
  */
 export async function insertPerformanceReport(pool, {
   schema,

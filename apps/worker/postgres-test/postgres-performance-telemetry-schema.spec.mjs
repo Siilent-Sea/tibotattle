@@ -7,11 +7,14 @@
 // postgres-test/fixtures/performance-telemetry.mjs and are synthetic and
 // content-free. Each test drops only the schemas it created (prefix g1_perf_).
 //
-// It proves the runtime guard, the grant revision/epoch rules and their
-// race, the capability and report head fences, the label and bucket CHECKs,
-// the delete guards and participant cascade, the refusal counters, the
-// DateStyle-stable lock keys the triggers call, the forward-only publication
-// heads, and that every new function pins its search_path.
+// It proves the runtime guard (including that only an audit row opened by the
+// activating transaction itself is accepted), that the runtime role cannot
+// write the dictionary registry, the grant revision/epoch rules and their
+// race, the capability and report head fences, the receipt-to-report tie, the
+// label and bucket CHECKs, the delete guards and participant cascade, the
+// refusal counters, the DateStyle-stable lock keys the triggers call, the
+// forward-only publication heads, and that every new function pins its
+// search_path.
 //
 // Run: PG_TEST_SOCKET=/private/tmp/tibotattle-pg-.../socket PG_TEST_PORT=<port> \
 //   node --test postgres-test/postgres-performance-telemetry-schema.spec.mjs
@@ -24,6 +27,8 @@ import { after, test } from "node:test";
 import * as telemetryContract from "@app-usagemonitor/telemetry-contract";
 import pg from "pg";
 import { createServer } from "vite";
+import { PRODUCTION_MIGRATIONS_CODE_PREFIX } from "../cloud-run/postgres-production-migrations.mjs";
+import { grantAndVerifyRuntimePrivileges } from "../cloud-run/postgres-runtime-grants.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { applyMigrationsBefore } from "./promoted-migration-prefix.mjs";
 import { postgresTestEndpoint } from "./staged-migrations-harness.mjs";
@@ -293,6 +298,10 @@ test("0079 is the promoted tail: a pre-0079 schema lacks it and is not current; 
   "P1005", "telemetry_performance_row_immutable");
   await rejects(pool.query(`DELETE FROM ${performanceTable(full, "telemetry_performance_field_dictionaries")}`),
     "P1005", "telemetry_performance_row_immutable");
+  await rejects(pool.query(`INSERT INTO ${performanceTable(full, "telemetry_performance_field_dictionaries")}
+      (field_dictionary_version, bucket_scheme_version, ultrafast_labels, registered_at)
+    VALUES ('telemetry-performance-registry-2027-01-01.1', 'performance-histogram-v2', true, now())`),
+  "P1005", "telemetry_performance_row_immutable");
   const runtime = await pool.query(`SELECT state, policy_revision FROM ${performanceTable(full, "telemetry_performance_runtime")}`);
   assert.deepEqual(runtime.rows, [{ state: "staged", policy_revision: 1 }]);
   assert.equal(await count(full, "analytics_v2_published_performance"), 0);
@@ -341,6 +350,22 @@ test("runtime: staged refuses intake; the guard allows exactly staged -> active 
     await client.query("SELECT set_config('tibotattle.telemetry_performance_activation', $1, true)", [operationId]);
     await update(client);
   }), "P1005", "telemetry_performance_runtime_guarded");
+  // A 'started' row from an earlier transaction (a crashed activation left it
+  // behind) is never accepted, even with the GUC naming it; nor is one begun
+  // inside a savepoint, whose xmin is a subtransaction's.
+  const stale = await beginPerformanceActivationAudit(pool, { schema });
+  await rejects(inTransaction(async (client) => {
+    await client.query("SELECT set_config('tibotattle.telemetry_performance_activation', $1, true)", [stale]);
+    await update(client);
+  }), "P1005", "telemetry_performance_runtime_guarded");
+  await rejects(inTransaction(async (client) => {
+    await client.query("SAVEPOINT audit_in_subtransaction");
+    const operationId = await beginPerformanceActivationAudit(client, { schema });
+    await client.query("RELEASE SAVEPOINT audit_in_subtransaction");
+    await client.query("SELECT set_config('tibotattle.telemetry_performance_activation', $1, true)", [operationId]);
+    await update(client);
+  }), "P1005", "telemetry_performance_runtime_guarded");
+  assert.equal(await count(schema, "admin_action_audit", "operation_id = $1 AND outcome = 'started'", [stale]), 1);
   // With a started audit: a skipped revision, a non-advancing instant and a staged target are refused.
   for (const variant of [{ revision: "policy_revision + 2" }, { revision: "policy_revision" }, { state: "'staged'" }]) {
     await rejects(inTransaction(async (client) => {
@@ -573,7 +598,7 @@ test("heads: the capability equals the grant tuple; the report equals the capabi
     [replaced.reportId]), "P1005", "telemetry_performance_row_immutable");
   await rejects(pool.query(`UPDATE ${t("telemetry_performance_buckets")} SET bucket_count = 9 WHERE report_id = $1`,
     [replaced.reportId]), "P1005", "telemetry_performance_row_immutable");
-  await rejects(pool.query(`UPDATE ${t("telemetry_performance_receipts")} SET outcome = 'idempotent' WHERE report_id = $1`,
+  await rejects(pool.query(`UPDATE ${t("telemetry_performance_receipts")} SET outcome = 'accepted' WHERE report_id = $1`,
     [replaced.reportId]), "P1005", "telemetry_performance_row_immutable");
 
   // A newer grant makes the older heads stale: the old tuple's report and a
@@ -684,6 +709,103 @@ test("labels and buckets: 2026-09-21.1 refuses Ultrafast and accepts turn_contex
     VALUES ($1, 5, $2, 'performance-histogram-v1', 'openai_codex', 'gpt-5.5', 'low', 'unavailable', 'standard',
       'rollout_thread_settings', 'standard', 1, 0, 0, 0, 0, 0, 0)`, [v2Report.reportId, PERFORMANCE_DICTIONARY_2026_10_10]),
   "23503");
+});
+
+test("dictionaries: the runtime role cannot insert, update or delete registry rows", {
+  skip, timeout: 240_000,
+}, async () => {
+  const schema = await promotedSchema("dictionary_role");
+  const t = (name) => performanceTable(schema, name);
+  const role = `g1_perf_runtime_${randomBytes(4).toString("hex")}`;
+  await pool.query(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`);
+  try {
+    // The migrate job's grant policy: DML on every table, the registry included.
+    await grantAndVerifyRuntimePrivileges(pool, { role: "primary", schema, runtimeRole: role,
+      codePrefix: PRODUCTION_MIGRATIONS_CODE_PREFIX });
+    const privileges = await pool.query(`SELECT has_table_privilege($1, $2, 'INSERT') AS can_insert,
+        has_table_privilege($1, $2, 'UPDATE') AS can_update, has_table_privilege($1, $2, 'DELETE') AS can_delete`,
+    [role, t("telemetry_performance_field_dictionaries")]);
+    assert.deepEqual(privileges.rows, [{ can_insert: true, can_update: true, can_delete: true }]);
+    const asRuntime = (sql, values = []) => withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query(`SET LOCAL ROLE "${role}"`);
+        const result = await client.query(sql, values);
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      }
+    });
+    // The role does write ordinary rows (control), but never a registry row.
+    await asRuntime(`INSERT INTO ${t("telemetry_performance_refusal_counts")} (day, route_id, code, status, refusals)
+      VALUES ($1::date, 'telemetry_performance_reports', 'BODY_INVALID', 400, 1)`, [DAY]);
+    for (const [dictionary, scheme] of [
+      ["telemetry-performance-registry-2027-01-01.1", "performance-histogram-v2"],
+      ["telemetry-performance-registry-2026-10-10.2", "performance-histogram-v1"],
+    ]) {
+      await rejects(asRuntime(`INSERT INTO ${t("telemetry_performance_field_dictionaries")}
+          (field_dictionary_version, bucket_scheme_version, ultrafast_labels, registered_at) VALUES ($1, $2, true, now())`,
+      [dictionary, scheme]), "P1005", "telemetry_performance_row_immutable");
+    }
+    await rejects(asRuntime(`UPDATE ${t("telemetry_performance_field_dictionaries")} SET ultrafast_labels = NOT ultrafast_labels`),
+      "P1005", "telemetry_performance_row_immutable");
+    await rejects(asRuntime(`DELETE FROM ${t("telemetry_performance_field_dictionaries")} WHERE field_dictionary_version = $1`,
+      [PERFORMANCE_DICTIONARY_2026_09_21]), "P1005", "telemetry_performance_row_immutable");
+    await rejects(asRuntime(`TRUNCATE ${t("telemetry_performance_field_dictionaries")}`), "42501");
+    // So a declared grant can only name one of the three seeded dictionaries.
+    assert.equal(await count(schema, "telemetry_performance_field_dictionaries"), 3);
+    await activatePerformanceRuntime(pool, { schema });
+    const owner = await seedPerformanceAccountlessOwner(pool, { schema });
+    await rejects(insertPerformanceGrant(pool, { schema, owner, dictionaryBasis: "client_declared",
+      fieldDictionaryVersion: "telemetry-performance-registry-2027-01-01.1" }), "23503");
+  } finally {
+    await pool.query(`DROP OWNED BY "${role}"`).catch(() => {});
+    await pool.query(`DROP ROLE IF EXISTS "${role}"`).catch(() => {});
+  }
+});
+
+test("receipts: a receipt names its report's participant, device, day and revision; one receipt per report", {
+  skip, timeout: 120_000,
+}, async () => {
+  const schema = await promotedSchema("receipts");
+  const t = (name) => performanceTable(schema, name);
+  await activatePerformanceRuntime(pool, { schema });
+  const { owner, grant } = await activeOwner(schema);
+  const other = await activeOwner(schema);
+  const report = await insertPerformanceReport(pool, { schema, owner, grant, reportDay: DAY, withReceipt: false,
+    records: [syntheticPerformanceRecord({ day: DAY })] });
+  const otherReport = await insertPerformanceReport(pool, { ...other, schema, reportDay: DAY, withReceipt: false,
+    records: [syntheticPerformanceRecord({ day: DAY })] });
+  const receipt = (overrides = {}) => {
+    const row = { participantId: owner.participantId, deviceId: owner.deviceId, reportId: report.reportId,
+      reportDay: DAY, reportRevision: report.reportRevision, envelope: randomBytes(32).toString("hex"),
+      outcome: "accepted", ...overrides };
+    return pool.query(`INSERT INTO ${t("telemetry_performance_receipts")} (id, participant_id, device_id, report_id,
+        report_day, report_revision, envelope_digest, outcome, created_at)
+      VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8, now())`,
+    [randomUUID(), row.participantId, row.deviceId, row.reportId, row.reportDay, row.reportRevision, row.envelope,
+      row.outcome]);
+  };
+  // Each column that disagrees with the report row is refused by the composite foreign key.
+  for (const overrides of [
+    { reportDay: "2026-10-08" },
+    { reportRevision: "a".repeat(64) },
+    { reportRevision: otherReport.reportRevision },
+    { participantId: other.owner.participantId, deviceId: other.owner.deviceId },
+    { deviceId: other.owner.deviceId },
+    { reportId: otherReport.reportId },
+    { reportId: randomUUID() },
+  ]) await rejects(receipt(overrides), "23503");
+  // An idempotent replay writes no receipt: the outcome is accepted or replaced only.
+  await rejects(receipt({ outcome: "idempotent" }), "23514");
+  await receipt();
+  await receipt({ participantId: other.owner.participantId, deviceId: other.owner.deviceId, reportId: otherReport.reportId,
+    reportRevision: otherReport.reportRevision, outcome: "replaced" });
+  // A second receipt for the same report revision is refused, whatever its envelope.
+  await rejects(receipt(), "23505");
+  assert.equal(await count(schema, "telemetry_performance_receipts", "report_id = $1", [report.reportId]), 1);
 });
 
 test("deletes: direct deletes are refused while the participant is active; DELETE FROM participants cascades", {
