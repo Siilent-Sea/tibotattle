@@ -30,8 +30,9 @@
  * show "unavailable" for every section with no GCP source (ADMIN-R12).
  * PRODUCTION_ADMIN_HOST_POLICY is therefore 'chokepoint': the runtime builds
  * createPostgresAdminAccessChokepoint once over the env, registers C-ADMIN's
- * six routes (no analytics pool while analytics_v2 lives in primary,
- * migration 0059) and injects C-MAINT's lifecycle pass as their
+ * six routes and the owner-decided read-only performance-intake view
+ * (2026-10-10, GATE-Q 4 and 23) (no analytics pool while analytics_v2 lives
+ * in primary, migration 0059) and injects C-MAINT's lifecycle pass as their
  * run_maintenance task, with SPD-G5's owner-only performance runtime
  * activation as its telemetryRuntimeActivation task (owner decision
  * 2026-10-10, decision 2; GATE-Q 23: no UI control). No overview source is
@@ -174,10 +175,11 @@ import {
 import { createPostgresAdminAccessChokepoint } from "../src/postgres-admin-access.ts";
 import { runPostgresLifecyclePass } from "../src/postgres-lifecycle-pass.ts";
 import { createAnalyticsV2CommunityDailyRoute } from "../src/analytics-v2/community-daily-route.ts";
+import { createAnalyticsV2CommunityModelPerformanceRoute } from "../src/analytics-v2/community-model-performance-route.ts";
 import { closeCloudSqlResources, createGoogleAccessTokenProvider, createIamPool } from "./cloud-sql.mjs";
 import { createOriginIntakeComposition } from "./origin-intake-composition.mjs";
 import { createAdminConsoleHandlers } from "./routes/admin-console.mjs";
-import { createPerformanceTelemetryDispatch } from "./routes/performance-telemetry.mjs";
+import { PERFORMANCE_TELEMETRY_ROUTE_IDS, createPerformanceTelemetryDispatch } from "./routes/performance-telemetry.mjs";
 import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "./origin-route-modules.mjs";
 import { logOriginBoundaryRefusal } from "./origin-node-request.mjs";
 import { createEdgeAdmissionLimiters, EDGE_ADMISSION_REPLAY_BINDINGS } from "./postgres-edge-admission-limiters.mjs";
@@ -186,7 +188,6 @@ import { requestIdFrom, createRequestContextStore } from "./postgres-request-con
 import { createProductionRequestHandler } from "./postgres-host-dispatch.mjs";
 import {
   ADMIN_HOST_ROUTE_IDS,
-  PERFORMANCE_ROUTE_IDS,
   assertIdentityLinkConsumersRetired,
   createProductionRouteRegistry,
 } from "./postgres-production-registry.mjs";
@@ -224,8 +225,8 @@ export const PRODUCTION_HOST_MODES = Object.freeze({
  * answered OWN-17 questions 1 to 3 in round 12 (open the admin host with
  * what is ported; sections without a GCP source say "unavailable"; the
  * removed deletion ledger is not_applicable with a closed-DTO version bump),
- * built as ADMIN-R12: C-ADMIN's six routes are served behind the Access
- * chokepoint. Without ACCESS_AUD (round 11's staging roll) the chokepoint
+ * built as ADMIN-R12: C-ADMIN's six routes (and the performance-intake view
+ * of 2026-10-10) are served behind the Access chokepoint. Without ACCESS_AUD (round 11's staging roll) the chokepoint
  * answers every admin-host request 503 ADMIN_NOT_CONFIGURED, as the Worker
  * does.
  */
@@ -517,7 +518,8 @@ function isPool(value) {
  *   community-daily module), mounted beside the intake's;
  * - routeModuleContext: (request) => frozen per-request module context;
  * - composeIntake: whether the legacy intake is composed;
- * - adminHandlers: null, or C-ADMIN's six handlers (Map by route id).
+ * - adminHandlers: null, or the seven admin handlers (Map by route id:
+ *   C-ADMIN's six and the performance-intake view).
  *
  * Returns {handlers, routeModules, routeModuleContext, dispatchers}: handlers
  * maps every route id the composition serves to its built-in (the registry
@@ -525,8 +527,11 @@ function isPool(value) {
  * device_upload_authorization; createOriginRouteRegistry), the three
  * performance intake ids included (owner decision 2026-10-10, decision 1:
  * the performance family over SPD-G2's policy, SPD-G3's reports and SPD-G4's
- * refusal counter); dispatchers are the families themselves (the loopback
- * fallback is the v1.2 dispatch).
+ * refusal counter) and the public community model-performance read
+ * (decision 7, GATE-Q 5: src/analytics-v2/community-model-performance-
+ * route.ts over the primary pool, with the public-read limiter over the
+ * admission env, which replays the edge's outcome); dispatchers are the
+ * families themselves (the loopback fallback is the v1.2 dispatch).
  */
 export function composeOriginFamilies(deps) {
   if (deps === null || typeof deps !== "object") refuse(ORIGIN_COMPOSITION_INVALID);
@@ -745,6 +750,22 @@ export function composeOriginFamilies(deps) {
   // anything else, so it is mounted before the v1.2 dispatch (as the v1.1
   // intake is).
   const performanceThenV12 = async (request) => (await performance.dispatch(request)) ?? v12Dispatch(request);
+  // Owner decision 2026-10-10 (decision 7, GATE-Q 5): one published
+  // community model-performance slot per request. The route reads the
+  // publication control itself and takes exactly {pool, schema,
+  // assertPublicReadAllowed}; the limiter is d43c8f92's public-read call
+  // (handleCommunityDaily's), so both public reads spend one per-client
+  // budget. It is not an IN-1 route module (no built-in serves the path), so
+  // its handler is registered here with the per-request module context.
+  const communityModelPerformanceRoute = createAnalyticsV2CommunityModelPerformanceRoute({
+    pool: dataPool,
+    schema: primarySchema,
+    assertPublicReadAllowed: (request) => assertPublicAggregateReadAllowed(
+      admissionEnv.PUBLIC_READ_RATE_LIMIT, request, admissionEnv,
+    ),
+  });
+  const communityModelPerformance = (request) =>
+    communityModelPerformanceRoute.handler(request, routeModuleContext(request));
   const handlers = new Map();
   for (const id of V12_ROUTE_IDS) handlers.set(id, v12Dispatch);
   for (const id of V11_ROUTE_IDS) handlers.set(id, intakeThenV12);
@@ -758,7 +779,8 @@ export function composeOriginFamilies(deps) {
   handlers.set("device_pairing_claim", devicePairingClaim);
   handlers.set("telemetry_v12_consent", telemetryV12Consent);
   handlers.set("community_daily", communityDaily);
-  for (const id of PERFORMANCE_ROUTE_IDS) handlers.set(id, performanceThenV12);
+  for (const id of PERFORMANCE_TELEMETRY_ROUTE_IDS) handlers.set(id, performanceThenV12);
+  handlers.set("community_model_performance", communityModelPerformance);
   handlers.set("health", statusDispatchers.health);
   // The legacy chain has no RD-2: its /api/ready is the v1.2 dispatch's
   // unsupported 503, as before.
@@ -779,7 +801,7 @@ export function composeOriginFamilies(deps) {
     routeModuleContext,
     dispatchers: Object.freeze({
       communityDaily, participantDevices, personalSession, devicePairing, devicePairingClaim,
-      telemetryV12Consent, v12Dispatch, intake, performance,
+      telemetryV12Consent, v12Dispatch, intake, performance, communityModelPerformance,
     }),
   });
 }

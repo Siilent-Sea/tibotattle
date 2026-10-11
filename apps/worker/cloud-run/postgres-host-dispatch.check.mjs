@@ -84,10 +84,16 @@ after(async () => {
 // ---------------------------------------------------------------------------
 // Fixture
 
-/** The smallest ported set: scope and the restored performance intake (decision 1, 2026-10-10). */
+/**
+ * The smallest ported set: scope and the performance class (the restored
+ * intake, decision 1, and the public model-performance read, decision 7).
+ */
 const SCOPE = () => [...registryModule.POSTGRES_SCOPE_ROUTE_IDS, ...registryModule.PERFORMANCE_ROUTE_IDS];
 const SCOPE_AND_CONTESTED = () => [...SCOPE(), ...registryModule.OD_CR_1_CONTESTED_ROUTE_IDS];
-const PERFORMANCE = () => registryModule.PERFORMANCE_ROUTE_IDS;
+/** Decision 1's intake: the performance class without the public read. */
+const PERFORMANCE = () => registryModule.PERFORMANCE_ROUTE_IDS.filter((id) => !PUBLIC_READS.includes(id));
+/** The two public reads: PUBLIC_ANALYTICS_MODE pre-gate, storage gate, 200 cache passthrough. */
+const PUBLIC_READS = Object.freeze(["community_daily", "community_model_performance"]);
 
 function envOf(overrides = {}) {
   return Object.freeze({ PUBLIC_ORIGIN, PUBLIC_ANALYTICS_MODE: "enabled", ...overrides });
@@ -500,14 +506,18 @@ test("step 4: every exact route outside the admin set answers 405 with its exact
   assert.equal(f.calls.length, 0);
 });
 
-test("step 5: community_daily with publication disabled is the Worker's unlogged 503", async () => {
+test("step 5: both public reads with publication disabled are the Worker's unlogged 503", async () => {
   for (const mode of [undefined, "disabled", "ENABLED"]) {
     const f = fixture({ env: envOf({ PUBLIC_ANALYTICS_MODE: mode }) });
     await assertError(await f.handler(f.edge(request("/api/v1/community/daily?date=2026-10-01"))), 503,
       "PUBLICATION_DISABLED", String(mode), { requestId: EDGE_REQUEST_ID });
+    await assertError(await f.handler(f.edge(request("/api/v1/community/model-performance?period=7&speedMode=fast"))),
+      503, "PUBLICATION_DISABLED", `model-performance ${mode}`, { requestId: EDGE_REQUEST_ID });
     // The method envelope still comes first.
     await assertError(await f.handler(request("/api/v1/community/daily", { method: "POST" })), 405,
       "METHOD_NOT_ALLOWED", "POST", { allow: "GET" });
+    await assertError(await f.handler(request("/api/v1/community/model-performance", { method: "POST" })), 405,
+      "METHOD_NOT_ALLOWED", "model-performance POST", { allow: "GET" });
     assert.equal(f.calls.length, 0);
     assert.equal(f.gateCalls.length, 0);
     assert.equal(parsedLines(f.lines).filter((line) => line.code === "PUBLICATION_DISABLED").length, 0);
@@ -602,6 +612,7 @@ test("round 12: every retired route answers the uniform 503 with no retry-after 
 test("decision 1: the three performance routes are ported families, never the unported 503", async () => {
   assert.deepEqual([...PERFORMANCE()], ["accountless_telemetry_performance_authorization",
     "telemetry_performance_capabilities", "telemetry_performance_reports"]);
+  assert.deepEqual([...registryModule.PERFORMANCE_ROUTE_IDS], [...PERFORMANCE(), "community_model_performance"]);
   // While the runtime is staged the family answers 403 TELEMETRY_TRANSPORT_BLOCKED
   // after authentication: the root passes it through as a family answer.
   const blocked = (_request, context) => errors.errorResponse(
@@ -693,15 +704,15 @@ test("step 7: a ported route runs its family once, inside the request context, t
     assert.equal(call.request, sent, "the family sees the exact Request object");
     assert.deepEqual({ ...call.context }, { requestId: EDGE_REQUEST_ID, routeId: id });
     assert.equal(f.store.accessor(sent), undefined, "the context is released once the family settles");
-    if (id === "community_daily") {
+    if (PUBLIC_READS.includes(id)) {
       assert.equal(response.headers.get("cache-control"), "public, max-age=60", "200 passes through");
     } else {
       assert.equal(response.headers.get("cache-control"), "no-store", id);
     }
     assert.deepEqual(await response.json(), { served: id });
   }
-  assert.equal(f.calls.length, 33, "scope 21, contested 9, performance 3");
-  assert.equal(f.gateCalls.length, 1, "only community_daily passes the storage gate here");
+  assert.equal(f.calls.length, 34, "scope 21, contested 9, performance 4");
+  assert.equal(f.gateCalls.length, 2, "only the two public reads pass the storage gate here");
   // A verifier request (no edge context) gets a fresh v4 id.
   await f.handler(request("/api/health"));
   assert.match(f.calls.at(-1).context.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
@@ -745,6 +756,40 @@ test("community_daily: storage gate first; 200 unmodified, anything else no-stor
       503, "BACKEND_STORAGE_UNAVAILABLE", `gate throws ${thrown.name}`, { requestId: EDGE_REQUEST_ID });
     assert.equal(plain.calls.length, 0);
   }
+});
+
+test("community_model_performance: storage gate first; 200 unmodified, the unpublished 404 no-store", async () => {
+  const path = "/api/v1/community/model-performance?period=all&speedMode=standard";
+  let answer = () => new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=300",
+    "content-type": "application/json; charset=utf-8" } });
+  const f = fixture({ families: { community_model_performance: () => answer() } });
+  const ok = await f.handler(f.edge(request(path)));
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get("cache-control"), "public, max-age=300");
+  // The route's unpublished state is a public 404, never a 5xx, and never cacheable.
+  answer = () => Response.json({ error: { code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED", requestId: EDGE_REQUEST_ID } },
+    { status: 404, headers: { "cache-control": "public, max-age=300" } });
+  const unpublished = await f.handler(f.edge(request(path)));
+  assert.equal(unpublished.status, 404);
+  assert.equal(unpublished.headers.get("cache-control"), "no-store");
+  const unpublishedLine = parsedLines(f.lines).at(-1);
+  assert.equal(unpublishedLine.code, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED");
+  // A 4xx is logged at warn; the injected recorder keeps the Worker's sampled 5xx rule.
+  assert.equal(unpublishedLine.level, "warn");
+  assert.equal(f.gateCalls.length, 2);
+  const drift = fixture({
+    storageGate: { async assertCurrent() { throw new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE"); } },
+  });
+  await assertError(await drift.handler(drift.edge(request(path))), 503, "BACKEND_STORAGE_UNAVAILABLE",
+    "receipt drift", { requestId: EDGE_REQUEST_ID });
+  assert.equal(drift.calls.length, 0, "no route runs on a stale receipt");
+});
+
+test("ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE is an expected read-only admin state, logged unavailable", () => {
+  assert.ok(dispatch.ORIGIN_UNAVAILABLE_CODES.includes("ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE"));
+  assert.ok(dispatch.ORIGIN_ADMIN_ROUTE_IDS.includes("admin_performance_intake"));
+  assert.equal(dispatch.ORIGIN_ADMIN_ROUTE_IDS.length, 7);
+  assert.deepEqual([...dispatch.ORIGIN_PUBLIC_READ_ROUTE_IDS], [...PUBLIC_READS]);
 });
 
 // ---------------------------------------------------------------------------
@@ -908,9 +953,11 @@ test("a failing log sink or diagnostic recorder never changes the answer", async
   }
 });
 
-test("no-store on every answer except a 200 community_daily (and the Worker's 308)", async () => {
+test("no-store on every answer except a 200 public read (and the Worker's 308)", async () => {
   const f = fixture({ ported: SCOPE_AND_CONTESTED(), families: {
     community_daily: () => new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=300" } }),
+    community_model_performance: () => new Response("{}", { status: 200,
+      headers: { "cache-control": "public, max-age=300" } }),
   } });
   const samples = [];
   for (const route of policy) {
@@ -920,7 +967,7 @@ test("no-store on every answer except a 200 community_daily (and the Worker's 30
   }
   for (const path of ["/", "/api/v1/nope", "/admin"]) samples.push([path, await f.handler(f.edge(request(path)))]);
   for (const [label, response] of samples) {
-    const communityOk = label === "community_daily" && response.status === 200;
+    const communityOk = PUBLIC_READS.includes(label) && response.status === 200;
     assert.equal(response.headers.get("cache-control"), communityOk ? "public, max-age=300" : "no-store", label);
   }
 });

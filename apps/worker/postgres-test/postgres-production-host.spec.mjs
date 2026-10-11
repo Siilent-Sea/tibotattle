@@ -480,14 +480,40 @@ test("round 12: retired routes are the closed 503, the performance intake served
     assert.equal(answer.headers["retry-after"], undefined, path);
     assertNoStoreMarked(answer, `${method} ${path}`);
   }
-  // ADMIN-R12: the admin host runs the Access chokepoint; a forged assertion is the Worker's 403.
+  // The owner-decided public read (2026-10-10): before the first
+  // publication every slot is the Worker's 404, no-store, never a 5xx.
+  for (const query of ["?period=7&speedMode=fast", "?speedMode=ultrafast&period=all"]) {
+    const requestId = randomUUID();
+    const answer = await send(port, { method: "GET", path: `/api/v1/community/model-performance${query}`,
+      headers: edgeHeaders({ requestId, admission: "v1;public_aggregate_read;allowed" }) });
+    assert.equal(answer.status, 404, `${query}: ${answer.text}`);
+    assert.deepEqual(JSON.parse(answer.text),
+      { error: { code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED", requestId } }, query);
+    assertNoStoreMarked(answer, `model-performance ${query}`);
+  }
   {
     const requestId = randomUUID();
-    const answer = await send(port, { method: "GET", path: "/api/v1/admin/overview",
+    const refused = await send(port, { method: "GET", path: "/api/v1/community/model-performance?period=14",
+      headers: edgeHeaders({ requestId, admission: "v1;public_aggregate_read;allowed" }) });
+    assert.equal(refused.status, 400, refused.text);
+    assert.deepEqual(JSON.parse(refused.text), { error: { code: "BODY_INVALID", requestId } });
+    assertNoStoreMarked(refused, "model-performance bad slot");
+  }
+  // ADMIN-R12: the admin host runs the Access chokepoint; a forged assertion is the Worker's 403.
+  for (const path of ["/api/v1/admin/overview", "/api/v1/admin/performance-intake"]) {
+    const requestId = randomUUID();
+    const answer = await send(port, { method: "GET", path,
       headers: { ...edgeHeaders({ hostKind: "admin", requestId }), "cf-access-jwt-assertion": "synthetic.access.assertion" } });
     assert.equal(answer.status, 403, answer.text);
     assert.equal(JSON.parse(answer.text).error.code, "ACCESS_REQUIRED");
-    assertNoStoreMarked(answer, "admin host");
+    assertNoStoreMarked(answer, `admin host ${path}`);
+  }
+  // The admin view is never served on the apex.
+  {
+    const answer = await send(port, { method: "GET", path: "/api/v1/admin/performance-intake",
+      headers: edgeHeaders({ requestId: randomUUID() }) });
+    assert.equal(answer.status, 404, answer.text);
+    assert.equal(JSON.parse(answer.text).error.code, "NOT_FOUND");
   }
   // OD-CR-6 (ii), accepted: a query string on a v1.2 POST route or on the
   // upload-authorization route is refused, where the Worker ignores it; (i)
@@ -697,6 +723,30 @@ test("decision 1: the performance intake answers the Worker's sequence for a rea
   assert.equal(activatedBody.result.state, "active");
   assert.deepEqual((await base.query(`SELECT state, policy_revision FROM ${t("telemetry_performance_runtime")}`)).rows,
     [{ state: "active", policy_revision: 2 }]);
+  // The composed read-only admin view (owner decision 2026-10-10, GATE-Q 4
+  // and 23) reads the same runtime over the primary pool, with this image's
+  // migration history and the performance routes' classes.
+  {
+    const intake = new Request(`${adminOrigin}/api/v1/admin/performance-intake`);
+    contexts.set(intake, Object.freeze({ requestId: randomUUID(), routeId: "admin_performance_intake",
+      adminIdentityKey: "owner@synthetic.example" }));
+    const answer = await handlers.get("admin_performance_intake")(intake);
+    const body = await answer.json();
+    assert.equal(answer.status, 200, JSON.stringify(body));
+    assert.equal(answer.headers.get("cache-control"), "no-store");
+    assert.equal(body.schemaVersion, "admin-performance-intake-v0.1");
+    assert.equal(body.runtime.state, "active");
+    assert.equal(body.runtime.policyRevision, 2);
+    assert.deepEqual(body.deployment, { sourceCommit: null, historySha256 });
+    assert.deepEqual(body.routes, [
+      { routeId: "accountless_telemetry_performance_authorization", routeClass: "performance" },
+      { routeId: "admin_performance_intake", routeClass: "admin" },
+      { routeId: "community_model_performance", routeClass: "performance" },
+      { routeId: "telemetry_performance_capabilities", routeClass: "performance" },
+      { routeId: "telemetry_performance_consent", routeClass: "retired" },
+      { routeId: "telemetry_performance_reports", routeClass: "performance" },
+    ]);
+  }
   // The grant now writes and echoes the exact body (201); the capability
   // reads back with the default dictionary (no v1.2 manifest: GATE-Q 1).
   {

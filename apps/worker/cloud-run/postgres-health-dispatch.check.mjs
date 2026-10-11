@@ -49,9 +49,10 @@ function registryFor(ported) {
 
 test("OD-CR-5: the capability flags derive from the registry, false while their routes are unported", () => {
   assert.deepEqual(Object.keys(health.HEALTH_CAPABILITY_ROUTE_IDS), ["participantExport", "coordinatedSignInAdmission"]);
-  // The ported list holds scope 21, od-cr-1 9 and performance 3 (owner
-  // decision 2026-10-10); none of them is a route a flag names.
-  assert.equal(composition.POSTGRES_PORTED_WORKER_ROUTE_IDS.length, 33);
+  // The ported list holds scope 21, od-cr-1 9 and performance 4 (owner
+  // decisions 2026-10-10: the restored intake and the public model-performance
+  // read); none of them is a route a flag names.
+  assert.equal(composition.POSTGRES_PORTED_WORKER_ROUTE_IDS.length, 34);
   const production = registryFor([...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS]);
   const flags = health.healthCapabilityFlags(health.registryPorted(production));
   assert.ok(Object.isFrozen(flags));

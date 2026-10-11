@@ -305,7 +305,8 @@ export const PRODUCTION_IDENTITY_LINK_ROTATION_LABELS = Object.freeze({
 });
 /**
  * Every route a production registry may port (the classes it admits: scope,
- * od-cr-1, admin and, since owner decision 2026-10-10, performance); the
+ * od-cr-1, admin and, since owner decision 2026-10-10, performance: 41
+ * routes, the two owner-decided routes of 2026-10-10 included); the
  * P8-R consumer refusal checks the identity-link consumers against it. Every
  * consumer is retired (round 12), and this set excludes the retired classes
  * by construction, so on the CLI path the refusal reduces to the registry

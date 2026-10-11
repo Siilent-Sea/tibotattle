@@ -760,8 +760,10 @@ test("the origin request contract mirrors the origin's own log line (cloud-run/p
       : registry.RETIRED_ROUTE_IDS.includes(routeClass), routeClass);
   }
   assert.deepEqual(registry.RETIRED_ROUTE_IDS.filter((id) => !excluded.includes(id)), []);
+  // The performance class also holds the owner-decided public model-performance
+  // read (2026-10-10), which is served and never excluded either.
   assert.deepEqual([...registry.PERFORMANCE_ROUTE_IDS], ["accountless_telemetry_performance_authorization",
-    "telemetry_performance_capabilities", "telemetry_performance_reports"]);
+    "telemetry_performance_capabilities", "telemetry_performance_reports", "community_model_performance"]);
   assert.equal(registry.PERFORMANCE_ROUTE_IDS.some((id) => excluded.includes(id)), false);
   assert.deepEqual(excluded.filter((id) => id.includes("performance")), ["telemetry_performance_consent"]);
   for (const path of ["/api/v1/accountless/telemetry-performance-authorization",

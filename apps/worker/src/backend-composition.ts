@@ -86,7 +86,8 @@ export function createPostgresWorkerBackend(
  * devices, revocation, pairing, pairing claim, v1.2 consent, disconnect and
  * credential renew) and the three restored performance intake routes (owner
  * decision 2026-10-10, decision 1: the accountless performance
- * authorization, capabilities and reports), in policy order. The six admin
+ * authorization, capabilities and reports) plus the owner-decided community
+ * model-performance read (2026-10-10), in policy order. The seven admin
  * console routes are served only on the admin host, behind the Access
  * chokepoint (POSTGRES_ADMIN_HOST_ROUTE_IDS). Every other route is retired at
  * the switch by owner round 12 (2026-10-02): legacy enroll, Google and Apple
@@ -131,13 +132,15 @@ export const POSTGRES_PORTED_WORKER_ROUTE_IDS = Object.freeze([
   "envelope_key",
   "contributions",
   "community_daily",
+  "community_model_performance",
 ] as const);
 
 /**
  * The admin console routes (the policy's 'admin' authority) the origin
  * serves on the admin host only, after the Access chokepoint (owner decision
  * OD-CR-2: the six admin console routes must work at the switch; ported by
- * C-ADMIN). Round 12 answered OWN-17 (open with what is ported), so the
+ * C-ADMIN; the owner-decided performance-intake read of 2026-10-10 is the
+ * seventh). Round 12 answered OWN-17 (open with what is ported), so the
  * production and staging composition root opens the admin host (OD-CR-3
  * 'chokepoint', ADMIN-R12); the composition root holds that switch.
  */
