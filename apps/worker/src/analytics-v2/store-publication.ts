@@ -235,7 +235,13 @@ interface StoredPerformanceHeadRow {
  * twelve slots in slot order). Inside the run's write transaction, it reads
  * every head FOR UPDATE, then:
  *  - defers an all-empty first publication: with no head stored and no
- *    candidate naming a model, it writes nothing (deferredEmpty);
+ *    candidate naming a model, it writes nothing (deferredEmpty). Under the
+ *    fold this is GATE-Q 12's measure ("nothing until the first run with
+ *    any included record", summary.includedRecords > 0): a model appears in
+ *    a candidate exactly when an included record names it, so "no candidate
+ *    names a model" equals "no included record". The refresh Job refuses a
+ *    fold result where the two disagree (cloud-run/analytics-refresh-read.mjs)
+ *    and the model-performance Job spec proves the equivalence;
  *  - otherwise keeps each slot whose digest is unchanged and writes each
  *    changed slot at nextPublishedRevision({ head, floor: null, seed }), with
  *    generatedAt = releasedAt, re-validated as community-model-performance-v1,

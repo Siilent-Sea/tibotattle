@@ -10,9 +10,13 @@
  * day). Opaque participant, device and report keys are held in memory only;
  * no output carries them and nothing logs record content.
  *
- * Not yet a kernel closure root: SPD-P3 registers this module, moves the
- * types below into contract.ts (type-only) and adds a parity test between
- * analyticsV2PerformanceContentSha256 here and the store-side helper.
+ * A kernel closure root (cloud-run/analytics-kernel-closure.mjs): the
+ * refresh Job runs it after computeAnalyticsV2, outside it
+ * (cloud-run/analytics-refresh-read.mjs), over the reader's pages. Its six
+ * shared types come type-only from performance-publication-contract.ts
+ * (plumbing, outside the closure); its content digest stays defined here, on
+ * the closure side, and a parity test holds it equal to the store-side
+ * helper on every golden candidate.
  *
  * The fold mirrors the desktop Model performance view
  * (src/reporting/model-performance.js on the client line):
@@ -72,9 +76,11 @@
  * pools; the day and model caps bound it, and held pools are released as
  * soon as the day cap trips. `account`, when given, is charged each emitted
  * candidate (resources.ts analyticsV2OutputRowBytes) and may throw (the run's
- * output budget). `checkpoint`, when given, is called with content-free
- * progress events and may throw (the Job's time guard); either error ends
- * the fold.
+ * output budget). The refresh Job passes none: the store charges the
+ * candidates to the run's output account exactly once, against the room
+ * computeAnalyticsV2 left, and records them (store-run.ts prepareOutputs).
+ * `checkpoint`, when given, is called with content-free progress events and
+ * may throw (the Job's time guard); either error ends the fold.
  */
 import {
   COMMUNITY_MODEL_PERFORMANCE_METHOD_VERSION,
@@ -100,12 +106,25 @@ import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
 import { analyticsV2OutputRowBytes } from "./resources";
 
-export type AnalyticsV2PerformancePeriod = '1' | '7' | '30' | 'all';
-export type AnalyticsV2PerformanceSpeedMode = 'standard' | 'fast' | 'ultrafast';
-export type AnalyticsV2PerformanceWithheld = 'ANALYTICS_V2_PERFORMANCE_CAPACITY' | 'ANALYTICS_V2_PERFORMANCE_RECORD_INVALID' | 'ANALYTICS_V2_PERFORMANCE_MODELS_EXCEEDED' | 'ANALYTICS_V2_PERFORMANCE_POINTS_EXCEEDED';
-export interface AnalyticsV2PerformanceCandidate { readonly period: AnalyticsV2PerformancePeriod; readonly speedMode: AnalyticsV2PerformanceSpeedMode; readonly payload: Readonly<Record<string, unknown>>; readonly payloadSha256: string }
-export interface AnalyticsV2PerformanceSummary { readonly reports: number; readonly cohorts: number; readonly includedRecords: number; readonly excludedRecords: number; readonly excludedUnknownTurns: number; readonly deferredFutureDays: number; readonly end: string }
-export interface AnalyticsV2PerformanceOutputs { readonly candidates: readonly AnalyticsV2PerformanceCandidate[]; readonly summary: AnalyticsV2PerformanceSummary; readonly withheld: AnalyticsV2PerformanceWithheld | null }
+// Type-only, erased by esbuild: the contract module is store-side plumbing and
+// no closure input (the kernel registry check asserts it).
+import type {
+  AnalyticsV2PerformanceCandidate,
+  AnalyticsV2PerformanceOutputs,
+  AnalyticsV2PerformancePeriod,
+  AnalyticsV2PerformanceSpeedMode,
+  AnalyticsV2PerformanceSummary,
+  AnalyticsV2PerformanceWithheld,
+} from "./performance-publication-contract";
+
+export type {
+  AnalyticsV2PerformanceCandidate,
+  AnalyticsV2PerformanceOutputs,
+  AnalyticsV2PerformancePeriod,
+  AnalyticsV2PerformanceSpeedMode,
+  AnalyticsV2PerformanceSummary,
+  AnalyticsV2PerformanceWithheld,
+};
 
 /** The periods and speed modes of the 12 slots, in candidate order (period-major). */
 export const ANALYTICS_V2_PERFORMANCE_PERIODS: readonly AnalyticsV2PerformancePeriod[] = Object.freeze(["1", "7", "30", "all"]);
@@ -176,7 +195,8 @@ const invalid = (what: string): never => { throw new TypeError(`ANALYTICS_V2_PER
  * A performance payload's content identity: sha256 of its canonical JSON
  * without the store's stamp (revision, generatedAt). Equal for every stamp of
  * the same content. The store keeps its own definition
- * (performance-publication-contract.ts); SPD-P3 tests their parity.
+ * (performance-publication-contract.ts); the model-performance Job spec
+ * proves the two equal on every golden candidate.
  */
 export async function analyticsV2PerformanceContentSha256(payload: Readonly<Record<string, unknown>>): Promise<string> {
   const { revision: _revision, generatedAt: _generatedAt, ...content } = payload;

@@ -43,7 +43,9 @@
  *     community aggregate exclusions the run applied (N-EXCL). A withheld
  *     performance publication leaves every performance head untouched; a run
  *     without performance outputs writes nothing of it, so stub pipelines and
- *     goldens are unchanged.
+ *     goldens are unchanged. The performance candidates are charged to the
+ *     run's output account here, once (the fold runs without one), and the
+ *     run row's timings.account records accountBytes with them included.
  *
  * Any failure rolls the whole transaction back: no analytics_v2 row changes.
  *
@@ -68,7 +70,7 @@
 
 import type { PostgresClient } from "../postgres-client";
 import { ANALYTICS_V2_SHA256_PATTERN, type AnalyticsV2RunOutputs } from "./contract";
-import type { AnalyticsV2PerformanceOutputs, AnalyticsV2PerformancePublicationSummary } from "./performance-publication-contract";
+import type { AnalyticsV2PerformancePublicationSummary } from "./performance-publication-contract";
 import { analyticsV2CompatibilitySha256 } from "./kernel";
 import { writeAnalyticsV2DerivedFamilies } from "./store-derived";
 import { AnalyticsV2PriceError, analyticsV2KernelPriceCards } from "./price-attribution";
@@ -106,14 +108,6 @@ import {
   type AnalyticsV2WriteReceipt,
   type WriteAnalyticsV2RunOptions,
 } from "./store-run";
-
-/**
- * A run's outputs with the optional community model performance publication.
- * Local until contract.ts (a kernel closure input) gains the field.
- */
-type AnalyticsV2RunOutputsWithPerformance = AnalyticsV2RunOutputs & {
-  readonly performance?: AnalyticsV2PerformanceOutputs;
-};
 
 // The store's public surface (K-SPLIT): one import path for the Job, the
 // route and the specs, whichever module now holds a name.
@@ -193,7 +187,7 @@ export type {
  */
 export async function writeRunOutputs(
   client: PostgresClient,
-  outputs: AnalyticsV2RunOutputsWithPerformance,
+  outputs: AnalyticsV2RunOutputs,
   options: WriteAnalyticsV2RunOptions,
 ): Promise<AnalyticsV2WriteReceipt> {
   if (client === null || typeof client !== "object" || typeof client.query !== "function"
