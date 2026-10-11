@@ -417,7 +417,7 @@ test("bounds hold with closed codes: options, checkpoints and the per-run cohort
   for (const pageSize of [0, -1, 1.5, 1_025, Number.NaN, "2"]) {
     assert.equal(await sourceCode(read({ pageSize })), "ANALYTICS_V2_SOURCE_INVALID");
   }
-  for (const maxCohorts of [0, 1_000_001, 2.5, null]) {
+  for (const maxCohorts of [0, 10_000_001, 2.5, null]) {
     assert.equal(await sourceCode(read({ maxCohorts })), "ANALYTICS_V2_SOURCE_INVALID");
   }
   for (const throughDay of ["2026-02-30", "2026-10-9", "", null]) {
@@ -426,7 +426,8 @@ test("bounds hold with closed codes: options, checkpoints and the per-run cohort
   assert.equal(await sourceCode(onSnapshot(schema, (client) => source.readAnalyticsV2PerformanceSource(client,
     { schema: "bad schema\"", throughDay: THROUGH_DAY }))), "ANALYTICS_V2_SOURCE_INVALID");
   assert.equal(source.MAX_ANALYTICS_V2_PERFORMANCE_PAGE_REPORTS, 1_024);
-  assert.equal(source.MAX_ANALYTICS_V2_PERFORMANCE_COHORTS, 1_000_000);
+  assert.equal(source.MAX_ANALYTICS_V2_PERFORMANCE_COHORTS, 10_000_000);
+  assert.equal(source.DEFAULT_ANALYTICS_V2_PERFORMANCE_COHORTS, 10_000_000);
   assert.deepEqual([...source.PERFORMANCE_SOURCE_STATEMENT_FAMILIES], ["performance.reports", "performance.cohorts"]);
 
   // Checkpoints: only one this module issued, for the same run parameters.
@@ -535,6 +536,125 @@ test("pages are bound to the snapshot: a report committed mid-run is not read", 
   const fresh = await onSnapshot(schema, (client) =>
     source.collectAnalyticsV2PerformanceSource(client, { schema, throughDay: THROUGH_DAY }));
   assert.deepEqual(fresh.records.map((record) => record.reportDay), ["2026-10-01", "2026-10-02", "2026-10-04"]);
+});
+
+/**
+ * Two devices with one current report each on one day, and a function that
+ * replaces the first-read device's day (revision 2, 3, ...) until the
+ * replacement's id sorts after `afterKey`: the state in which a keyset position
+ * carried into a later snapshot would read that device-day twice.
+ */
+async function replacementCorpus(label) {
+  const schema = await promotedSchema(label);
+  const day = "2026-10-01";
+  const devices = [];
+  for (let index = 0; index < 2; index += 1) {
+    const who = await ownerWithGrant(schema, PERFORMANCE_DICTIONARY_2026_10_10);
+    const report = await insertPerformanceReport(pool, { schema, owner: who.owner, grant: who.grant, reportDay: day,
+      records: [syntheticPerformanceRecord({ day, fieldDictionaryVersion: who.dictionary })],
+      sourceRevision: 1, sourceGeneration: "gen-1" });
+    devices.push({ who, reportId: report.reportId });
+  }
+  const replaceAfter = async (afterKey) => {
+    const { who } = devices.find((device) => device.reportId === afterKey);
+    for (let revision = 2; revision < 64; revision += 1) {
+      const report = await insertPerformanceReport(pool, { schema, owner: who.owner, grant: who.grant, reportDay: day,
+        records: [syntheticPerformanceRecord({ day, fieldDictionaryVersion: who.dictionary, turns: revision })],
+        sourceRevision: revision, sourceGeneration: `gen-${revision}` });
+      const order = await pool.query("SELECT $1::text > $2::text AS after", [report.reportId, afterKey]);
+      if (order.rows[0].after) return who;
+    }
+    return assert.fail("no replacement sorted after the checkpoint key");
+  };
+  return { schema, replaceAfter };
+}
+
+test("a checkpoint is refused on any other snapshot, so a replaced device-day is never read twice",
+  { skip }, async () => {
+    const { schema, replaceAfter } = await replacementCorpus("cross");
+    const options = { schema, throughDay: THROUGH_DAY, pageSize: 1 };
+    const first = await onSnapshot(schema, (client) => source.readAnalyticsV2PerformanceSource(client, options));
+    assert.equal(first.records.length, 1);
+    assert.notEqual(first.checkpoint, null);
+    // Committed after snapshot A: the first device's day is replaced by a report
+    // whose id sorts after A's keyset position.
+    const replaced = await replaceAfter(first.records[0].reportKey);
+    // Snapshot B refuses A's checkpoint before reading any report or cohort.
+    await onSnapshot(schema, async (client) => {
+      const recorder = recording(client);
+      assert.equal(await sourceCode(source.readAnalyticsV2PerformanceSource(recorder,
+        { ...options, checkpoint: first.checkpoint })), "ANALYTICS_V2_SOURCE_INVALID");
+      assert.deepEqual(recorder.statements.map(({ text }) => FAMILY_TAG.exec(text)?.[1]), ["snapshot.read_only"]);
+    });
+    // A fresh run in B reads each device-day exactly once, the replacement included.
+    const fresh = await onSnapshot(schema, (client) => source.collectAnalyticsV2PerformanceSource(client, options));
+    assert.equal(fresh.records.length, 2);
+    assert.equal(new Set(fresh.records.map((record) => record.deviceKey)).size, 2);
+    const replacement = fresh.records.find((record) => record.deviceKey === replaced.owner.deviceId);
+    assert.notEqual(replacement.reportKey, first.records[0].reportKey);
+  });
+
+test("a checkpoint continues on another session that imported the same exported snapshot", { skip }, async () => {
+  const { schema, replaceAfter } = await replacementCorpus("export");
+  const options = { schema, throughDay: THROUGH_DAY, pageSize: 1 };
+  const exporter = await pool.connect();
+  const importer = await pool.connect();
+  try {
+    // The refresh Job's createSnapshotReadPool shape: export on one session,
+    // import on another, both read-only repeatable read.
+    await exporter.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const exported = (await exporter.query("SELECT pg_export_snapshot() AS snapshot")).rows[0].snapshot;
+    assert.match(exported, /^[0-9A-F]+-[0-9A-F]+-[0-9]+$/u);
+    const first = await source.readAnalyticsV2PerformanceSource(exporter, options);
+    assert.notEqual(first.checkpoint, null);
+    // A later commit is invisible to the exported snapshot.
+    await replaceAfter(first.records[0].reportKey);
+    await importer.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await importer.query(`SET TRANSACTION SNAPSHOT '${exported}'`);
+    const second = await source.readAnalyticsV2PerformanceSource(importer, { ...options, checkpoint: first.checkpoint });
+    assert.equal(second.checkpoint, null);
+    const records = [...first.records, ...second.records];
+    assert.equal(records.length, 2, "one record per device-day, from the exported state");
+    assert.equal(new Set(records.map((record) => record.deviceKey)).size, 2);
+    assert.equal(second.summary.reports, 2);
+    await importer.query("COMMIT");
+    await exporter.query("COMMIT");
+  } finally {
+    await importer.query("ROLLBACK").catch(() => {});
+    await exporter.query("ROLLBACK").catch(() => {});
+    importer.release();
+    exporter.release();
+  }
+});
+
+test("a page whose statements see different snapshots fails closed", { skip }, async () => {
+  const { schema } = await buildCorpus();
+  // Autocommit with read-only repeatable-read session defaults passes the
+  // per-statement settings check, but every statement takes a new snapshot.
+  const client = await pool.connect();
+  try {
+    await client.query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const statements = [];
+    const interleaved = {
+      async query(text, values) {
+        statements.push(text);
+        const result = await client.query(text, values);
+        // Another session commits right after the page's report statement.
+        if (text.includes("analytics_v2:performance.reports") && text.includes("ORDER BY r.report_day")) {
+          await pool.query("SELECT pg_current_xact_id()");
+        }
+        return result;
+      },
+    };
+    assert.equal(await sourceCode(source.readAnalyticsV2PerformanceSource(interleaved,
+      { schema, throughDay: THROUGH_DAY, pageSize: 2 })), "ANALYTICS_V2_SOURCE_UNAVAILABLE");
+    const families = statements.map((text) => FAMILY_TAG.exec(text)?.[1]);
+    assert.deepEqual(families.slice(-2), ["performance.cohorts", "snapshot.read_only"],
+      "the cohorts were consistent; the closing snapshot read refused the page");
+  } finally {
+    // Discard the session so its altered defaults never reach another test.
+    client.release(true);
+  }
 });
 
 test("an empty corpus reads one complete empty page", { skip }, async () => {

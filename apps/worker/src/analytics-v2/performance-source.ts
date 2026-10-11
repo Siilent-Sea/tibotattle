@@ -14,14 +14,30 @@
  *    JSON object per histogram), so no bucket row reaches the client.
  *  - A superseded report, or a current zero-record report (a day tombstone),
  *    is never read. Current non-empty reports after throughDay are not read
- *    either; their distinct days are counted as deferredFutureDays.
+ *    either; their distinct days are counted as deferredFutureDays. The
+ *    record_count > 0 filter sits outside the partial index predicate, so day
+ *    tombstones inside a page's key range are visited and discarded.
  *
  * Snapshot: the reader runs on the caller's client, inside the caller's
  * read-only REPEATABLE READ transaction (the refresh Job's exported snapshot,
  * or owners.ts withAnalyticsV2ReadSnapshot). It opens, commits and rolls back
  * no transaction of its own; it refuses a client that is not in a read-only
- * repeatable-read (or serializable) transaction. The checkpoint is valid only
- * within that snapshot: it is an in-memory token, never persisted.
+ * repeatable-read (or serializable) transaction. Every page starts with the
+ * snapshot.read_only guard, which also reads pg_current_snapshot()::text, and
+ * ends by reading it again:
+ *  - The checkpoint is bound to that snapshot. A continuation whose snapshot
+ *    differs from the one that issued the checkpoint is refused with
+ *    SOURCE_INVALID, so a keyset position never carries into a later state
+ *    (where a superseded report's replacement could sort after it and a
+ *    device-day would be read twice). Under REPEATABLE READ the value is fixed
+ *    for the transaction, and every session that imports one exported
+ *    snapshot (SET TRANSACTION SNAPSHOT) reports the same value, so a page may
+ *    continue on another connection of createSnapshotReadPool.
+ *  - Equal snapshot text means equal visibility (no transaction completed in
+ *    between), so a page whose closing read differs from its opening guard
+ *    mixed snapshots (for example an autocommit session whose session defaults
+ *    are REPEATABLE READ READ ONLY) and fails with SOURCE_UNAVAILABLE.
+ * The checkpoint is an in-memory token, never persisted.
  *
  * Output: every cohort is rebuilt into the contract record shape
  * (model-performance-daily-v1, keys in the contract's order): the report's
@@ -70,9 +86,15 @@ export type PerformanceSourceStatementFamily = (typeof PERFORMANCE_SOURCE_STATEM
 /** Reports per page: the default and the ceiling. */
 export const DEFAULT_ANALYTICS_V2_PERFORMANCE_PAGE_REPORTS = 256;
 export const MAX_ANALYTICS_V2_PERFORMANCE_PAGE_REPORTS = 1_024;
-/** Cohorts per run: the default and the ceiling. */
-export const DEFAULT_ANALYTICS_V2_PERFORMANCE_COHORTS = 500_000;
-export const MAX_ANALYTICS_V2_PERFORMANCE_COHORTS = 1_000_000;
+/**
+ * Cohorts per run: the default and the ceiling. The run reads the whole corpus
+ * (the publication's "all" window), so the bound is sized for decades of
+ * community growth, not a convenience window. It bounds work, not memory:
+ * production folds page by page; collectAnalyticsV2PerformanceSource holds
+ * every record and is meant for tests and small corpora.
+ */
+export const DEFAULT_ANALYTICS_V2_PERFORMANCE_COHORTS = 10_000_000;
+export const MAX_ANALYTICS_V2_PERFORMANCE_COHORTS = 10_000_000;
 
 /** An opaque in-memory key. Never output, logged or persisted. */
 export type AnalyticsV2PerformanceSourceKey = string;
@@ -89,7 +111,7 @@ export interface AnalyticsV2PerformanceSourceRecord {
   readonly record: Readonly<TelemetryPerformanceRecord>;
 }
 
-/** An opaque keyset position, valid only within the snapshot that issued it. */
+/** An opaque keyset position, accepted only on the snapshot that issued it. */
 export interface AnalyticsV2PerformanceSourceCheckpoint {
   readonly kind: "analytics-v2-performance-source-checkpoint";
 }
@@ -121,13 +143,15 @@ export interface ReadAnalyticsV2PerformanceSourceOptions {
   readonly throughDay: string;
   /** Reports per page (default 256, at most 1,024). */
   readonly pageSize?: number;
-  /** Cohorts per run (default 500,000, at most 1,000,000). */
+  /** Cohorts per run (default and ceiling 10,000,000). */
   readonly maxCohorts?: number;
   /** The previous page's checkpoint; null or absent for the first page. */
   readonly checkpoint?: AnalyticsV2PerformanceSourceCheckpoint | null;
 }
 
 interface CheckpointState {
+  /** pg_current_snapshot()::text of the issuing page (never on the token). */
+  readonly snapshot: string;
   readonly schema: string;
   readonly throughDay: string;
   readonly pageSize: number;
@@ -151,6 +175,9 @@ const BUCKET_KEY = /^(?:0|[1-9]\d{0,1})$/u;
 const MAX_BUCKET_INDEX = 95;
 const MAX_REPORT_RECORDS = 1_024;
 const ISOLATIONS: ReadonlySet<string> = new Set(["repeatable read", "serializable"]);
+// pg_snapshot text: xmin:xmax:xip_list (decimal xids, comma separated).
+const SNAPSHOT = /^\d{1,20}:\d{1,20}:(?:\d{1,20}(?:,\d{1,20})*)?$/u;
+const MAX_SNAPSHOT_TEXT = 1_048_576;
 
 const HISTOGRAMS = Object.freeze([
   ["speedHistogram", "speed", "speed_buckets", "speed_min", "speed_max"],
@@ -347,16 +374,24 @@ function cohortsSql(s: string): string {
  LIMIT $2`;
 }
 
-async function assertSnapshot(client: Pick<PostgresClient, "query">): Promise<void> {
-  const result = await client.query<{ read_only: unknown; isolation: unknown }>(analyticsV2Statement(
-    "snapshot.read_only",
-    "SELECT current_setting('transaction_read_only') AS read_only, "
-    + "current_setting('transaction_isolation') AS isolation"));
+/**
+ * The read-only repeatable-read guard; returns the snapshot it runs on
+ * (pg_current_snapshot()::text), which binds checkpoints and closes each page.
+ */
+async function assertSnapshot(client: Pick<PostgresClient, "query">): Promise<string> {
+  const result = await client.query<{ read_only: unknown; isolation: unknown; snapshot: unknown }>(
+    analyticsV2Statement("snapshot.read_only",
+      "SELECT current_setting('transaction_read_only') AS read_only, "
+      + "current_setting('transaction_isolation') AS isolation, "
+      + "pg_current_snapshot()::text AS snapshot"));
   const row = result.rows[0];
   if (result.rows.length !== 1 || row?.read_only !== "on"
-      || typeof row.isolation !== "string" || !ISOLATIONS.has(row.isolation)) {
-    sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+      || typeof row.isolation !== "string" || !ISOLATIONS.has(row.isolation)
+      || typeof row.snapshot !== "string" || row.snapshot.length > MAX_SNAPSHOT_TEXT
+      || !SNAPSHOT.test(row.snapshot)) {
+    return sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
   }
+  return row.snapshot;
 }
 
 function issueCheckpoint(state: CheckpointState): AnalyticsV2PerformanceSourceCheckpoint {
@@ -369,7 +404,7 @@ function issueCheckpoint(state: CheckpointState): AnalyticsV2PerformanceSourceCh
  * Read one keyset page of current, non-empty performance reports up to
  * throughDay, rebuilt as contract records, on the caller's open read-only
  * snapshot. Pass the returned checkpoint back (with the same schema,
- * throughDay, pageSize and maxCohorts) until it is null.
+ * throughDay, pageSize and maxCohorts, on the same snapshot) until it is null.
  */
 export async function readAnalyticsV2PerformanceSource(
   client: Pick<PostgresClient, "query">,
@@ -395,7 +430,9 @@ export async function readAnalyticsV2PerformanceSource(
     }
   }
 
-  await assertSnapshot(client);
+  const snapshot = await assertSnapshot(client);
+  // A checkpoint continues only the snapshot that issued it.
+  if (prior !== null && prior.snapshot !== snapshot) return sourceFail("ANALYTICS_V2_SOURCE_INVALID");
   let deferredFutureDays: number;
   if (prior === null) {
     const deferred = await client.query<{ days: unknown }>(
@@ -465,6 +502,8 @@ export async function readAnalyticsV2PerformanceSource(
       cohortIndex += 1;
     }
   }
+  // Every statement of this page saw one state only if the snapshot is unchanged.
+  if (await assertSnapshot(client) !== snapshot) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
 
   const summary: AnalyticsV2PerformanceSourceSummary = Object.freeze({
     reports: priorReports + reports.length,
@@ -475,6 +514,7 @@ export async function readAnalyticsV2PerformanceSource(
   });
   const last = reports.at(-1);
   const checkpoint = complete || last === undefined ? null : issueCheckpoint({
+    snapshot,
     schema: s,
     throughDay,
     pageSize,
