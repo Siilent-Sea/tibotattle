@@ -239,7 +239,7 @@ calculation requires a separate decision after sufficient collected history.
 day, provider, model, reasoning effort, speed method, speed mode/evidence source
 and API tier. Its independent TPS, TTFT and full-completion histograms retain
 eligible sample counts, conservative integer extrema and speed token/duration
-sums. Completion is positive integer milliseconds; measured zero TTFT is valid. `performance-histogram-v1` fixes the bucket
+sums. Completion is positive integer milliseconds; measured zero TTFT is valid. Each bucket scheme (`performance-histogram-v1`, `performance-histogram-v2`) fixes the bucket
 edges for every contributor/client and includes explicit tails. Counts and integer units remain bounded by
 JavaScript's safe-integer range. Typed storage retains only populated bucket
 indexes/counts, typed cohort dimensions and the bounded integer summaries.
@@ -261,7 +261,37 @@ Timing SQLite schemas advance from 2/3 to 4/5 while parser methods remain 2/3.
 Older writers refuse the upgraded stores. Old rows retain existing TPS/TTFT
 with unavailable new fields. Receipt timing
 wins when qualified; tool-free timing is a single-sample fallback, never a
-second speed sample for the same turn. The field dictionary is `telemetry-performance-registry-2026-09-21.1`.
+second speed sample for the same turn. Clients emit field dictionary `telemetry-performance-registry-2026-09-29.1`.
+
+Readers accept every dictionary in `PERFORMANCE_FIELD_DICTIONARIES`:
+- `…2026-09-21.1` (0.1.24–0.1.26, no Ultrafast; their Ultrafast turns are `other`);
+- `…2026-09-29.1` (0.1.27 onward);
+- `…2026-10-10.1`, which is `accepted` server first, before any client emits it.
+
+`accepted` means intake accepts a dictionary; transport never advertises a
+dictionary the device did not declare. `PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION`
+is the bucket scheme of the emitted dictionary. The legacy Cloudflare Worker's
+D1 performance path is pinned to the dictionary its schema admits and does not
+follow the emitted default.
+
+`adaptTelemetryPerformanceRecord` validates a record under its own dictionary
+and returns it in the latest vocabulary by identity.
+
+`performance-histogram-v2`, paired with `…2026-10-10.1`, keeps every v1 edge.
+It resolves speed above 120 tokens/second through about 3,228 tokens/second;
+millisecond bins are unchanged. A record and its three histograms always share
+one scheme. Same-scheme histograms merge exactly. `poolPerformanceHistograms`
+combines v1 and v2 evidence, carrying v1 speed overflow as unresolved mass that
+widens bounds to the observed maximum.
+
+`community-model-performance-v1` is the closed publication shape. It mirrors the
+desktop view per model and speed mode, and each percentile carries an estimate
+plus conservative lower and upper bounds. Per-point sample and unresolved
+counts and contributor, device and report counts are always present; there is
+no contributor minimum. The
+[community model speed decision](../decisions/2026-10-10-community-model-speed.md)
+records these choices. Hosted intake and publication remain unbuilt.
+
 The [performance specification](../design/2026-09-20-performance-telemetry-contract.md)
 records the measurement, overlap, policy, delivery, erasure, restore and UI requirements.
 Those gates must not delay continuity collection or alter cache calculations.

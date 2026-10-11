@@ -208,3 +208,14 @@ switch.
 
     The 5xx alert never excludes the two upload paths, because every live
     v1 upload shares them.
+
+## Performance sharing amendment (2026-10-10)
+
+The owner decided on 2026-10-10 that activating the accountless daily
+performance stream needs no new first-run, Settings or public privacy wording.
+The disclosure requirement above continues to govern accountless usage
+collection; it does not gate performance activation. Performance sharing still
+follows the global sharing preference and its persistent opt-out, and stays
+content-free. The
+[community model speed decision](./2026-10-10-community-model-speed.md) records
+the full set of decisions.

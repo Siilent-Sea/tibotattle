@@ -89,6 +89,12 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 14: activation-only classification proof working sets share the
   // overlay reader's module; overlay reads and pricing identity unchanged.
   "2caee1ed3c56982a8cc6b945ca33ec727cc130ce9e4f7ad230582202d9594967",
+  // Kernel 15 (PROVISIONAL, SPD-G0): the community model speed contract port
+  // (performance-histogram-v2, dictionary adapters, community performance
+  // shape) and two new ErrorCode members reach the closure through the
+  // telemetry-contract barrel and errors.ts; pricing identity unchanged.
+  // SPD-INT-G drops this entry and appends max(live)+1.
+  "0f8647bab47a3c7d42701da84041fc535297583a9033da097a9e22c85e1bd545",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
