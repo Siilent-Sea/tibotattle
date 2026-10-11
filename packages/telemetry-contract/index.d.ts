@@ -747,6 +747,8 @@ export interface PerformanceFieldDictionary {
   readonly apiServiceTiers: readonly PerformanceApiServiceTier[];
 }
 export const PERFORMANCE_FIELD_DICTIONARIES: Readonly<Record<PerformanceFieldDictionaryVersion, PerformanceFieldDictionary>>;
+/** The emitted dictionary's bucket scheme; this literal moves with PERFORMANCE_FIELD_DICTIONARY_VERSION. */
+export const PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION: "performance-histogram-v1";
 export const PERFORMANCE_PRIVACY_CONTRACT_VERSION: "privacy-safe-model-performance-v1";
 export const PERFORMANCE_CONTRACT_STATE: "staged";
 export const PERFORMANCE_HISTOGRAM_SCHEMA_VERSION: "performance-histogram-v1";

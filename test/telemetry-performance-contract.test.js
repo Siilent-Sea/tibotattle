@@ -10,6 +10,7 @@ import {
   PERFORMANCE_BUCKET_SCHEME_VERSION,
   PERFORMANCE_BUCKET_SCHEME_VERSION_V2,
   PERFORMANCE_CONTRACT_STATE,
+  PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION,
   PERFORMANCE_FIELD_DICTIONARIES,
   PERFORMANCE_FIELD_DICTIONARY_VERSION,
   PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21,
@@ -144,14 +145,90 @@ function expectPublicationInvalid(value, label) {
   );
 }
 
-function expectInvalid(value, label) {
+function expectInvalid(value, label, fieldDictionaryVersion = PERFORMANCE_FIELD_DICTIONARY_VERSION) {
+  let failure = null;
   assert.throws(
-    () => parseTelemetryPerformanceRecord(value),
-    (error) => error?.code === "TELEMETRY_RECORD_INVALID"
-      || error?.code === "PRIVACY_CANARY_DETECTED",
+    () => parseTelemetryPerformanceRecord(value, fieldDictionaryVersion),
+    (error) => {
+      failure = error;
+      return error?.code === "TELEMETRY_RECORD_INVALID"
+        || error?.code === "PRIVACY_CANARY_DETECTED";
+    },
     label,
   );
+  return failure;
 }
+
+// One fixture kit per registered dictionary: the base record and every
+// histogram use that dictionary's own bucket scheme, so an invalid case built
+// from the kit can fail only for the property it changes.
+function dictionaryKit(fieldDictionaryVersion) {
+  const scheme = PERFORMANCE_FIELD_DICTIONARIES[fieldDictionaryVersion].bucketSchemeVersion;
+  const histogram = (metric, values) => buildPerformanceHistogram(metric, values, scheme);
+  const speed = (values = [50, 50]) => histogram("speed", values);
+  const ttft = (values = [500]) => histogram("ttft", values);
+  const completion = (values = [1000, 1200]) => histogram("turnDuration", values);
+  const record = (overrides = {}) => performanceRecord({
+    bucketSchemeVersion: scheme,
+    speedHistogram: speed(),
+    ttftHistogram: ttft(),
+    completionHistogram: completion(),
+    ...overrides,
+  });
+  return { fieldDictionaryVersion, scheme, record, speed, ttft, completion };
+}
+
+const SCHEME_MISMATCH_DETAIL = "performance_histogram_scheme_mismatch";
+const RECORD_INVALID = "performance_record_invalid";
+const SOURCE_MISMATCH = "performance_speed_mode_source_mismatch";
+
+// Each case names the detail it must fail with.  A function detail varies by
+// dictionary only where the dictionary's vocabulary legitimately differs.
+const INVALID_RECORD_CASES = Object.freeze([
+  ["unknown top-level key", (kit) => ({ ...kit.record(), extra: 1 }), RECORD_INVALID],
+  ["privacy canary", (kit) => ({ ...kit.record(), prompt: "private-synthetic-canary" }), "performance_privacy_canary"],
+  ["invalid UTC day", (kit) => kit.record({ day: "2026-02-29" }), RECORD_INVALID],
+  ["unreviewed provider/model", (kit) => kit.record({ provider: "private_provider", modelId: "private_model" }), RECORD_INVALID],
+  ["cross-provider model", (kit) => kit.record({ provider: "anthropic_claude_code", modelId: "gpt-5.6-luna" }), RECORD_INVALID],
+  ["unknown mode requires unobserved source", (kit) => kit.record({ speedMode: "unknown", speedModeSource: "mixed" }), SOURCE_MISMATCH],
+  ["mixed mode requires mixed source", (kit) => kit.record({ speedMode: "mixed", speedModeSource: "unobserved" }), SOURCE_MISMATCH],
+  ["known mode requires evidence source", (kit) => kit.record({ speedMode: "standard", speedModeSource: "unobserved" }), SOURCE_MISMATCH],
+  ["fast mode requires own or inherited evidence", (kit) => kit.record({ speedMode: "fast", speedModeSource: "mixed" }), SOURCE_MISMATCH],
+  // 2026-09-21.1 has no Ultrafast at all, so its vocabulary refuses first.
+  ["ultrafast requires observed evidence", (kit) => kit.record({ speedMode: "ultrafast", speedModeSource: "unobserved" }),
+    (kit) => (PERFORMANCE_FIELD_DICTIONARIES[kit.fieldDictionaryVersion].speedModes.includes("ultrafast")
+      ? SOURCE_MISMATCH : RECORD_INVALID)],
+  ["unreviewed speed mode", (kit) => kit.record({ speedMode: "ultrafast-private" }), RECORD_INVALID],
+  ["unknown reasoning effort", (kit) => kit.record({ reasoningEffort: "not-known" }), RECORD_INVALID],
+  ["unknown speed method", (kit) => kit.record({ speedMethod: "inferred" }), RECORD_INVALID],
+  ["unknown measurement version", (kit) => kit.record({ measurementVersion: "model-performance-samples-v0" }), RECORD_INVALID],
+  ["non-positive cohort", (kit) => kit.record({ turns: 0 }), RECORD_INVALID],
+  ["receipt cohort must cover all turns", (kit) => kit.record({ speedTurns: 1 }), "performance_histogram_count_mismatch"],
+  ["speed metric mismatch", (kit) => kit.record({ speedHistogram: kit.ttft() }), "performance_histogram_count_mismatch"],
+  ["TTFT metric mismatch", (kit) => kit.record({ ttftHistogram: kit.speed() }), "performance_histogram_count_mismatch"],
+  ["completion metric mismatch", (kit) => kit.record({ completionHistogram: kit.ttft() }), "performance_histogram_count_mismatch"],
+  ["completion cohort cannot exceed turns", (kit) => kit.record({ completionTurns: 3 }), RECORD_INVALID],
+  ["zero completion cohort must have empty histogram",
+    (kit) => kit.record({ completionTurns: 0, completionHistogram: kit.completion() }), "performance_histogram_count_mismatch"],
+  ["positive completion cohort must have samples",
+    (kit) => kit.record({ completionTurns: 1, completionHistogram: kit.completion([]) }), "performance_histogram_count_mismatch"],
+  ["summed speed ratio outside extrema", (kit) => kit.record({ speedTokens: 10 }), "performance_speed_sum_outside_extrema"],
+  ["unavailable speed must have no timed response", (kit) => kit.record({
+    speedMethod: "unavailable",
+    speedTurns: 0,
+    timedResponses: 1,
+    speedTokens: 0,
+    speedDurationMs: 0,
+    speedHistogram: kit.speed([]),
+  }), "performance_speed_unavailable_mismatch"],
+  ["empty TTFT cohort must have empty histogram",
+    (kit) => kit.record({ ttftTurns: 0, ttftHistogram: kit.ttft([0]) }), "performance_histogram_count_mismatch"],
+  ["accessor-backed record", (kit) => {
+    const value = kit.record();
+    Object.defineProperty(value, "turns", { enumerable: true, configurable: true, get: () => 2 });
+    return value;
+  }, "accessor_or_hidden_field"],
+]);
 
 function v12Usage(overrides = {}) {
   return {
@@ -276,47 +353,32 @@ test("performance daily cohorts preserve the closed measurement shape", () => {
 });
 
 test("performance validation rejects privacy, version, bounds, and relation violations", () => {
-  const extra = performanceRecord();
-  extra.extra = 1;
-  expectInvalid(extra, "unknown top-level key");
+  for (const [label, build, detail] of INVALID_RECORD_CASES) {
+    const failure = expectInvalid(build(dictionaryKit(PERFORMANCE_FIELD_DICTIONARY_VERSION)), label);
+    assert.equal(failure.detailCode, typeof detail === "function"
+      ? detail(dictionaryKit(PERFORMANCE_FIELD_DICTIONARY_VERSION)) : detail, label);
+  }
+});
 
-  const privateValue = performanceRecord();
-  privateValue.prompt = "private-synthetic-canary";
-  expectInvalid(privateValue, "privacy canary");
-
-  expectInvalid(performanceRecord({ day: "2026-02-29" }), "invalid UTC day");
-  expectInvalid(performanceRecord({ provider: "private_provider", modelId: "private_model" }), "unreviewed provider/model");
-  expectInvalid(performanceRecord({ provider: "anthropic_claude_code", modelId: "gpt-5.6-luna" }), "cross-provider model");
-  expectInvalid(performanceRecord({ speedMode: "unknown", speedModeSource: "mixed" }), "unknown mode requires unobserved source");
-  expectInvalid(performanceRecord({ speedMode: "mixed", speedModeSource: "unobserved" }), "mixed mode requires mixed source");
-  expectInvalid(performanceRecord({ speedMode: "standard", speedModeSource: "unobserved" }), "known mode requires evidence source");
-  expectInvalid(performanceRecord({ speedMode: "fast", speedModeSource: "mixed" }), "fast mode requires own or inherited evidence");
-  expectInvalid(performanceRecord({ speedMode: "ultrafast", speedModeSource: "unobserved" }), "ultrafast requires observed evidence");
-  expectInvalid(performanceRecord({ speedMode: "ultrafast-private" }), "unreviewed speed mode");
-  expectInvalid(performanceRecord({ reasoningEffort: "not-known" }), "unknown reasoning effort");
-  expectInvalid(performanceRecord({ speedMethod: "inferred" }), "unknown speed method");
-  expectInvalid(performanceRecord({ measurementVersion: "model-performance-samples-v0" }), "unknown measurement version");
-  expectInvalid(performanceRecord({ turns: 0 }), "non-positive cohort");
-  expectInvalid(performanceRecord({ speedTurns: 1 }), "receipt cohort must cover all turns");
-  expectInvalid(performanceRecord({ speedHistogram: ttftHistogram() }), "speed metric mismatch");
-  expectInvalid(performanceRecord({ ttftHistogram: speedHistogram() }), "TTFT metric mismatch");
-  expectInvalid(performanceRecord({ completionHistogram: ttftHistogram() }), "completion metric mismatch");
-  expectInvalid(performanceRecord({ completionTurns: 3 }), "completion cohort cannot exceed turns");
-  expectInvalid(performanceRecord({ completionTurns: 0, completionHistogram: completionHistogram() }), "zero completion cohort must have empty histogram");
-  expectInvalid(performanceRecord({ completionTurns: 1, completionHistogram: completionHistogram([]) }), "positive completion cohort must have samples");
-  expectInvalid(performanceRecord({ speedTokens: 10 }), "summed speed ratio outside extrema");
-  expectInvalid(performanceRecord({
-    speedMethod: "unavailable",
-    speedTurns: 0,
-    timedResponses: 1,
-    speedTokens: 0,
-    speedDurationMs: 0,
-    speedHistogram: speedHistogram([]),
-  }), "unavailable speed must have no timed response");
-  expectInvalid(performanceRecord({
-    ttftTurns: 0,
-    ttftHistogram: ttftHistogram([0]),
-  }), "empty TTFT cohort must have empty histogram");
+test("every invalid case fails for its own reason under each dictionary, never only for its scheme", () => {
+  for (const fieldDictionaryVersion of Object.keys(PERFORMANCE_FIELD_DICTIONARIES)) {
+    const kit = dictionaryKit(fieldDictionaryVersion);
+    // The kit's base record is valid under this dictionary, so no case below
+    // can owe its failure to a scheme the dictionary does not pair with.
+    const base = kit.record();
+    assert.equal(parseTelemetryPerformanceRecord(base, fieldDictionaryVersion), base, fieldDictionaryVersion);
+    for (const [label, build, detail] of INVALID_RECORD_CASES) {
+      const value = build(kit);
+      for (const key of ["speedHistogram", "ttftHistogram", "completionHistogram"]) {
+        assert.equal(value[key].schemaVersion, kit.scheme, `${fieldDictionaryVersion}: ${label}: ${key} scheme`);
+      }
+      assert.equal(value.bucketSchemeVersion, kit.scheme, `${fieldDictionaryVersion}: ${label}: record scheme`);
+      const failure = expectInvalid(value, `${fieldDictionaryVersion}: ${label}`, fieldDictionaryVersion);
+      assert.notEqual(failure.detailCode, SCHEME_MISMATCH_DETAIL, `${fieldDictionaryVersion}: ${label}`);
+      assert.equal(failure.detailCode, typeof detail === "function" ? detail(kit) : detail,
+        `${fieldDictionaryVersion}: ${label}`);
+    }
+  }
 });
 
 test("canonical performance bytes are deterministic, private-free, and accessor-safe", () => {
@@ -432,7 +494,7 @@ test("performance additions do not widen the frozen v1.2 usage record", () => {
   assert.equal(telemetryV12RequiredConsent().telemetrySchemaVersion, "telemetry-contribution-v1.2");
 });
 
-test("every released and draft field dictionary is registered with its bucket scheme", () => {
+test("every accepted field dictionary is registered with its bucket scheme", () => {
   assert.equal(PERFORMANCE_FIELD_DICTIONARY_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29);
   assert.equal(PERFORMANCE_LATEST_FIELD_DICTIONARY_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_10_10);
   assert.deepEqual(Object.keys(PERFORMANCE_FIELD_DICTIONARIES), [
@@ -441,11 +503,22 @@ test("every released and draft field dictionary is registered with its bucket sc
     PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_10_10,
   ]);
   const [legacy, current, next] = Object.values(PERFORMANCE_FIELD_DICTIONARIES);
-  assert.deepEqual([legacy.state, current.state, next.state], ["accepted", "accepted", "draft"]);
+  // 2026-10-10.1 is accepted server first, before any released client emits it.
+  assert.deepEqual([legacy.state, current.state, next.state], ["accepted", "accepted", "accepted"]);
   assert.deepEqual(
     [legacy.bucketSchemeVersion, current.bucketSchemeVersion, next.bucketSchemeVersion],
     [PERFORMANCE_BUCKET_SCHEME_VERSION, PERFORMANCE_BUCKET_SCHEME_VERSION, PERFORMANCE_BUCKET_SCHEME_VERSION_V2],
   );
+  // PERFORMANCE_BUCKET_SCHEME_VERSION keeps meaning v1; the emitted scheme is
+  // derived from the emitted dictionary's registry pairing.
+  assert.equal(PERFORMANCE_BUCKET_SCHEME_VERSION, "performance-histogram-v1");
+  assert.equal(
+    PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION,
+    PERFORMANCE_FIELD_DICTIONARIES[PERFORMANCE_FIELD_DICTIONARY_VERSION].bucketSchemeVersion,
+  );
+  assert.equal(PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION, PERFORMANCE_BUCKET_SCHEME_VERSION);
+  assert.equal(canonical.PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION, PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION);
+  assert.equal(browser.PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION, PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION);
   assert.equal(legacy.speedModes.includes("ultrafast"), false);
   assert.equal(legacy.apiServiceTiers.includes("ultrafast"), false);
   for (const dictionary of [legacy, current]) {
