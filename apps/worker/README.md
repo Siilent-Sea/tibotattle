@@ -486,7 +486,8 @@ reverses the cutover's retirement of GCP performance admission. On the origin:
   and `community_model_performance_head_age_days`.
 
 The D1 Worker keeps its own pinned performance path and answers the two new
-routes without a PostgreSQL source: the public read always answers
+routes without a PostgreSQL source: a public read that passes the method,
+public-analytics, publication-control, limiter and query gates answers
 `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`, and the admin view answers
 `503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` on the admin host. The PostgreSQL
 performance specs run in `npm run postgres:domain:check` under the standard

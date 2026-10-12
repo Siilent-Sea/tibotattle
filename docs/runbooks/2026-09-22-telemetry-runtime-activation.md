@@ -365,30 +365,39 @@ All of these must hold, and each is checked read-only before the POST:
 1. **The v1.2 activation-timeout fix is live and verified** in production
    (decision 10), and so is any kernel the live registry orders before the
    performance kernel.
-2. **Migration 0079 is applied and the image rolled**, through
+2. **The edge is in `gcp` mode.** `admin.tibotattle.com` reaches this origin
+   only while the live edge forwards its admin routes here. In `worker` mode
+   the D1 Worker answers the admin view and the admin action itself, and in
+   `fenced` mode they answer `503 MUTATION_BARRIER_ACTIVE`; this section does
+   not apply in either.
+3. **Migration 0079 is applied and the image rolled**, through
    [Migration 0079](./gcp-rollout.md#migration-0079-community-model-speed) in
    the rollout runbook. Keep the migrate receipt: its
    `migrations.historySha256` is the `deployment.historySha256` below.
-3. **The storage receipt is current.** The live migration history equals the
+4. **The edge changed-site deploy is live** (rollout step 6). The admin view
+   that preconditions 7 and 8 read exists at the edge only from that deploy:
+   before it, the live edge answers `GET /api/v1/admin/performance-intake`
+   itself with `404 NOT_FOUND` and never forwards it. No other read-only source
+   for the staged revision is built, so activation waits for this deploy. The
+   admin action route itself is already forwarded.
+5. **The storage receipt is current.** The live migration history equals the
    image's manifest exactly, so `/api/ready` reads `ready` and the
    storage-gated routes answer. The task re-reads the receipt itself and
    refuses `503 TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE` if it is not
    current.
-4. **Collection controls are enabled.** `uploadRegistration` and `processing`
+6. **Collection controls are enabled.** `uploadRegistration` and `processing`
    must both be enabled. A disabled control refuses with its own `503`
    (`UPLOAD_REGISTRATION_DISABLED` or `PROCESSING_DISABLED`).
-5. **The runtime is staged.** Read `GET /api/v1/admin/performance-intake` on
+7. **The runtime is staged.** Read `GET /api/v1/admin/performance-intake` on
    the admin host. It must show runtime `staged` and the policy revision to use
    as `expectedRevision` (1 on a fresh migration). Do not guess the revision.
-6. **The deployment matches.** The view's `deployment.sourceCommit` must equal
+8. **The deployment matches.** The view's `deployment.sourceCommit` must equal
    the rolled commit, and its `deployment.historySha256` must equal the migrate
    receipt's `migrations.historySha256`. The view's digest is computed from the
    image's own migration manifest, not read from the live database, so check
    it against the receipt rather than relying on the view alone. A null
    `sourceCommit` means `DEPLOYMENT_SOURCE_COMMIT` is not set, and every
    activation then refuses `503 TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE`.
-7. **The edge site is deployed**, if the owner wants the admin section and the
-   public reader live first (rollout step 4). Activation does not depend on it.
 
 ### The request
 
@@ -411,7 +420,7 @@ exactly:
 }
 ```
 
-Replace `1` with the staged revision from precondition 5. Every key is
+Replace `1` with the staged revision from precondition 7. Every key is
 required, and any other key, value or shape is `400 BODY_INVALID`.
 
 `scripts/telemetry-runtime-reconciliation.mjs` is Worker and D1 only. It builds

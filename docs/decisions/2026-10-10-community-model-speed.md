@@ -308,9 +308,11 @@ The runtime probe adds two content-free gauges,
 
 The [GCP rollout runbook](../runbooks/gcp-rollout.md#migration-0079-community-model-speed)
 orders the owner steps. Migrate and roll only after the v1.2
-activation-timeout fix is live, reprice under the new kernel, verify
-read-only, deploy the edge site, and then activate. Client 0.1.29 follows,
-server first.
+activation-timeout fix is live, reprice under the new kernel, and check the
+staged intake refusals. Then deploy the edge site: the live edge has neither
+new route and answers both with its own 404, so the admin view and the public
+read can be verified only through the new edge. Activate only after that
+verification. Client 0.1.29 follows, server first.
 
 ## Not covered
 

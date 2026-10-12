@@ -395,6 +395,11 @@ What the migration does to the rollout:
   `503 BACKEND_STORAGE_UNAVAILABLE` ([the accepted write outage](#the-accepted-write-outage)).
   That includes every upload route, not only performance. Run `roll`
   immediately.
+- **Edge mode.** The production hostnames reach this origin only while the
+  live edge is in `gcp` mode. In `worker` mode the Worker answers every
+  request in steps 5, 7 and 8 itself, and in `fenced` mode they answer
+  `503 MUTATION_BARRIER_ACTIVE`, so those checks and the activation wait for
+  `gcp` mode.
 
 Owner order, after the general preconditions:
 
@@ -424,28 +429,37 @@ Owner order, after the general preconditions:
    intake routes are counted like every other route that is not excluded.
    Re-plan and apply under a fresh plan digest
    ([monitoring](../../apps/worker/cloud-run/infra/monitoring.md#protected-monitoring-apply)).
-5. **Read-only verification.** While the runtime is staged:
+5. **Read-only checks before the edge deploy.** While the runtime is staged,
+   only the paths the live edge already forwards can be checked:
+   - `/api/ready` reads `ready`;
+   - authenticated grants, capability polls and report uploads from installed
+     clients answer `403 TELEMETRY_TRANSPORT_BLOCKED`, never a 5xx.
+
+   Do not expect the admin view or the public read yet. The live edge's route
+   registry has neither new path, so until step 6 it answers both itself with
+   `404 NOT_FOUND` and never forwards them to the origin.
+6. **Edge changed-site deploy** from the edge-port line: the two new routes,
+   the admin section and the website reader
+   ([production edge modes](./production-edge-modes.md#community-model-speed-routes-2026-10-10)).
+   `owner`. The intake routes need no edge change. This deploy may also run
+   before step 2, because a new edge forwards both new paths to an origin that
+   answers them with its own 404 until the roll. Steps 7 and 8 need both the
+   roll and this deploy.
+7. **Read-only verification through the edge.** While the runtime is staged:
    - `GET /api/v1/admin/performance-intake` on the admin host answers 200 with
      runtime `staged` at revision 1, the rolled `sourceCommit`, and a
      `historySha256` equal to the migrate receipt's;
    - every `GET /api/v1/community/model-performance` slot answers
      `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED` with `no-store`;
-   - authenticated grants, capability polls and report uploads from installed
-     clients answer `403 TELEMETRY_TRANSPORT_BLOCKED`. They show up as refusal
-     counters in the admin view, never as 5xx.
-6. **Edge changed-site deploy** from the edge-port line: the two new routes,
-   the admin section and the website reader
-   ([production edge modes](./production-edge-modes.md#community-model-speed-routes-2026-10-10)).
-   `owner`. Steps 2 and 6 may run in either order: the intake routes need no
-   edge change, and each side answers an unknown route with 404.
-7. **Owner activation**, only through
-   [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation).
-   `owner`. There is no admin UI control.
-8. **First reports and publication.** Reports arrive as clients restart and
+   - the step 5 refusals show up as refusal counters in the admin view.
+8. **Owner activation**, only through
+   [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation),
+   and only after step 7 passes. `owner`. There is no admin UI control.
+9. **First reports and publication.** Reports arrive as clients restart and
    re-grant. The first publication comes at the next analytics refresh after a
    report with an included record exists.
-9. **Client 0.1.29**, which emits `…2026-10-10.1` and sends grant v2, ships
-   only after steps 2 to 7. `owner`.
+10. **Client 0.1.29**, which emits `…2026-10-10.1` and sends grant v2, ships
+    only after steps 2 to 8. `owner`.
 
 During the staged window, each refused capability poll upserts one refusal
 counter row. Local measurement at concurrency 24 and 64 on the production pool

@@ -654,8 +654,8 @@ origin and edge-port lines:
   `PUBLIC_READ_RATE_LIMIT` budget with purpose `public_aggregate_read`, so the
   two reads share one budget. The origin passes a verified 200 through with
   `public, max-age=300`. An unpublished slot is
-  `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`; that is also what a D1-mode
-  Worker always answers. Every error is `no-store`.
+  `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`; a worker-mode Worker gives
+  that answer to every read that passes its gates. Every error is `no-store`.
 - `GET /api/v1/admin/performance-intake` (route `admin_performance_intake`) is
   the seventh admin route. It is served only on the admin host, behind the
   Access chokepoint, and forwarded with the Access assertion like the other
@@ -667,26 +667,38 @@ origin and edge-port lines:
 The three accountless performance intake routes need no edge change; they
 were already forwarded as policy routes. Monitoring counts both new routes in
 the origin 5xx ratio. They are not on its explicit never-excluded list
-(`ORIGIN_5XX_NEVER_EXCLUDED_PATHS`), but no exclusion matches them, because
-they never answer `503 POSTGRES_ROUTE_NOT_PORTED`.
+(`ORIGIN_5XX_NEVER_EXCLUDED_PATHS`), but no exclusion names either of them:
+each exclusion names one exact route and only its
+`503 POSTGRES_ROUTE_NOT_PORTED` answer.
 
 Deploy order for this change:
 
 1. Origin migrate and roll of the integration commit, after the v1.2
-   activation-timeout fix is live, then the reprice and read-only checks
+   activation-timeout fix is live, then the reprice and the read-only checks
+   that need no edge change: `/api/ready` and the intake routes' staged
+   `403 TELEMETRY_TRANSPORT_BLOCKED`
    ([rollout](./gcp-rollout.md#migration-0079-community-model-speed)).
 2. One changed-site typed deploy from the edge-port line, in the live mode,
    carrying the two routes, the admin section (the admin bundle ships with the
    edge Worker) and the website reader. Prepare its receipt on the edge-port
    line, as [Changing the public site](#changing-the-public-site) requires.
    The owner may package it differently at deploy time.
-3. Owner activation of the performance runtime, through
-   [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation).
+3. Read-only verification of the admin view and the public read through the
+   new edge, which needs steps 1 and 2.
+4. Owner activation of the performance runtime, through
+   [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation),
+   which needs step 3.
 
-Steps 1 and 2 may run in either order. Until the edge deploy, the live edge
-answers both new paths with its own 404, which the website reader shows as
-`none_published` and the admin section as unavailable. Until the origin roll,
-a new edge forwards both paths to an origin that answers 404 as well.
+Steps 1 and 2 may run in either order, but steps 3 and 4 need both. Until the
+edge deploy, the live edge's route registry has neither new path, so it
+answers both with its own `404 NOT_FOUND` and never forwards them; the admin
+view the activation reads is therefore unreachable. Before that deploy the
+admin bundle has no performance-intake section at all. If the edge deploys
+first, it forwards both paths to an origin that answers 404 until the roll:
+the website reader then shows `none_published` and the admin section shows
+as unavailable. All of this reaches the origin only in gcp mode. In worker
+mode the Worker answers both paths itself, as described above, and in fenced
+mode every API path answers `503 MUTATION_BARRIER_ACTIVE`.
 
 ### Reading edge failures
 
