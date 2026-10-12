@@ -101,6 +101,11 @@ const REGISTRY_PINS = Object.freeze([
   // export and reviewed historical admin catalog compatibility. Vendor, prices
   // and B' allowance projection remain unchanged; this source is not deployed.
   "5b24da66e2c07be8f53f4af303eadde84ba5209c3d78bbbdf03c9932cddbff4f",
+  // Kernel 18: FIX-FUTURE-V12 (owner decision 2026-10-12). The refresh never
+  // plans or publishes a day after its UTC day, deferring later queued days
+  // as blocked, and errors.ts gains the v1.2 future-day refusal code. Vendor,
+  // prices and the pricer are unchanged; this source is not deployed.
+  "999667eb7a3c6c5ab5c2e9d02c7cce160c5a20b91f07ab82895762e12934506c",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
