@@ -64,8 +64,10 @@ The telemetry contract package implements the source side:
   bucket scheme. `accepted` means intake accepts the dictionary: a released
   client emits it, or a merged client change emits it and the servers deploy
   before that client release (server first). `draft` means no client change
-  emits it yet, so intake must not accept it. In every state, transport never
-  advertises a dictionary the device did not declare.
+  emits it yet, so intake must not accept it. `…2026-10-10.1` is a recorded
+  exception (see the
+  [no new client amendment](#no-new-client-amendment-2026-10-12)). In every
+  state, transport never advertises a dictionary the device did not declare.
   `PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION` is the bucket scheme paired with
   the emitted `PERFORMANCE_FIELD_DICTIONARY_VERSION`;
   `PERFORMANCE_BUCKET_SCHEME_VERSION` keeps meaning v1 for registry rows, schema
@@ -235,7 +237,10 @@ with `idempotency-replayed: true`.
   requires widening this window first, server first.
 - A replacement may change dictionary from the prior revision's. This is the
   re-upload path for re-prepared backfill days after a client moves to
-  `…2026-10-10.1`; the composed-host test proves it.
+  `…2026-10-10.1`; the composed-host test proves it. Under the
+  [no new client amendment](#no-new-client-amendment-2026-10-12) no client
+  moves to `…2026-10-10.1`, but released clients still use this path when a
+  0.1.24–0.1.26 device upgrades to 0.1.27 or 0.1.28.
 - A report read refuses more than 256 reports, 8 MiB of declared bytes,
   16,384 records or cohort rows, or 65,536 bucket rows with
   `400 SYNC_RANGE_TOO_LARGE`.
@@ -360,16 +365,32 @@ as written, except where this section says otherwise.
   `community-model-performance-v1` already represents (decision 8). The v2
   layout of decision 5 stays in the contract and in intake, but no community
   report uses it.
-- **Ultrafast.** 0.1.24–0.1.26 Ultrafast turns stay `other` and excluded, as
-  [Publication](#publication) states. The Ultrafast slots draw only on 0.1.27
-  and 0.1.28 reports.
+- **Ultrafast.** Reports prepared by 0.1.24–0.1.26 keep Ultrafast turns as
+  `other`, excluded as [Publication](#publication) states. The Ultrafast
+  slots draw only on reports prepared by 0.1.27 and 0.1.28, which include
+  backfill days a device re-sends after upgrading (next bullet).
+- **Dictionary-changing replacements stay live.** The replacement path that
+  changes a report's dictionary is used by released clients. Every scheduler
+  pass re-sends the current day and the last 7 completed days, and each
+  report carries the build's own dictionary. A device that upgrades from
+  0.1.24–0.1.26 to 0.1.27 or 0.1.28 is resolved to `…2026-09-29.1` at the
+  first grant after its newest v1.2 day manifest names parser v19 or higher,
+  and from then on re-sends its backfill days under `…2026-09-29.1`. Origin
+  admission supersedes the stored `…2026-09-21.1` report for a day when the
+  re-sent source revision is higher, or equal with the same source generation
+  and digest. The source digest covers the local timing sources, not the
+  dictionary, so a dictionary change alone is not a conflict. Such a
+  replacement can move formerly `other` Ultrafast turns into the Ultrafast
+  slots. No client moves to `…2026-10-10.1`.
 - **Accepted but unused.** Dictionary `…2026-10-10.1` and grant v2
   (`accountless-performance-owner-v2`, basis `client_declared`) remain
   accepted server-side, with their tests. No released client sends either.
-  The 0079 dictionary registry is immutable once seeded, so withdrawing
-  `…2026-10-10.1` would need its own migration and decision; none is made
-  here. The replacement path that changes a report's dictionary has no
-  current trigger.
+  Keeping `…2026-10-10.1` accepted is an explicit exception to the
+  [reader contract](#reader-contract) definition of `accepted`: with SPD-C2a
+  parked, neither a released client nor a merged client change emits it, so
+  that definition alone would make it `draft`. The 0079 dictionary registry
+  is immutable once seeded, so withdrawing `…2026-10-10.1` would need its own
+  migration and decision; none is made here.
 - **Client-line switch-over: parked.** The two client-behaviour commits on
   the client integration line, SPD-C2a (`c37fa2353`: emit `…2026-10-10.1`
   with v2 histograms) and SPD-C2b (`7f9bdd7cf`: grant v2 with exact echo),

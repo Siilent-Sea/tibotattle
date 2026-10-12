@@ -469,7 +469,7 @@ records the contracts.
 | Independent capability and grant | Built: accountless grant v1 and v2, per-device dictionary resolution (`v12_parser_inference`, `default_no_manifest`, `client_declared`) and an exact-echo capability. The signed-in consent route stays retired |
 | Encrypted delivery and typed storage | Built: primary migration `0079` with append-only reports, cohorts, buckets and receipts, an immutable dictionary registry and composite dictionary/scheme keys |
 | Idempotent per-device revisions | Built: replay writes no receipt; replacements supersede; a replacement may change dictionary; content conflicts and lower revisions answer 409 |
-| All released dictionaries | Built: `…2026-09-21.1`, `…2026-09-29.1` and `…2026-10-10.1` admitted; a dictionary that differs from the capability answers 403 |
+| All accepted dictionaries | Built: `…2026-09-21.1`, `…2026-09-29.1` and `…2026-10-10.1` admitted; a dictionary that differs from the capability answers 403 |
 | Owner activation | Built: owner-only `run_maintenance` task in one transaction with its own audit row; no UI control. Not run against a live project |
 | Erasure | Offline owner purge only (append-only decision): participant rows cascade; publication heads are recomputed by the next refresh. No online deletion |
 | Hosted publication | Built: analytics-refresh performance stage, twelve `community-model-performance-v1` slots, the public read route and the deferred-empty first publication. No slot published |
