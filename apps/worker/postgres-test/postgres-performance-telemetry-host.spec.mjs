@@ -29,7 +29,10 @@
 //   202; a replay 202 idempotent with idempotency-replayed; a higher
 //   sourceRevision replaces; a lower one 409; a dictionary that differs from
 //   the capability 403; a malformed record 409 TELEMETRY_RECORD_INVALID whose
-//   counter row carries the parser's closed detail; a replacement that changes
+//   counter row carries the parser's closed detail; a report day outside the
+//   server-time window (today - 10 through today + 1) 409 counted as
+//   TELEMETRY_RECORD_INVALID_REPORT_DAY_OUT_OF_WINDOW (the fixture is
+//   re-dated into the window); a replacement that changes
 //   dictionary (09-29.1 -> 10-10.1 after a v2 re-grant, the C2a re-upload) is
 //   accepted; GET reports is bounded; refusal counters increment; captured
 //   logs carry no identifier or body;
@@ -127,6 +130,28 @@ const V1_GRANT_BODY = JSON.stringify({ schemaVersion: "accountless-performance-o
 const CLIENT_V2_FIXTURE = Object.freeze(JSON.parse(
   await readFile(resolve(HERE, "fixtures", "performance-report-client-v2.json"), "utf8"),
 ));
+
+const DAY_MS = 86_400_000;
+/** The UTC day `offset` days from today at the real clock the composed host reads. */
+function hostDay(offset) {
+  return new Date(Math.floor(Date.now() / DAY_MS) * DAY_MS + offset * DAY_MS).toISOString().slice(0, 10);
+}
+// Admission refuses report days outside today - 10 through today + 1 at the
+// server's clock, so report days here are relative to today.
+const REPORT_DAY = hostDay(-2);
+const EARLIER_REPORT_DAY = hostDay(-3);
+const EARLIEST_REPORT_DAY = hostDay(-4);
+let clientV2ReportMemo = null;
+/**
+ * The copied client fixture, unchanged except re-dated to REPORT_DAY (its
+ * records with it), with the client's revision recomputed. Memoized so every
+ * upload in the run names the same bytes.
+ */
+function clientV2Report(m) {
+  clientV2ReportMemo ??= revisedReport(m, { ...CLIENT_V2_FIXTURE, day: REPORT_DAY,
+    records: CLIENT_V2_FIXTURE.records.map((record) => ({ ...record, day: REPORT_DAY })) });
+  return clientV2ReportMemo;
+}
 
 let vite;
 let modules;
@@ -623,7 +648,7 @@ test("staged: grant, capabilities and report upload answer 403 and write nothing
   const { m, base, t, port, keys } = fixture;
   const device = await enrollAccountlessDevice(fixture);
   const client = performanceClient(port, device);
-  const fixtureEnvelope = await sealedReport(keys, CLIENT_V2_FIXTURE);
+  const fixtureEnvelope = await sealedReport(keys, clientV2Report(m));
   // 0079's seed: staged at revision 1. Every route refuses after the device
   // authenticated (G2's staged answer), with no retry-after.
   assert.deepEqual((await base.query(`SELECT state, policy_revision FROM ${t("telemetry_performance_runtime")}`)).rows,
@@ -687,7 +712,7 @@ test("staged: grant, capabilities and report upload answer 403 and write nothing
   const granted = await client.grant();
   assert.equal(granted.status, 201);
   assert.equal(granted.text, V1_GRANT_BODY);
-  assertCleanLogs(fixture, [...deviceSecrets(device), CLIENT_V2_FIXTURE.reportRevision, admin.ownerEmail]);
+  assertCleanLogs(fixture, [...deviceSecrets(device), clientV2Report(m).reportRevision, admin.ownerEmail]);
 }));
 
 test("grants: the dictionary follows the v1.2 manifest, the declared v2 dictionary, or the default (GATE-Q 1)", {
@@ -789,6 +814,10 @@ test("reports: the v2 client's fixture, replay, replacement order, dictionary fe
   // The copied fixture's revision is the client's sha256 over its canonical
   // body: the host and this spec agree on it before anything is sent.
   assert.equal(revisedReport(m, CLIENT_V2_FIXTURE).reportRevision, CLIENT_V2_FIXTURE.reportRevision);
+  // Re-dating into the window changes only the day and the revision.
+  const clientReport = clientV2Report(m);
+  assert.deepEqual({ ...clientReport, day: CLIENT_V2_FIXTURE.day, reportRevision: CLIENT_V2_FIXTURE.reportRevision,
+    records: clientReport.records.map((record) => ({ ...record, day: CLIENT_V2_FIXTURE.day })) }, CLIENT_V2_FIXTURE);
   const device = await enrollAccountlessDevice(fixture);
   const client = performanceClient(port, device);
   const v2Body = v2GrantBody(PERFORMANCE_DICTIONARY_2026_10_10);
@@ -801,12 +830,12 @@ test("reports: the v2 client's fixture, replay, replacement order, dictionary fe
     return body;
   };
   // The released v2 client's report: 202 accepted.
-  const accepted = await client.upload(await sealedReport(keys, CLIENT_V2_FIXTURE));
+  const accepted = await client.upload(await sealedReport(keys, clientV2Report(m)));
   assert.equal(accepted.status, 202);
   const first = receipt(accepted);
   assert.deepEqual({ status: first.status, day: first.day, reportRevision: first.reportRevision,
-    replayed: first.replayed }, { status: "accepted", day: CLIENT_V2_FIXTURE.day,
-    reportRevision: CLIENT_V2_FIXTURE.reportRevision, replayed: false });
+    replayed: first.replayed }, { status: "accepted", day: clientV2Report(m).day,
+    reportRevision: clientV2Report(m).reportRevision, replayed: false });
   assert.equal(accepted.headers["idempotency-replayed"], undefined);
   const stored = (await base.query(`SELECT field_dictionary_version, bucket_scheme_version, record_count, source_revision
       FROM ${t("telemetry_performance_reports")} WHERE id = $1`, [first.reportId])).rows[0];
@@ -821,7 +850,7 @@ test("reports: the v2 client's fixture, replay, replacement order, dictionary fe
 
   // A replay (a fresh envelope of the same report): 202 idempotent, marked,
   // and no new receipt or report.
-  const replay = await client.upload(await sealedReport(keys, CLIENT_V2_FIXTURE));
+  const replay = await client.upload(await sealedReport(keys, clientV2Report(m)));
   assert.equal(replay.status, 202);
   assert.equal(replay.headers["idempotency-replayed"], "true");
   const replayed = receipt(replay);
@@ -831,7 +860,7 @@ test("reports: the v2 client's fixture, replay, replacement order, dictionary fe
   assert.equal(await tableCount(base, t, "telemetry_performance_reports"), 1);
 
   // A higher sourceRevision replaces the current report.
-  const higher = revisedReport(m, CLIENT_V2_FIXTURE, { sourceRevision: 8 });
+  const higher = revisedReport(m, clientV2Report(m), { sourceRevision: 8 });
   const replaced = await client.upload(await sealedReport(keys, higher));
   assert.equal(replaced.status, 202);
   const replacement = receipt(replaced);
@@ -839,22 +868,33 @@ test("reports: the v2 client's fixture, replay, replacement order, dictionary fe
   assert.deepEqual((await base.query(`SELECT state, source_revision::int AS revision FROM ${t("telemetry_performance_reports")}
       ORDER BY source_revision`)).rows, [{ state: "superseded", revision: 7 }, { state: "current", revision: 8 }]);
   // A lower one never displaces it.
-  const lower = revisedReport(m, CLIENT_V2_FIXTURE, { sourceRevision: 6 });
+  const lower = revisedReport(m, clientV2Report(m), { sourceRevision: 6 });
   assert.deepEqual(outcome(await client.upload(await sealedReport(keys, lower))),
     { status: 409, code: "TELEMETRY_MANIFEST_CONFLICT" });
 
   // A report whose dictionary differs from the capability: 403, nothing written.
-  const otherDictionary = syntheticReport(m, { day: "2026-10-09", fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29 });
+  const otherDictionary = syntheticReport(m, { day: EARLIER_REPORT_DAY, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29 });
   assert.deepEqual(outcome(await client.upload(await sealedReport(keys, otherDictionary))), BLOCKED);
   // A malformed record (a model the reviewed catalog does not name): 409
   // TELEMETRY_RECORD_INVALID; its counter row carries the closed detail.
-  const unreviewed = revisedReport(m, CLIENT_V2_FIXTURE, {
-    day: "2026-10-08",
-    records: [{ ...CLIENT_V2_FIXTURE.records[0], day: "2026-10-08", modelId: "synthetic-unreviewed-model" }],
+  const unreviewed = revisedReport(m, clientV2Report(m), {
+    day: EARLIER_REPORT_DAY,
+    records: [{ ...clientV2Report(m).records[0], day: EARLIER_REPORT_DAY, modelId: "synthetic-unreviewed-model" }],
   });
   const invalid = await client.upload(await sealedReport(keys, unreviewed));
   assert.deepEqual(outcome(invalid), { status: 409, code: "TELEMETRY_RECORD_INVALID" });
   assert.ok(!invalid.text.includes("MODEL_UNREVIEWED"), "the detail never reaches the body");
+  assert.equal(await tableCount(base, t, "telemetry_performance_reports"), 2);
+  // A report day outside the server-time window (today - 10 through
+  // today + 1): 409 TELEMETRY_RECORD_INVALID, counted with its closed detail,
+  // nothing stored.
+  for (const day of [hostDay(-11), hostDay(2)]) {
+    const stale = revisedReport(m, clientV2Report(m), {
+      day, records: clientV2Report(m).records.map((record) => ({ ...record, day })) });
+    const refused = await client.upload(await sealedReport(keys, stale));
+    assert.deepEqual(outcome(refused), { status: 409, code: "TELEMETRY_RECORD_INVALID" });
+    assert.ok(!refused.text.includes("REPORT_DAY_OUT_OF_WINDOW"), "the detail never reaches the body");
+  }
   assert.equal(await tableCount(base, t, "telemetry_performance_reports"), 2);
 
   // GET reports: the current report, the superseded one on request, a closed query.
@@ -890,9 +930,10 @@ test("reports: the v2 client's fixture, replay, replacement order, dictionary fe
     [`${ROUTE_REPORTS} SYNC_RANGE_TOO_LARGE 400`]: 1,
     [`${ROUTE_REPORTS} TELEMETRY_MANIFEST_CONFLICT 409`]: 1,
     [`${ROUTE_REPORTS} TELEMETRY_RECORD_INVALID_MODEL_UNREVIEWED 409`]: 1,
+    [`${ROUTE_REPORTS} TELEMETRY_RECORD_INVALID_REPORT_DAY_OUT_OF_WINDOW 409`]: 2,
     [`${ROUTE_REPORTS} TELEMETRY_TRANSPORT_BLOCKED 403`]: 1,
   });
-  assertCleanLogs(fixture, [...deviceSecrets(device), CLIENT_V2_FIXTURE.reportRevision, higher.reportRevision,
+  assertCleanLogs(fixture, [...deviceSecrets(device), clientV2Report(m).reportRevision, higher.reportRevision,
     first.reportId]);
 }));
 
@@ -908,18 +949,18 @@ test("a replacement that changes dictionary is accepted after a v2 re-grant (the
   const client = performanceClient(port, device);
   assert.equal((await client.grant()).status, 201);
   // It reports the fixture's day under its old dictionary (v1 buckets).
-  const old = syntheticReport(m, { day: CLIENT_V2_FIXTURE.day, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29,
+  const old = syntheticReport(m, { day: clientV2Report(m).day, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29,
     sourceRevision: 3 });
   const oldAnswer = await client.upload(await sealedReport(keys, old));
   assert.equal(oldAnswer.status, 202);
   assert.equal(JSON.parse(oldAnswer.text).status, "accepted");
   // Under the old capability the v2 client's report is the dictionary fence.
-  assert.deepEqual(outcome(await client.upload(await sealedReport(keys, CLIENT_V2_FIXTURE))), BLOCKED);
+  assert.deepEqual(outcome(await client.upload(await sealedReport(keys, clientV2Report(m)))), BLOCKED);
   // The upgraded client re-grants v2 (declared 2026-10-10.1) and re-uploads
   // the re-prepared day: a replacement whose dictionary differs from the
   // prior revision's is accepted.
   assert.equal((await client.grant(v2GrantBody(PERFORMANCE_DICTIONARY_2026_10_10))).status, 201);
-  const upgraded = await client.upload(await sealedReport(keys, CLIENT_V2_FIXTURE));
+  const upgraded = await client.upload(await sealedReport(keys, clientV2Report(m)));
   assert.equal(upgraded.status, 202);
   assert.equal(JSON.parse(upgraded.text).status, "replaced");
   const rows = (await base.query(`SELECT state, field_dictionary_version, bucket_scheme_version,
@@ -934,9 +975,9 @@ test("a replacement that changes dictionary is accepted after a v2 re-grant (the
       WHERE device_id = $1 ORDER BY created_at`, [device.deviceId])).rows.map((row) => row.outcome);
   assert.deepEqual(outcomes, ["accepted", "replaced"]);
   // A late old-dictionary upload for another day is fenced now.
-  const late = syntheticReport(m, { day: "2026-10-07", fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29 });
+  const late = syntheticReport(m, { day: EARLIEST_REPORT_DAY, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29 });
   assert.deepEqual(outcome(await client.upload(await sealedReport(keys, late))), BLOCKED);
-  assertCleanLogs(fixture, [...deviceSecrets(device), old.reportRevision, CLIENT_V2_FIXTURE.reportRevision]);
+  assertCleanLogs(fixture, [...deviceSecrets(device), old.reportRevision, clientV2Report(m).reportRevision]);
 }));
 
 /**
@@ -1005,7 +1046,7 @@ test("released-client flow: the shipped client transport is granted, reads its c
     assert.equal(value.keyId, KEY_ID);
     return { keyId: value.keyId, publicJwk: value.publicJwk };
   };
-  const day = "2026-10-09";
+  const day = hostDay(-1);
   const records = [syntheticPerformanceRecord({ day, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29 })];
   let state = null;
   const performanceClientTransport = createTelemetryPerformanceClient({
@@ -1259,7 +1300,7 @@ test("admin intake reads a real refresh's performance block: host-admitted repor
   const device = await enrollAccountlessDevice(fixture);
   const client = performanceClient(port, device);
   assert.equal((await client.grant(v2GrantBody(PERFORMANCE_DICTIONARY_2026_10_10))).status, 201);
-  assert.equal((await client.upload(await sealedReport(keys, CLIENT_V2_FIXTURE))).status, 202);
+  assert.equal((await client.upload(await sealedReport(keys, clientV2Report(m)))).status, 202);
   // The refresh Job (in process, the default pipeline with the performance
   // stage) over this schema at the current instant: the publication ends on
   // the latest completed UTC day, which holds the fixture's day or later.
@@ -1299,5 +1340,5 @@ test("admin intake reads a real refresh's performance block: host-admitted repor
     finishedAt: undefined, published: slots, unchanged: [], withheld: null, deferredEmpty: false });
   assert.equal(intake.publication.slots.length, 12);
   assert.equal(intake.reports.current, 1);
-  assertCleanLogs(fixture, [...deviceSecrets(device), CLIENT_V2_FIXTURE.reportRevision]);
+  assertCleanLogs(fixture, [...deviceSecrets(device), clientV2Report(m).reportRevision]);
 }));

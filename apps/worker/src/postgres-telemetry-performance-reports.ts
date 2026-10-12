@@ -25,6 +25,17 @@
  *     read, so concurrent identical POSTs give one write and one idempotent
  *     answer. A unique-index race that still escapes it is re-read and
  *     answered idempotent.
+ *   - A new admission or replacement must name a report day inside the
+ *     server-time window: from POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_PAST_DAYS
+ *     days before the server's UTC day (the injected nowEpoch) through
+ *     POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_FUTURE_DAYS day after it.
+ *     Outside it the report is 409 TELEMETRY_RECORD_INVALID with the closed
+ *     detail REPORT_DAY_OUT_OF_WINDOW and nothing is written. The window is
+ *     checked after the idempotency read, so an exact replay of a stored
+ *     revision still answers idempotent wherever its day now falls. The D1
+ *     Worker has no such bound; without it one device could stretch the
+ *     public 'all' period or withhold every publication slot with reports
+ *     dated years away from the present.
  *   - The capability is the one the route read immediately before decryption
  *     (D1 parity: the envelope carries no mutable authorization). Its revision
  *     and epoch are what the report row records; the 0079 admission trigger
@@ -97,9 +108,20 @@ const MAX_READ_BUCKET_ROWS = 65_536;
 // unnest() rows per INSERT statement. A maximal report has 1,024 cohorts and
 // at most 211 sparse bins per cohort; chunking keeps each bind array bounded.
 const MAX_INSERT_ROWS = 8_192;
+const DAY_MS = 86_400_000;
 const REVIEWED_MODEL_PAIRS: ReadonlySet<string> = new Set(
   REVIEWED_MODEL_CATALOG.map(({ provider, id }) => `${provider}\u0000${id}`),
 );
+
+/**
+ * The report-day admission window, in whole UTC days around the server's UTC
+ * day. Clients re-send the current day plus the last 7 completed days (the
+ * 7-day backfill, owner decision 4 of 2026-10-10), so 10 days back and 1 day
+ * ahead leave 2-3 days of clock skew and offline slack. Widening the client
+ * backfill requires widening this window first (server first).
+ */
+export const POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_PAST_DAYS = 10;
+export const POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_FUTURE_DAYS = 1;
 
 /** The closed refusal details; only the refusal counters read them. */
 export const POSTGRES_TELEMETRY_PERFORMANCE_RECORD_INVALID_DETAILS = Object.freeze([
@@ -111,6 +133,7 @@ export const POSTGRES_TELEMETRY_PERFORMANCE_RECORD_INVALID_DETAILS = Object.free
   "DAY_MISMATCH",
   "SIZE",
   "SHAPE",
+  "REPORT_DAY_OUT_OF_WINDOW",
 ] as const);
 
 export type PostgresTelemetryPerformanceRecordInvalidDetail =
@@ -194,6 +217,12 @@ export interface PostgresTelemetryPerformanceAdmission {
   readonly reportId: string;
   readonly day: string;
   readonly reportRevision: string;
+}
+
+/** The inclusive report-day window (YYYY-MM-DD) at one server instant. */
+export interface PostgresTelemetryPerformanceReportDayWindow {
+  readonly fromDay: string;
+  readonly throughDay: string;
 }
 
 export interface PostgresTelemetryPerformanceReadOptions {
@@ -323,6 +352,25 @@ function nowInstant(nowEpoch: unknown): string {
     unavailable();
   }
   return new Date(nowEpoch as number).toISOString();
+}
+
+/**
+ * The inclusive window a newly admitted report day must fall in at the
+ * server instant `nowEpoch`: its UTC day minus
+ * POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_PAST_DAYS through its UTC day plus
+ * POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_FUTURE_DAYS. An invalid instant is
+ * 503 BACKEND_STORAGE_UNAVAILABLE, as for admission.
+ */
+export function postgresTelemetryPerformanceReportDayWindow(
+  nowEpoch: number,
+): PostgresTelemetryPerformanceReportDayWindow {
+  nowInstant(nowEpoch);
+  const today = Math.floor(nowEpoch / DAY_MS) * DAY_MS;
+  const day = (epoch: number) => new Date(epoch).toISOString().slice(0, 10);
+  return Object.freeze({
+    fromDay: day(today - POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_PAST_DAYS * DAY_MS),
+    throughDay: day(today + POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_FUTURE_DAYS * DAY_MS),
+  });
 }
 
 function validPrincipal(principal: unknown): principal is PostgresTelemetryPerformancePrincipal {
@@ -665,9 +713,10 @@ async function readAdmittedRevision(
 /**
  * Admit one decrypted daily report for an authenticated device, in one
  * transaction: the report/day advisory lock, then the idempotency read, the
- * revision digest, the capability dictionary, the source-revision order
- * against the locked current row, then supersession and the report, cohorts,
- * sparse buckets and receipt. An idempotent replay writes nothing.
+ * report-day window at `nowEpoch`, the revision digest, the capability
+ * dictionary, the source-revision order against the locked current row, then
+ * supersession and the report, cohorts, sparse buckets and receipt. An
+ * idempotent replay writes nothing and is answered even outside the window.
  */
 export async function admitPostgresTelemetryPerformanceReport(
   pool: PostgresPool,
@@ -682,6 +731,7 @@ export async function admitPostgresTelemetryPerformanceReport(
 ): Promise<PostgresTelemetryPerformanceAdmission> {
   const quoted = schemaOf(schema);
   const now = nowInstant(nowEpoch);
+  const dayWindow = postgresTelemetryPerformanceReportDayWindow(nowEpoch);
   if (!validPrincipal(principal)) transportBlocked();
   if (!safeString(envelopeDigest, DIGEST)) recordInvalid("SHAPE");
   const report = parsePostgresTelemetryPerformanceReport(plaintext);
@@ -701,6 +751,11 @@ export async function admitPostgresTelemetryPerformanceReport(
       );
       const replay = await readAdmittedRevision(client, quoted, principal, report);
       if (replay !== null) return replay;
+      // Only after the replay read: a stored revision stays idempotent, while
+      // a new admission or replacement must name a day inside the window.
+      if (report.day < dayWindow.fromDay || report.day > dayWindow.throughDay) {
+        recordInvalid("REPORT_DAY_OUT_OF_WINDOW");
+      }
       if (expectedRevision !== report.reportRevision) manifestConflict();
       if (report.fieldDictionaryVersion !== capability.requiredConsent.fieldDictionaryVersion) {
         transportBlocked();

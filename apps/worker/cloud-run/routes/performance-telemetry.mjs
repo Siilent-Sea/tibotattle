@@ -72,7 +72,9 @@
  * answer is also passed to deps.recordRefusal({ routeId, code, status }),
  * where code is the closed response code, or for 409 TELEMETRY_RECORD_INVALID
  * the code joined to the report parser's closed detail (for example
- * TELEMETRY_RECORD_INVALID_MODEL_UNREVIEWED). The detail is read from the
+ * TELEMETRY_RECORD_INVALID_MODEL_UNREVIEWED, or
+ * TELEMETRY_RECORD_INVALID_REPORT_DAY_OUT_OF_WINDOW for a report day outside
+ * the admission's server-time window). The detail is read from the
  * refused error's `detail` property (SPD-G3's
  * PostgresTelemetryPerformanceRecordInvalidError) and appended only
  * when it is one of the parser's closed details; it never reaches the
@@ -147,10 +149,15 @@ export const PERFORMANCE_TELEMETRY_PATHNAMES = Object.freeze({
 /** The recorder's wall-clock bound inside a request. */
 export const PERFORMANCE_TELEMETRY_REFUSAL_BOUND_MILLISECONDS = 1_000;
 
-/** SPD-G3's closed report-parser details, the only suffixes a counter code takes. */
+/**
+ * The reports module's closed refusal details
+ * (POSTGRES_TELEMETRY_PERFORMANCE_RECORD_INVALID_DETAILS), the only suffixes a
+ * counter code takes. postgres-telemetry-performance-reports.spec.mjs pins the
+ * two lists equal.
+ */
 export const PERFORMANCE_TELEMETRY_RECORD_INVALID_DETAILS = Object.freeze([
   "MODEL_UNREVIEWED", "DICTIONARY_UNACCEPTED", "SCHEME_MISMATCH", "ORDER",
-  "DUPLICATE_COHORT", "DAY_MISMATCH", "SIZE", "SHAPE",
+  "DUPLICATE_COHORT", "DAY_MISMATCH", "SIZE", "SHAPE", "REPORT_DAY_OUT_OF_WINDOW",
 ]);
 
 const RECEIPT_SCHEMA_VERSION = "telemetry-performance-receipt-v1";

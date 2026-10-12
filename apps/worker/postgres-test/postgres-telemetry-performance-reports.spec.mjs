@@ -25,6 +25,7 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import pg from "pg";
 import { createServer } from "vite";
+import { PERFORMANCE_TELEMETRY_RECORD_INVALID_DETAILS } from "../cloud-run/routes/performance-telemetry.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { postgresTestEndpoint } from "./staged-migrations-harness.mjs";
 import {
@@ -48,8 +49,17 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const endpoint = await postgresTestEndpoint();
 const skip = endpoint === null ? "set PG_TEST_SOCKET or PG_TEST_HOST to a local PostgreSQL 17" : false;
 
-const DAY = "2026-10-09";
-const NEXT_DAY = "2026-10-10";
+const DAY_MS = 86_400_000;
+/** The UTC day `offset` days from the UTC day of `epoch`. */
+function utcDayAt(epoch, offset = 0) {
+  return new Date(Math.floor(epoch / DAY_MS) * DAY_MS + offset * DAY_MS).toISOString().slice(0, 10);
+}
+// Report days sit inside admission's server-time window (today - 10 through
+// today + 1) at the real clock the 0079 trigger also reads, so the spec does
+// not age out: three and two days before today.
+const DAY = utcDayAt(Date.now(), -3);
+const NEXT_DAY = utcDayAt(Date.now(), -2);
+const LATER_DAY = utcDayAt(Date.now(), -1);
 const REPORT_SCHEMA_VERSION = "telemetry-performance-report-v1";
 const METHOD_VERSION = "performance-daily-histogram-v1";
 const PRIVACY_CONTRACT_VERSION = "privacy-safe-model-performance-v1";
@@ -368,7 +378,27 @@ test("parser: every accepted dictionary parses with its scheme; each invalid cla
   assert.equal(reports.postgresTelemetryPerformanceRecordInvalidDetail(new Error("x")), null);
   assert.deepEqual([...reports.POSTGRES_TELEMETRY_PERFORMANCE_RECORD_INVALID_DETAILS].sort(), [
     "DAY_MISMATCH", "DICTIONARY_UNACCEPTED", "DUPLICATE_COHORT", "MODEL_UNREVIEWED", "ORDER",
-    "SCHEME_MISMATCH", "SHAPE", "SIZE"]);
+    "REPORT_DAY_OUT_OF_WINDOW", "SCHEME_MISMATCH", "SHAPE", "SIZE"]);
+  // The route's counter-code suffixes mirror these details exactly.
+  assert.deepEqual([...PERFORMANCE_TELEMETRY_RECORD_INVALID_DETAILS].sort(),
+    [...reports.POSTGRES_TELEMETRY_PERFORMANCE_RECORD_INVALID_DETAILS].sort());
+});
+
+test("report-day window: today - 10 through today + 1 at the server's UTC day, from named constants", async () => {
+  await loadModules();
+  assert.equal(reports.POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_PAST_DAYS, 10);
+  assert.equal(reports.POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_FUTURE_DAYS, 1);
+  const window = reports.postgresTelemetryPerformanceReportDayWindow;
+  // The UTC day decides, at either edge of it, across a month and a year end.
+  assert.deepEqual(window(Date.UTC(2026, 9, 12, 0, 0, 0, 0)), { fromDay: "2026-10-02", throughDay: "2026-10-13" });
+  assert.deepEqual(window(Date.UTC(2026, 9, 12, 23, 59, 59, 999)), { fromDay: "2026-10-02", throughDay: "2026-10-13" });
+  assert.deepEqual(window(Date.UTC(2026, 9, 13)), { fromDay: "2026-10-03", throughDay: "2026-10-14" });
+  assert.deepEqual(window(Date.UTC(2027, 0, 5, 12)), { fromDay: "2026-12-26", throughDay: "2027-01-06" });
+  assert.deepEqual(window(Date.UTC(2026, 11, 31, 12)), { fromDay: "2026-12-21", throughDay: "2027-01-01" });
+  assert.ok(Object.isFrozen(window(Date.now())));
+  for (const invalid of [-1, 1.5, Number.NaN, 8_640_000_000_000_001, "1"]) {
+    assert.throws(() => window(invalid), (error) => error?.status === 503 && error.code === "BACKEND_STORAGE_UNAVAILABLE");
+  }
 });
 
 /**
@@ -376,7 +406,7 @@ test("parser: every accepted dictionary parses with its scheme; each invalid cla
  * throws `insertError`, the in-transaction idempotency read finds nothing and
  * the re-read after an aborted transaction returns `rereadRows`.
  */
-function scriptedPool({ insertError, rereadRows = [], connectError = null }) {
+function scriptedPool({ insertError, rereadRows = [], connectError = null, firstReadRows = [] }) {
   const statements = [];
   let idempotencyReads = 0;
   return {
@@ -391,7 +421,7 @@ function scriptedPool({ insertError, rereadRows = [], connectError = null }) {
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [{}], rowCount: 1 };
           if (sql.includes("AND report_revision = $4")) {
             idempotencyReads += 1;
-            const rows = idempotencyReads === 1 ? [] : rereadRows;
+            const rows = idempotencyReads === 1 ? firstReadRows : rereadRows;
             return { rows, rowCount: rows.length };
           }
           if (sql.startsWith("INSERT INTO") && sql.includes("telemetry_performance_reports")) throw insertError;
@@ -441,6 +471,23 @@ test("error mapping: trigger P1005 messages, unique races and driver failures (s
   assert.match(work[0], /^SELECT pg_advisory_xact_lock\("tibotattle"\.telemetry_performance_report_lock_key\(\$1, \$2, \$3::date\)\)$/u);
   assert.match(work[1], /AND report_revision = \$4$/u);
   assert.match(work[2], /FOR UPDATE$/u);
+
+  // The report-day window is checked after the lock and the idempotency read
+  // and before the revision digest and the current-row lock: a stored
+  // revision replays as idempotent outside the window; a new one is refused.
+  const late = Date.parse(`${DAY}T12:00:00.000Z`) + 11 * DAY_MS;
+  const outside = scriptedPool({ insertError: new Error("unreachable") });
+  await rejectsApi(admit("tibotattle", owner, grant, { ...report, reportRevision: "f".repeat(64) },
+    { db: outside, nowEpoch: late }), 409, "TELEMETRY_RECORD_INVALID", "REPORT_DAY_OUT_OF_WINDOW");
+  const refusedWork = outside.statements.filter((sql) => !/^(?:BEGIN|SET LOCAL|COMMIT|ROLLBACK)/u.test(sql));
+  assert.equal(refusedWork.length, 2, "only the lock and the idempotency read ran");
+  assert.match(refusedWork[0], /pg_advisory_xact_lock/u);
+  assert.match(refusedWork[1], /AND report_revision = \$4$/u);
+  assert.ok(outside.statements.includes("ROLLBACK"), "the refused transaction rolls back");
+  const stored = scriptedPool({ insertError: new Error("unreachable"),
+    firstReadRows: [{ id: "00000000-0000-4000-8000-000000000002", report_day: DAY, report_revision: report.reportRevision }] });
+  assert.deepEqual(await admit("tibotattle", owner, grant, report, { db: stored, nowEpoch: late }),
+    { status: "idempotent", reportId: "00000000-0000-4000-8000-000000000002", day: DAY, reportRevision: report.reportRevision });
 
   // Refusals before any database work: invalid envelope digest, principal and capability.
   const untouched = scriptedPool({ insertError: new Error("unreachable") });
@@ -584,6 +631,59 @@ test("admission: a dictionary other than the capability's is 403; each invalid c
   await rejectsApi(admit(schema, owner, grant, buildReport(), { envelopeDigest: "not-a-digest" }),
     409, "TELEMETRY_RECORD_INVALID", "SHAPE");
   assert.deepEqual(await ownerRows(schema, owner), { reports: 0, receipts: 0, cohorts: 0 });
+});
+
+test("admission: report days from today - 10 through today + 1 are admitted; outside is 409 REPORT_DAY_OUT_OF_WINDOW with no write", {
+  skip, timeout: 180_000,
+}, async () => {
+  const schema = await promotedSchema("window");
+  await activatePerformanceRuntime(pool, { schema });
+  const { owner, grant } = await owned(schema);
+  const now = Date.now();
+  const oldest = utcDayAt(now, -10);
+  const newest = utcDayAt(now, 1);
+  assert.deepEqual(reports.postgresTelemetryPerformanceReportDayWindow(now), { fromDay: oldest, throughDay: newest });
+  const dayReport = (day, fields = {}) => buildReport({ day,
+    records: cohortRecords(day, PERFORMANCE_DICTIONARY_2026_09_29, 1), ...fields });
+
+  // Both edges are admitted.
+  const edges = {};
+  for (const day of [oldest, newest]) {
+    edges[day] = dayReport(day, { sourceRevision: 2 });
+    const result = await admit(schema, owner, grant, edges[day], { nowEpoch: now });
+    assert.deepEqual([result.status, result.day], ["accepted", day]);
+  }
+  const admitted = await ownerRows(schema, owner);
+  assert.deepEqual(admitted, { reports: 2, receipts: 2, cohorts: 2 });
+
+  // One day past either edge, and far outside, is refused before any write.
+  for (const day of [utcDayAt(now, -11), utcDayAt(now, 2), "2001-01-01", "0001-01-01", "9999-12-31"]) {
+    await rejectsApi(admit(schema, owner, grant, dayReport(day), { nowEpoch: now }),
+      409, "TELEMETRY_RECORD_INVALID", "REPORT_DAY_OUT_OF_WINDOW");
+  }
+  assert.deepEqual(await ownerRows(schema, owner), admitted, "nothing stored for a refused day");
+
+  // A day later the oldest edge has left the window. An exact replay of its
+  // stored revision still answers idempotent and writes nothing; a
+  // replacement for that day (a newer sourceRevision) is refused.
+  const nextDay = now + DAY_MS;
+  assert.equal(reports.postgresTelemetryPerformanceReportDayWindow(nextDay).fromDay, utcDayAt(now, -9));
+  const replay = await admit(schema, owner, grant, edges[oldest], { nowEpoch: nextDay });
+  assert.equal(replay.status, "idempotent");
+  assert.equal(replay.reportRevision, edges[oldest].reportRevision);
+  await rejectsApi(admit(schema, owner, grant, dayReport(oldest, { sourceRevision: 3,
+    sourceGeneration: "synthetic-generation-3" }), { nowEpoch: nextDay }),
+  409, "TELEMETRY_RECORD_INVALID", "REPORT_DAY_OUT_OF_WINDOW");
+  // The newest edge is still inside and still replaceable.
+  const replaced = await admit(schema, owner, grant, dayReport(newest, { sourceRevision: 3,
+    sourceGeneration: "synthetic-generation-3" }), { nowEpoch: nextDay });
+  assert.equal(replaced.status, "replaced");
+  assert.deepEqual(await ownerRows(schema, owner), { reports: 3, receipts: 3, cohorts: 3 });
+  const currentDays = (await pool.query(`SELECT to_char(report_day, 'YYYY-MM-DD') AS day
+      FROM ${performanceTable(schema, "telemetry_performance_reports")}
+     WHERE participant_id = $1 AND device_id = $2 AND state = 'current' ORDER BY report_day`,
+  [owner.participantId, owner.deviceId])).rows.map((row) => row.day);
+  assert.deepEqual(currentDays, [oldest, newest]);
 });
 
 test("admission: a day under 2026-09-29.1/v1 then 2026-10-10.1/v2 with a higher sourceRevision ends with one current row", {
@@ -778,7 +878,7 @@ test("read: the Worker DTO, device scope, day filters, includeSuperseded and req
     [DAY, "superseded", 2], [DAY, "current", 1], [NEXT_DAY, "current", 1]]);
   assert.deepEqual((await read(schema, owner, { fromDay: NEXT_DAY })).reports.map((entry) => entry.day), [NEXT_DAY]);
   assert.deepEqual((await read(schema, owner, { throughDay: DAY })).reports.map((entry) => entry.day), [DAY]);
-  assert.deepEqual((await read(schema, owner, { fromDay: "2026-10-11" })).reports, []);
+  assert.deepEqual((await read(schema, owner, { fromDay: LATER_DAY })).reports, []);
   // Device scope: another device's id under this participant reads nothing.
   assert.deepEqual((await read(schema, { participantId: owner.participantId, deviceId: other.owner.deviceId })).reports, []);
   assert.equal((await read(schema, other.owner)).reports.length, 1);
