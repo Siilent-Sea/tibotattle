@@ -47,13 +47,12 @@ const NODE_PLAN = Object.freeze({
   "cloud-run-check": Object.freeze([TOOLCHAIN_NODE]),
   "postgres-17-suite": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
 });
-// The Worker gate checks out depth 1. The Cloud Run check runs the cutover
-// seal check, which reads pinned commits (the restore-base generator commit
-// and the Cloudflare production line) as git objects and fails as an
-// environment gap without them. The PostgreSQL 17 suite runs the
-// READ-EXPANSION specs, which `git archive` their pinned base commit
-// (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). Both need full history.
-const FETCH_DEPTH = Object.freeze({ "worker-gate": 1, "cloud-run-check": 0, "postgres-17-suite": 0 });
+// The Worker gate runs vendored-kernel identity and transition checks against
+// pinned production commits and the reviewed historical facade. The Cloud Run
+// check runs the cutover seal check against pinned restore-base and production
+// commits. The PostgreSQL 17 suite archives its pinned READ-EXPANSION base.
+// Every job needs these immutable Git objects and fails without full history.
+const FETCH_DEPTH = Object.freeze({ "worker-gate": 0, "cloud-run-check": 0, "postgres-17-suite": 0 });
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
@@ -246,6 +245,21 @@ test("hosted-backend is read-only: contents read, no secrets, no environments, p
       NODE_PLAN[id],
       `${id} installs exactly its reviewed Node.js versions, in order`,
     );
+  }
+});
+
+test("every job that runs the vendored-kernel identity gate checks out full history", async () => {
+  const { workflow } = await loadWorkflow();
+  const workerPackage = JSON.parse(await readFile(join(REPOSITORY_ROOT, "apps/worker/package.json"), "utf8"));
+  assert.ok(workerPackage.scripts.check.split(" && ").includes("npm run vendor:kernels:check"),
+    "the Worker check retains vendored-kernel identity verification");
+  const vendorJobs = Object.entries(workflow.jobs)
+    .filter(([, job]) => runs(job).includes(workerNpm("check")));
+  assert.deepEqual(vendorJobs.map(([id]) => id), ["worker-gate"]);
+  for (const [id, job] of vendorJobs) {
+    const checkout = job.steps.find(({ uses: action }) => action === CHECKOUT);
+    assert.equal(checkout.with["fetch-depth"], 0,
+      `${id} needs pinned production, historical-facade and transition commit objects`);
   }
 });
 
