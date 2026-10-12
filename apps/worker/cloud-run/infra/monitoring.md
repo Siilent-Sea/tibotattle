@@ -204,9 +204,10 @@ query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
 - **Volume context, not evidence for a threshold.** Production's Worker
   answered 132,945 requests in 30 days on the 16 routes queried (12 had
   rows; OWN-2-GQL, 2026-10-02). That is a mean of about 31 per 10-minute
-  window, and only a lower bound for the origin. `WORKER_ROUTE_POLICY` has
-  51 paths, and routes such as health, readiness, sync state, manifests and
-  sessions were not queried. No per-window distribution was read. On those
+  window, and only a lower bound for the origin. `WORKER_ROUTE_POLICY` had
+  51 paths then and has 53 now (the two routes of 2026-10-10 below), and
+  routes such as health, readiness, sync state, manifests and sessions were
+  not queried. No per-window distribution was read. On those
   16 routes the Worker's 5xx share was 1.33 % (community/daily 3.55 %,
   accountless enrollment 3.47 %).
 - **Extrapolation is an assumption.** How Cloud Monitoring's PromQL
@@ -245,6 +246,32 @@ query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
     reaches Cloud Run, so it is outside this alert's inputs altogether. A
     total edge-to-origin outage leaves Cloud Run with fewer requests or
     none, and this alert stays silent. edge-health covers that path.
+- **The two routes of 2026-10-10 count like any live route.** The owner's
+  community model speed decisions add two served paths, and
+  `ORIGIN_5XX_EXCLUSIONS` holds neither:
+  - `/api/v1/community/model-performance` (route class
+    `community_model_performance`): the public read of the twelve
+    community model-performance slots. It shares community/daily's
+    per-client public-read budget, so its 429 is the same limiter's. Its
+    expected refusals are 4xx: `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`
+    for a slot with no head (every slot until the first refresh with an
+    included report), `400 BODY_INVALID` for a bad query, 405 and 429.
+    Its 5xx are `503 BACKEND_STORAGE_UNAVAILABLE` (a head that fails
+    verification, or a failed read) and `503 PUBLICATION_DISABLED`, as for
+    community/daily; in gcp mode the edge answers the publication pre-gate
+    itself, so the origin's comes only when its own control disagrees with
+    the edge's mode.
+  - `/api/v1/admin/performance-intake` (route class
+    `admin_performance_intake`): the read-only owner view on the admin host.
+    A request without the owner's identity is `403 ADMIN_REQUIRED`; a view
+    the origin cannot read is `503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE`,
+    which counts.
+
+  Neither ever answers `POSTGRES_ROUTE_NOT_PORTED`, the only code an
+  exclusion may name, so no exclusion can apply to them. They are not in
+  `ORIGIN_5XX_NEVER_EXCLUDED_PATHS` either; the monitoring check pins the
+  exact excluded route classes and that no performance-class route is
+  excluded.
 - **v0.x uploads answer a 4xx.** Round 12 retires v0.x uploads at the
   switch, and round 19 (2026-10-03) answers them with `d43c8f92`'s definite
   `403 TELEMETRY_TRANSPORT_BLOCKED`, not the unported 503: a v0.1 or v0.2
