@@ -440,8 +440,10 @@ Owner order, after the general preconditions:
    Do not expect the admin view or the public read yet. The live edge's route
    registry has neither new path, so until step 6 it answers both itself with
    `404 NOT_FOUND` and never forwards them to the origin.
-6. **Edge changed-site deploy** from the edge-port line: the two new routes,
-   the admin section and the website reader
+6. **Edge deploy** from the edge-port line: the two new routes, the admin
+   section and the website reader, as two typed deploys (kept-site code, then
+   the web-only site change), because a single changed-site deploy of that
+   candidate is outside the web-only closure
    ([production edge modes](./production-edge-modes.md#community-model-speed-routes-2026-10-10)).
    `owner`. The intake routes need no edge change. This deploy may also run
    before step 2, because a new edge forwards both new paths to an origin that

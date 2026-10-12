@@ -374,8 +374,9 @@ All of these must hold, and each is checked read-only before the POST:
    [Migration 0079](./gcp-rollout.md#migration-0079-community-model-speed) in
    the rollout runbook. Keep the migrate receipt: its
    `migrations.historySha256` is the `deployment.historySha256` below.
-4. **The edge changed-site deploy is live** (rollout step 6). The admin view
-   that preconditions 7 and 8 read exists at the edge only from that deploy:
+4. **The edge deploy is live** (rollout step 6; its code deploy carries the
+   admin view). The admin view that preconditions 7 and 8 read exists at the
+   edge only from that deploy:
    before it, the live edge answers `GET /api/v1/admin/performance-intake`
    itself with `404 NOT_FOUND` and never forwards it. No other read-only source
    for the staged revision is built, so activation waits for this deploy. The

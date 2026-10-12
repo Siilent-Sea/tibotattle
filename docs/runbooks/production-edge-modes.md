@@ -678,11 +678,17 @@ Deploy order for this change:
    that need no edge change: `/api/ready` and the intake routes' staged
    `403 TELEMETRY_TRANSPORT_BLOCKED`
    ([rollout](./gcp-rollout.md#migration-0079-community-model-speed)).
-2. One changed-site typed deploy from the edge-port line, in the live mode,
-   carrying the two routes, the admin section (the admin bundle ships with the
-   edge Worker) and the website reader. Prepare its receipt on the edge-port
-   line, as [Changing the public site](#changing-the-public-site) requires.
-   The owner may package it differently at deploy time.
+2. The edge deploy from the edge-port line, in the live mode, carrying the
+   two routes, the admin section (the admin bundle ships with the edge Worker)
+   and the website reader. A single changed-site deploy of the edge-port
+   candidate is refused today: its `live..HEAD` scope also changes Worker,
+   admin and doc paths outside the web-only closure, which the
+   `--web-release-receipt` contract requires
+   ([Changing the public site](#changing-the-public-site)). The supported
+   packaging is two typed deploys: a kept-site code deploy from a commit with
+   the web-only closure files reset to the live site source, then a web-only
+   changed-site release of those files prepared against that commit. The owner
+   chooses the packaging at deploy time.
 3. Read-only verification of the admin view and the public read through the
    new edge, which needs steps 1 and 2.
 4. Owner activation of the performance runtime, through
