@@ -518,6 +518,11 @@ report uploads. Both controls also stop usage collection. While the
   counter table is locked or unavailable. The admin attention item for
   refusals in the last 24 hours fires throughout this window; that is
   expected.
+- **Report-day window.** Once active, a new report or replacement whose day
+  falls outside the server's UTC window, from 10 days before today through
+  tomorrow, is refused `409 TELEMETRY_RECORD_INVALID` and appears in the
+  refusal counters; a few from devices with skewed clocks are expected
+  ([decision](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)).
 - **Admin view cost.** The view reads grant and capability heads, report
   totals and a 400-day cohort window under one 10-second read-only snapshot,
   mostly as full scans of narrow tables. It has not been load-tested at

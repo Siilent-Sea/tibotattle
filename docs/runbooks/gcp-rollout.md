@@ -416,14 +416,37 @@ Owner order, after the general preconditions:
    the [sequence](#sequence). `owner`. Keep the migrate receipt: its
    `migrations.historySha256` is the deployment digest the activation request
    names.
-3. **Reprice under the new kernel**, immediately after the roll. `owner`. Run
-   the analytics reprice Job in plan mode, review the plan, then execute it
-   with the reviewed plan digest
-   ([historical spend repricing](./2026-10-09-historical-spend-repricing.md)).
-   Price equivalences stamped by the previous kernel stay hidden until this
-   run completes under the new one. Resume the triggers under steps 10 and 11
-   of the sequence; the maintenance trigger must resume within the 2-hour
-   readiness window that step 9 describes.
+3. **Resume the triggers** under steps 10 and 11 of the sequence. `owner`.
+   The maintenance trigger must resume within the 2-hour readiness window
+   that step 9 describes.
+
+   **Reprice under the new kernel: blocked, outside this window.** `owner`,
+   `not built`. The public read accepts a stored price equivalence only for
+   the serving kernel (`reprice-read.ts` matches `kernel_id` to the bundled
+   target), so equivalences stamped under the previous kernel stop applying
+   at the roll. A day that relies on one then has its historical spend block
+   withheld, never rewritten. Days already priced at the current registry are
+   not affected.
+   No record shows that the reprice lane has ever executed in production; if
+   it has not, the roll hides nothing. There is no production carrier:
+   - the image contains `dist/analytics-reprice.mjs`, but the rendered Cloud
+     Run Jobs are only `production-migrate`, `analytics-refresh` and
+     `maintenance` (`JOB_NAMES` in `scripts/gcp-ops-infra-manifest.mjs`);
+   - no reviewed tool executes the CLI in production or reads its
+     `analytics-reprice-receipt-v1` line, which carries the plan digest, back
+     from the execution log;
+   - [historical spend repricing](./2026-10-09-historical-spend-repricing.md)
+     is not live-qualified, and its templates submit no Job.
+
+   Do not improvise a carrier, for example by overriding the refresh Job's
+   arguments. Once a carrier is reviewed, the run count follows from the
+   plans, not from this runbook. Each plan selects at most 32 stale-price
+   heads (`--max-days`), 1,000 members and 16 MiB of input, and execution
+   refuses a capped plan. So more heads take several consecutive
+   date-partitioned rounds of plan, review and execute, each with a fresh
+   `--run-id`. Execution takes the shared refresh transaction lock and
+   refuses busy input, so it needs no trigger pause. Resume the triggers
+   without waiting for it, and run it outside a scheduled refresh.
 4. **Monitoring policy apply.** `owner`. The rendered policies changed: the
    performance capability and report paths joined the paths never excluded
    from the origin 5xx ratio, and the retired consent route is the only
@@ -445,10 +468,13 @@ Owner order, after the general preconditions:
    the web-only site change), because a single changed-site deploy of that
    candidate is outside the web-only closure
    ([production edge modes](./production-edge-modes.md#community-model-speed-routes-2026-10-10)).
-   `owner`. The intake routes need no edge change. This deploy may also run
-   before step 2, because a new edge forwards both new paths to an origin that
-   answers them with its own 404 until the roll. Steps 7 and 8 need both the
-   roll and this deploy.
+   `owner`. The intake routes need no edge change. Run this deploy only after
+   the roll and step 5. Before any write, a gcp-mode deploy reads the
+   origin's served commit through the verifier and refuses
+   `EDGE_ORIGIN_COMMIT_MISMATCH` unless it equals `--origin-commit`, so both
+   typed deploys pass the rolled commit. The verifier also needs
+   `/api/ready` to read `ready`, which a maintenance pass under 2 hours old
+   provides. Steps 7 and 8 need both the roll and this deploy.
 7. **Read-only verification through the edge.** While the runtime is staged:
    - `GET /api/v1/admin/performance-intake` on the admin host answers 200 with
      runtime `staged` at revision 1, the rolled `sourceCommit`, and a
@@ -461,7 +487,11 @@ Owner order, after the general preconditions:
    and only after step 7 passes. `owner`. There is no admin UI control.
 9. **First reports and publication.** Reports arrive as clients restart and
    re-grant. The first publication comes at the next analytics refresh after a
-   report with an included record exists.
+   report with an included record exists. A new report or replacement for a
+   day outside the server's UTC window, from 10 days before today through
+   tomorrow, is refused `409 TELEMETRY_RECORD_INVALID` and counted as a
+   refusal; that is expected for a device with a skewed clock
+   ([decision](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)).
 10. **Client 0.1.29**, which emits `…2026-10-10.1` and sends grant v2, ships
     only after steps 2 to 8. `owner`.
 
@@ -503,6 +533,7 @@ insert it before running the refresh.
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
 | Staging migrate-and-roll proof, with its live sub-checks | Open (see [staging proof](#staging-proof)) |
 | Migration 0079 rollout | Source and local PostgreSQL proof only. Not built, migrated, rolled or activated in any project |
+| Production reprice carrier | `not built`. `dist/analytics-reprice.mjs` is in the image, but no Cloud Run Job or reviewed tool runs it in production or reads its receipt back. The reprice after a kernel change is blocked until one is reviewed ([Migration 0079](#migration-0079-community-model-speed), step 3) |
 
 ## Evidence boundary
 
