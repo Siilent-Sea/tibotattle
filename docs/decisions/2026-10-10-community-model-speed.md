@@ -110,8 +110,9 @@ activated and no slot published. Decisions 2 and 10 still gate each of those
 steps. The orchestrator's gate answers of 2026-10-11 settled the open
 transport questions within the decisions above; they are recorded here where
 they shape behavior. The client switch to `…2026-10-10.1` and grant v2 is
-separate client-line source. This line's own client source still emits
-`…2026-09-29.1`.
+separate client-line source, parked by the
+[no new client amendment](#no-new-client-amendment-2026-10-12). This line's
+own client source still emits `…2026-09-29.1`.
 
 ### Storage
 
@@ -331,7 +332,62 @@ activation-timeout fix is live, reprice under the new kernel, and check the
 staged intake refusals. Then deploy the edge site: the live edge has neither
 new route and answers both with its own 404, so the admin view and the public
 read can be verified only through the new edge. Activate only after that
-verification. Client 0.1.29 follows, server first.
+verification. No client release follows: the
+[no new client amendment](#no-new-client-amendment-2026-10-12) withdrew the
+planned 0.1.29.
+
+## No new client amendment (2026-10-12)
+
+The owner decided on 2026-10-12 that community model speed ships with **no new
+client release**. This amendment narrows the record above without rewriting
+its decisions: intake, the reader contract, publication and the rollout stand
+as written, except where this section says otherwise.
+
+- **Sources.** Community speed data comes only from released clients 0.1.24
+  to 0.1.28. They emit `…2026-09-21.1` (0.1.24–0.1.26) or `…2026-09-29.1`
+  (0.1.27 and 0.1.28), always with `performance-histogram-v1` buckets, and
+  send the v1 grant body (`accountless-performance-owner-v1`). The origin
+  therefore resolves every device's dictionary by `v12_parser_inference` or
+  `default_no_manifest`, as
+  [Grant and dictionary resolution](#grant-and-dictionary-resolution)
+  describes.
+- **Speeds of 120 tokens/second or more.** They stay in the v1 overflow
+  bucket, which starts at the final 120 tokens/second edge. Pools carry that
+  overflow as unresolved mass (the reader contract above), so it appears in
+  each point's unresolved count, and a percentile that falls in it has bounds
+  from 120 tokens/second up to the pool's observed maximum. Such turns are
+  published as unresolved samples with wide bounds, which
+  `community-model-performance-v1` already represents (decision 8). The v2
+  layout of decision 5 stays in the contract and in intake, but no community
+  report uses it.
+- **Ultrafast.** 0.1.24–0.1.26 Ultrafast turns stay `other` and excluded, as
+  [Publication](#publication) states. The Ultrafast slots draw only on 0.1.27
+  and 0.1.28 reports.
+- **Accepted but unused.** Dictionary `…2026-10-10.1` and grant v2
+  (`accountless-performance-owner-v2`, basis `client_declared`) remain
+  accepted server-side, with their tests. No released client sends either.
+  The 0079 dictionary registry is immutable once seeded, so withdrawing
+  `…2026-10-10.1` would need its own migration and decision; none is made
+  here. The replacement path that changes a report's dictionary has no
+  current trigger.
+- **Client-line switch-over: parked.** The two client-behaviour commits on
+  the client integration line, SPD-C2a (`c37fa2353`: emit `…2026-10-10.1`
+  with v2 histograms) and SPD-C2b (`7f9bdd7cf`: grant v2 with exact echo),
+  are parked and must not merge into main for release. When the speed work is
+  ported onto the unified release line, take only the shared contract pieces:
+  the dictionary registry, the `…2026-10-10.1` acceptance, the adapters and
+  pools, and the `community-model-performance-v1` publication contract. The
+  client keeps emitting `…2026-09-29.1` with v1 buckets, so
+  `PERFORMANCE_FIELD_DICTIONARY_VERSION` and
+  `PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION` keep their current values.
+- **Rollout.** The [rollout](#rollout) ends with owner activation and the
+  first reports from released clients as they restart and re-grant. Moving
+  any client to another dictionary or bucket scheme needs a new owner
+  decision, and the server-first ordering of the reader contract still
+  applies to it.
+
+This amendment is source documentation. It records no release, deployment,
+migration or activation.
 
 ## Not covered
 

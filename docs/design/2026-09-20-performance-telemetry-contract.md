@@ -412,7 +412,7 @@ minimums.
 | --- | --- | --- | --- | --- |
 | `…2026-09-21.1` | 0.1.24–0.1.26 | no `ultrafast` | `performance-histogram-v1` | accepted |
 | `…2026-09-29.1` | 0.1.27 onward | adds `ultrafast` | `performance-histogram-v1` | accepted |
-| `…2026-10-10.1` | none yet | same as `…09-29.1` | `performance-histogram-v2` | accepted (server first) |
+| `…2026-10-10.1` | none (no client release planned, 2026-10-12) | same as `…09-29.1` | `performance-histogram-v2` | accepted, unused |
 
 Each older dictionary is a strict vocabulary subset of the latest, and the
 reviewed model catalog only grows, so the reader adapter is an identity map
@@ -475,7 +475,7 @@ records the contracts.
 | Hosted publication | Built: analytics-refresh performance stage, twelve `community-model-performance-v1` slots, the public read route and the deferred-empty first publication. No slot published |
 | Admin visibility and probes | Built: read-only `admin-performance-intake-v0.1` route and two runtime-probe gauges. The admin UI section ships from the edge-port line |
 | Restore | Follows the database restore path in [GCP brake and incidents](../runbooks/gcp-brake-and-incidents.md#database-or-data-loss), whose real-recovery tooling is not built; the do-not-restore list applies to performance rows with the rest of a participant's data |
-| Installed-client and deployed-service qualification | Open: needs the rollout, the owner activation and client 0.1.29 |
+| Installed-client and deployed-service qualification | Open: needs the rollout and the owner activation, then reports from released clients 0.1.24–0.1.28. No client release is planned ([no new client amendment](../decisions/2026-10-10-community-model-speed.md#no-new-client-amendment-2026-10-12)) |
 
 ## Qualification checkpoint — 2026-09-20
 

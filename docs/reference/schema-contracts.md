@@ -266,7 +266,10 @@ second speed sample for the same turn. Clients emit field dictionary `telemetry-
 Readers accept every dictionary in `PERFORMANCE_FIELD_DICTIONARIES`:
 - `…2026-09-21.1` (0.1.24–0.1.26, no Ultrafast; their Ultrafast turns are `other`);
 - `…2026-09-29.1` (0.1.27 onward);
-- `…2026-10-10.1`, which is `accepted` server first, before any client emits it.
+- `…2026-10-10.1`, which intake accepts although no client emits it. The owner
+  decided on 2026-10-12 against a new client release, so community data stays
+  on the two released dictionaries with v1 buckets
+  ([no new client amendment](../decisions/2026-10-10-community-model-speed.md#no-new-client-amendment-2026-10-12)).
 
 `accepted` means intake accepts a dictionary; transport never advertises a
 dictionary the device did not declare. `PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION`
@@ -329,6 +332,7 @@ Three wire and DTO contracts sit on top:
 - **Grant v2.** `accountless-performance-owner-v2` adds
   `fieldDictionaryVersion` to the v1 body; the origin echoes the exact body.
   The origin accepts v1 and v2, and the legacy D1 Worker accepts v1 only.
+  Released clients send only v1, and no client release will send v2.
 - **Public read.** `GET /api/v1/community/model-performance` returns one
   stored slot as `community-model-performance-v1`, re-verified against the
   head's digest, revision, instant and slot before it is served.

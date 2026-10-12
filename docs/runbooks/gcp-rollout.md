@@ -485,15 +485,24 @@ Owner order, after the general preconditions:
 8. **Owner activation**, only through
    [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation),
    and only after step 7 passes. `owner`. There is no admin UI control.
-9. **First reports and publication.** Reports arrive as clients restart and
-   re-grant. The first publication comes at the next analytics refresh after a
-   report with an included record exists. A new report or replacement for a
-   day outside the server's UTC window, from 10 days before today through
-   tomorrow, is refused `409 TELEMETRY_RECORD_INVALID` and counted as a
-   refusal; that is expected for a device with a skewed clock
+9. **First reports and publication.** Reports arrive as released clients
+   (0.1.24–0.1.28) restart and re-grant. The first publication comes at the
+   next analytics refresh after a report with an included record exists. A
+   new report or replacement for a day outside the server's UTC window, from
+   10 days before today through tomorrow, is refused
+   `409 TELEMETRY_RECORD_INVALID` and counted as a refusal; that is expected
+   for a device with a skewed clock
    ([decision](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)).
-10. **Client 0.1.29**, which emits `…2026-10-10.1` and sends grant v2, ships
-    only after steps 2 to 8. `owner`.
+
+There is no client release step. The owner decided on 2026-10-12 against a new
+client for community model speed, and the planned 0.1.29 is withdrawn
+([no new client amendment](../decisions/2026-10-10-community-model-speed.md#no-new-client-amendment-2026-10-12)).
+Every report uses `…2026-09-21.1` or `…2026-09-29.1` with v1 buckets and
+arrives through a v1 grant. Speeds of 120 tokens/second or more are published
+as unresolved samples with wide bounds. Dictionary `…2026-10-10.1` and grant
+v2 stay accepted but unused: a `…2026-10-10.1` dictionary or a
+`client_declared` grant basis in the admin view comes from an unreleased
+client build.
 
 During the staged window, each refused capability poll upserts one refusal
 counter row. Local measurement at concurrency 24 and 64 on the production pool
