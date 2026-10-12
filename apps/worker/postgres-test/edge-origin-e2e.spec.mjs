@@ -2537,10 +2537,9 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
 // ---------------------------------------------------------------------------
 // S9: a published community model-performance head through the edge
 //
-// These run after S4 (whose admitted model-performance pairs compare with the
-// Worker, which publishes no head) and after the golden read. The head is
-// written by the store's own writer and stays (the table is forward-only), so
-// the S5 performance flow below then publishes the whole slot set over it.
+// This runs after S4, whose admitted model-performance pairs compare with the
+// Worker, which publishes no head: the head is written by the store's own
+// writer into the main schema and stays (the table is forward-only).
 
 const COMMUNITY_MODEL_PERFORMANCE_PATH = "/api/v1/community/model-performance";
 const PUBLIC_MODEL_PERFORMANCE_CACHE = "public, max-age=300";
@@ -2715,6 +2714,35 @@ const REPOSITORY_ROOT = resolve(WORKER_ROOT, "..", "..");
 const DIST_REFRESH = join(WORKER_ROOT, "cloud-run", "dist", "analytics-refresh.mjs");
 /** State the S5 performance flow leaves for the refresh-and-read test after it. */
 const performanceFlow = { production: null, device: null, day: null, reportRevision: null };
+let performanceLanePromise = null;
+
+/**
+ * The performance flow's own lane: a fresh seeded schema behind its own
+ * edge-test origin, Google front end and gcp edge (the same bundle, Access,
+ * Sparkle and asset fixtures, and the run's client-key secret), so the
+ * refresh Job reads only what this flow wrote. Its exchanges join the run's
+ * S7 record. The main schema keeps the other S5 flows' synthetic residue:
+ * after the S5 v1.2 flow, the deployable refresh's read phase fails there with
+ * ANALYTICS_V2_SOURCE_UNAVAILABLE (seen 2026-10-11; not diagnosed here).
+ */
+function performanceLane() {
+  performanceLanePromise ??= (async () => {
+    const f = await fixture();
+    const schema = `tibotattle_fastpath_edge_e2e_perf_${randomBytes(4).toString("hex")}`;
+    await f.base.query(`CREATE SCHEMA "${schema}"`);
+    f.created.push(schema);
+    const t = await seedSchema(f.base, f.m, schema);
+    const origin = await startOrigin({ socket: f.socket, schema, keys: f.keys, objects: new Map() });
+    disposers.push(() => origin.close());
+    const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
+      upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(origin.port) });
+    const edge = await createEdgeInstance({ ...f.common, mode: "gcp", frontEnd, invokerKeyJson: f.invoker.keyJson,
+      clientKeySecret: f.clientKeySecret });
+    disposers.push(() => edge.dispose());
+    return { ...f, schema, t, origin, frontEnd, edge };
+  })();
+  return performanceLanePromise;
+}
 
 const base64UrlJson = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
 
@@ -2918,7 +2946,7 @@ test("S5 performance flow: the shipped client is granted through the edge (201, 
   + "capability, reports 202 and re-runs idempotently, after the owner's activation on the admin host", {
   skip: SKIP, timeout: LONG,
 }, async () => {
-  const f = await fixture();
+  const f = await performanceLane();
   const runtimeRow = async () => (await f.base.query(`SELECT state, policy_revision
     FROM ${f.t("telemetry_performance_runtime")}`)).rows;
   assert.deepEqual(await runtimeRow(), [{ state: "staged", policy_revision: 1 }], "staged until the owner acts");
@@ -3066,7 +3094,7 @@ test("S5 performance publication: the deployable refresh Job publishes all 12 sl
   + "route reads its run (RUN_PERFORMANCE_KEYS), and the edge serves the published slot", {
   skip: SKIP, timeout: LONG,
 }, async () => {
-  const f = await fixture();
+  const f = await performanceLane();
   const { production, device, day } = performanceFlow;
   assert.ok(production !== null && device !== null, "the S5 performance flow ran first");
   assert.ok(existsSync(DIST_REFRESH), "run `node cloud-run/build.mjs` first");
@@ -3097,7 +3125,7 @@ test("S5 performance publication: the deployable refresh Job publishes all 12 sl
   assert.equal(receipt.performance.reports, 1);
   assert.equal(receipt.performance.withheld, null);
   assert.equal(receipt.performance.deferredEmpty, false);
-  // Once any head exists every slot publishes (GATE-Q 12); the S9 head differs from this run's candidate.
+  // The first run with an included record publishes all twelve slots (GATE-Q 12).
   assert.deepEqual(receipt.performance.published, PERFORMANCE_SLOT_KEYS);
   const runRow = (await f.base.query(`SELECT publication -> 'performance' AS performance
       FROM ${f.t("analytics_v2_runs")} WHERE run_id = $1::uuid`, [receipt.runId])).rows[0];
