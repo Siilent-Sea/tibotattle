@@ -10,6 +10,7 @@ import { applyPostgresMigrations as applyStockMigrations, readPostgresMigrations
 import { loadExpansionReaders, compareExpansionRead } from "../scripts/gcp-read-expansion-ab.mjs";
 import { applyStockAndStagedMigrations, stagedOrPromotedMigrationName } from "./staged-migrations-harness.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
+import { createAnalyticsRefreshStatementLedger, createSnapshotReadPool } from "../cloud-run/analytics-refresh-read.mjs";
 import {
   CORRECTED_TOTALS,
   D1,
@@ -641,6 +642,31 @@ test("K-READ: reader statements are tagged and prepared, generic plans stay insi
       (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
     const statement = await modules.owners.analyticsV2PreparedStatement("occurrences.scope", "SELECT 1");
     assert.match(statement.name, /^a2_occurrences_scope_[0-9a-f]{16}$/u);
+  });
+
+test("K-PGSTAT: evidence fingerprints attribute classification proofs without changing their identities",
+  { skip: SKIP, timeout: 120_000 }, async () => {
+    const scoped = context("active");
+    const range = { ownerDigest: fixtures.active.owners.alpha.ownerDigest, fromDay: D1, throughDay: D3 };
+    const expected = await modules.occurrences.readOwnerDayFingerprints(scoped, range);
+    const exporter = await pool.connect();
+    const ledger = createAnalyticsRefreshStatementLedger();
+    let reads;
+    try {
+      await exporter.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const snapshot = (await exporter.query("SELECT pg_export_snapshot() AS snapshot")).rows[0].snapshot;
+      reads = createSnapshotReadPool(pool, snapshot, { ledger });
+      const actual = await modules.occurrences.readOwnerDayFingerprints({ ...scoped, pool: reads }, range);
+      assert.deepEqual([...actual], [...expected], "classification attribution leaves evidence identities unchanged");
+      const statements = ledger.summary();
+      assert.equal(statements.families.untagged, undefined, "every fingerprint reader statement carries its family");
+      const classification = statements.families["occurrences.classification"];
+      assert.deepEqual({ calls: classification?.calls, rows: classification?.rows, bytes: classification?.bytes },
+        { calls: 1, rows: 0, bytes: 82 }, "the unchanged bounded overlay proof reaches its closed family");
+    } finally {
+      await reads?.close();
+      try { await exporter.query("ROLLBACK"); } finally { exporter.release(); }
+    }
   });
 
 test("K-READ: F(o,d) names exactly the reader's evidence days, is stable, and is local to the owner",

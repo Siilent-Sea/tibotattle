@@ -1340,24 +1340,37 @@ function pushSource<T>(target: Map<string, T[]>, id: string, value: T): void {
   if (group) group.push(value); else target.set(id, [value]);
 }
 
+/** Keep shared classification readers analytics-neutral, attributing every
+ * physical-record and overlay-proof read at the analytics boundary. The same
+ * snapshot client receives the same SQL body, parameters and driver result. */
+function classificationReadClient(client: PostgresClient): PostgresClient {
+  return Object.freeze({
+    query<Row extends object = Record<string, unknown>>(sql: string, values?: unknown[]) {
+      return client.query<Row>(analyticsV2Statement("occurrences.classification", sql), values);
+    },
+    release(discard?: boolean) { return client.release(discard); },
+  });
+}
+
 /** Fetch exact physical variants in bounded pages. Archived total facts can
  * outlive their original row; absence preserves their existing evidence. */
 async function classificationVariants(client: PostgresClient, s: string, participantId: string,
   stream: "usage" | "session", format: 10 | 11 | 12, ids: readonly string[], retained = false):
   Promise<Map<string, { original: PostgresClassificationRecord; analytical: PostgresClassificationRecord }>> {
   const output = new Map<string, { original: PostgresClassificationRecord; analytical: PostgresClassificationRecord }>();
+  const classificationClient = classificationReadClient(client);
   for (const page of chunks([...new Set(ids)], EXPANSION_BATCH)) {
     let selected = page;
     if (retained) {
-      const present = await client.query<{ id: string }>(
+      const present = await classificationClient.query<{ id: string }>(
         `SELECT id::text FROM ${s}.typed_telemetry_records WHERE format=$1 AND id=ANY($2::bigint[]) ORDER BY id LIMIT 201`,
         [format, page]);
       if (present.rows.length > EXPANSION_BATCH) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
       selected = present.rows.map(row => row.id);
     }
     if (!selected.length) continue;
-    const original = await readPostgresClassificationRecords(client, s, format, selected);
-    const analytical = await applyPostgresClassificationOverlays(client, s, participantId, stream, [...original.values()]);
+    const original = await readPostgresClassificationRecords(classificationClient, s, format, selected);
+    const analytical = await applyPostgresClassificationOverlays(classificationClient, s, participantId, stream, [...original.values()]);
     if (analytical.length !== original.size) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
     for (const row of analytical) {
       const source = original.get(row.recordId);
@@ -1980,7 +1993,7 @@ export async function readOwnerDayFingerprints(
           if (facts.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
           for (const row of facts) keyed(row.occurrence_id).facts.push(canonicalRow(row));
           const classification = stream === "quota" ? null : await postgresClassificationEvidenceIdentities(
-            client, s, scope.participantId, stream, raw.ids);
+            classificationReadClient(client), s, scope.participantId, stream, raw.ids);
           for (const [id, sources] of byOccurrence) {
             const evidence: unknown[] = [sources.legacy, sources.v12, sources.facts];
             // Preserve unchanged identities where this occurrence has no links.

@@ -3480,6 +3480,12 @@ test("PG17 K-PAR: W=2/4/8 x b=1/5/14/70 over the real readers and kernels writes
       assert.ok(run.reads.statements.families["occurrences.scope"].calls > 0);
       assert.ok(run.reads.statements.families["snapshot.control"].calls > 0);
       assert.equal(run.reads.statements.families.untagged, undefined, "every reader statement carries its family");
+      const classification = run.reads.statements.families["occurrences.classification"];
+      assert.ok(classification.calls > 0, "physical classification and overlay-proof reads retain their attribution");
+      if (workers === 1) {
+        assert.deepEqual({ calls: classification.calls, rows: classification.rows, bytes: classification.bytes },
+          { calls: 13, rows: 11, bytes: 15_250 }, "tagging preserves the inline corpus's queries and received results");
+      }
       assert.ok(run.reads.phaseWallMs >= 0 && run.reads.unattributedMs >= 0);
       // N-EXCL: the table (primary 0066) is empty, unchanged since no run: nothing is applied or republished.
       assert.deepEqual(run.exclusions, { rows: 0, active: 0, excludedOwners: 0, changed: false, republishedDays: 0 });

@@ -59,7 +59,7 @@ const FAILURE_FAMILIES = new Set([
   "snapshot.control", "snapshot.read_only", "snapshot.plan_cache", "owners.runtime", "owners.roster",
   "occurrences.scope", "occurrences.legacy_candidates", "occurrences.v12_candidates",
   "occurrences.correction_candidates", "occurrences.legacy_sources", "occurrences.v12_sources",
-  "occurrences.correction_sources", "occurrences.counts", "occurrences.first_evidence", "occurrences.watermark",
+  "occurrences.correction_sources", "occurrences.classification", "occurrences.counts", "occurrences.first_evidence", "occurrences.watermark",
   "devices.count", "queued_days.page", "exclusions.read", "owner_sets.read", "owner_sets.values", "owner_sets.frozen",
 ]);
 const FAILURE_SQL_STATES = new Set(["57014", "55P03"]);

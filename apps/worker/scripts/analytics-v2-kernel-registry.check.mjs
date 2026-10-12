@@ -104,6 +104,10 @@ const REGISTRY_PINS = Object.freeze([
   // Pro Max source-evidence comment join the GCP closure; vendored pricing,
   // analytics computations, pricing class and orchestration method are unchanged.
   "09c3b697114e550855d5c5e7c57001a097a970306a4293422054b6cfd8582212",
+  // Kernel 18: closed classification-read SQL tags and their failure-family
+  // mirror cover occurrence expansion and fingerprint proofs; SQL bodies,
+  // bind values, pricing identity and orchestration method are unchanged.
+  "82d037979be72766105c127c8ce787da42910d9244031031cea0733c66273451",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -113,6 +117,81 @@ const BUILD_OPTIONS = Object.freeze({ plugins: cloudRunBuildPlugins(WORKER_ROOT)
 
 const canonical = (entry) => JSON.stringify(Object.fromEntries(ENTRY_KEYS.map((key) => [key, entry[key]])));
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+
+/** Undo only kernel 18's reviewed tags, binding the result to exact kernel 17
+ * source bytes. This remains self-contained in shallow CI checkouts. */
+async function kernel17Sources() {
+  const repositoryRoot = resolve(WORKER_ROOT, "../..");
+  const replaceOnce = (text, before, after, label) => {
+    assert.equal(text.split(before).length, 2, `${label} occurs exactly once`);
+    return text.replace(before, after);
+  };
+  const adapter = [
+    "/** Keep shared classification readers analytics-neutral, attributing every",
+    " * physical-record and overlay-proof read at the analytics boundary. The same",
+    " * snapshot client receives the same SQL body, parameters and driver result. */",
+    "function classificationReadClient(client: PostgresClient): PostgresClient {",
+    "  return Object.freeze({",
+    "    query<Row extends object = Record<string, unknown>>(sql: string, values?: unknown[]) {",
+    '      return client.query<Row>(analyticsV2Statement("occurrences.classification", sql), values);',
+    "    },",
+    "    release(discard?: boolean) { return client.release(discard); },",
+    "  });",
+    "}", "", "",
+  ].join("\n");
+  const historicalPins = new Map([
+    ["apps/worker/src/analytics-v2/occurrence-source.ts", "e959c3a2c65ae12c1e9eaccbc3b3ad9b61ceb0563230c1eca5f14f6b6b0eaf67"],
+    ["apps/worker/src/analytics-v2/owners.ts", "e58363536b61a06569983e232959b7ec04dbe0202fdbd3b887e74596c27dc343"],
+    ["apps/worker/cloud-run/analytics-refresh-read.mjs", "1f933a944674823fe14d1448c481978bfc6a371fcc0f77b6dfa8eb16332a425c"],
+  ]);
+  const sources = new Map();
+  for (const [path, pin] of historicalPins) {
+    let text = await readFile(join(repositoryRoot, path), "utf8");
+    if (path.endsWith("occurrence-source.ts")) {
+      text = replaceOnce(text, adapter, "", "the fixed-family client adapter");
+      for (const [before, after] of [
+        ["  const classificationClient = classificationReadClient(client);\n", ""],
+        ["await classificationClient.query<{ id: string }>(", "await client.query<{ id: string }>("],
+        ["readPostgresClassificationRecords(classificationClient,", "readPostgresClassificationRecords(client,"],
+        ["applyPostgresClassificationOverlays(classificationClient,", "applyPostgresClassificationOverlays(client,"],
+        ["classificationReadClient(client), s, scope.participantId, stream, raw.ids);", "client, s, scope.participantId, stream, raw.ids);"],
+      ]) text = replaceOnce(text, before, after, before);
+    } else if (path.endsWith("owners.ts")) {
+      text = replaceOnce(text, '  "occurrences.classification",\n', "", "the closed statement-family entry");
+    } else {
+      text = replaceOnce(text, '"occurrences.correction_sources", "occurrences.classification", "occurrences.counts",',
+        '"occurrences.correction_sources", "occurrences.counts",', "the failure-family mirror");
+    }
+    assert.equal(sha256(text), pin, `${path} reconstructs kernel 17's exact historical bytes`);
+    sources.set(path, Buffer.from(text));
+  }
+  return sources;
+}
+
+/** Compile and hash the same virtual sources, including installed package copies.
+ * Registry bytes stay common to both builds: this is source/compute conformance,
+ * not byte provenance for a previously published artifact. */
+function virtualCompilation(sources, name) {
+  const bytesFor = (path) => {
+    const normalized = String(path).split(sep).join("/");
+    for (const [sourcePath, bytes] of sources) {
+      if (normalized.endsWith(`/${sourcePath}`)) return bytes;
+      if (!sourcePath.startsWith("packages/")) continue;
+      const [, packageName, ...inside] = sourcePath.split("/");
+      if (normalized.endsWith(`/node_modules/@app-usagemonitor/${packageName}/${inside.join("/")}`)) return bytes;
+    }
+    return undefined;
+  };
+  const virtual = { name, setup(builder) {
+    builder.onLoad({ filter: /\.(?:mjs|js|ts)$/ }, (args) => {
+      const bytes = bytesFor(args.path);
+      return bytes === undefined ? undefined : { contents: bytes.toString("utf8"),
+        loader: args.path.endsWith(".ts") ? "ts" : "js", resolveDir: dirname(args.path) };
+    });
+  } };
+  return { build: (options) => esbuild().build({ ...options, plugins: [virtual, ...(options.plugins ?? [])] }),
+    read: (path, ...rest) => bytesFor(path) ?? readFile(path, ...rest) };
+}
 
 async function registry() {
   return JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
@@ -196,7 +275,8 @@ test("an entry names the code this checkout builds, and its vendored kernels", a
 });
 
 test("main convergence adds only unused immutable Job policy initialization; Worker and pricing stay unchanged", async () => {
-  // Reconstruct only the two reviewed GCP entry-file differences in memory.
+  // First bind the historical kernel 17 graph, then reconstruct only the
+  // two reviewed 16→17 GCP entry-file differences in memory.
   // No Git-history dependency: the Worker CI job intentionally has depth 1.
   // The original kernel and this source convergence keep their identities;
   // removing a runtime-used export would fail compilation or byte equivalence.
@@ -216,29 +296,17 @@ test("main convergence adds only unused immutable Job policy initialization; Wor
   assert.equal(quota.split(exportBlock).length, 2, "the reviewed unused export occurs once");
   assert.equal(constants.split(currentComment).length, 2, "the source-evidence comment occurs once");
   const sources = new Map([
+    ...await kernel17Sources(),
     [quotaPath, Buffer.from(quota.replace(exportBlock, ""))],
     [constantsPath, Buffer.from(constants.replace(currentComment, priorComment))],
   ]);
-  const priorBytes = (path) => {
-    const normalized = String(path).split(sep).join("/");
-    for (const [sourcePath, bytes] of sources) {
-      const [, packageName, ...inside] = sourcePath.split("/");
-      if (normalized.endsWith(`/${sourcePath}`)
-          || normalized.endsWith(`/node_modules/@app-usagemonitor/${packageName}/${inside.join("/")}`)) return bytes;
-    }
-    return undefined;
-  };
-  const virtual = { name: "reviewed-main-convergence-baseline", setup(builder) {
-    builder.onLoad({ filter: /\.js$/ }, (args) => {
-      const bytes = priorBytes(args.path);
-      return bytes === undefined ? undefined : { contents: bytes.toString("utf8"), loader: "js", resolveDir: dirname(args.path) };
-    });
-  } };
-  const build = (options) => esbuild().build({ ...options, plugins: [virtual, ...(options.plugins ?? [])] });
+  const { build, read } = virtualCompilation(sources, "reviewed-main-convergence-baseline");
+  const historical = virtualCompilation(await kernel17Sources(), "historical-kernel17");
   const cwd = join(WORKER_ROOT, "cloud-run");
   const prior = await computeAnalyticsKernelIdentity({ build, options: BUILD_OPTIONS, vendorRoot: VENDOR_ROOT, cwd,
-    read: (path, ...rest) => priorBytes(path) ?? readFile(path, ...rest) });
-  const current = await identityWith();
+    read });
+  const current = await computeAnalyticsKernelIdentity({ build: historical.build, options: BUILD_OPTIONS,
+    vendorRoot: VENDOR_ROOT, cwd, read: historical.read });
   assert.notEqual(current.computeClosureSha256, prior.computeClosureSha256);
   assert.equal(current.vendorManifestSha256, prior.vendorManifestSha256);
   assert.equal(current.pricerSha256, prior.pricerSha256, "the pricing class is unchanged");
@@ -248,13 +316,15 @@ test("main convergence adds only unused immutable Job policy initialization; Wor
   const convergence = entries[16];
   assert.equal(previous.kernelId, 16);
   assert.equal(convergence.kernelId, 17);
+  assert.equal(prior.computeClosureSha256, previous.computeClosureSha256, "the complete historical graph binds kernel 16");
+  assert.equal(current.computeClosureSha256, convergence.computeClosureSha256, "the complete historical graph binds kernel 17");
   for (const key of ENTRY_KEYS.filter((key) => !["kernelId", "computeClosureSha256"].includes(key))) {
     assert.equal(convergence[key], previous[key], `kernel 17 preserves ${key}`);
   }
   const options = { ...BUILD_OPTIONS, absWorkingDir: cwd, write: false, metafile: true,
     entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY, ANALYTICS_REPRICE_JOB_ENTRY],
     outdir: join(cwd, "dist") };
-  const [oldBundle, currentBundle] = await Promise.all([build(options), esbuild().build(options)]);
+  const [oldBundle, currentBundle] = await Promise.all([build(options), historical.build(options)]);
   const outputs = (result) => new Map(result.outputFiles.map(({ path, text }) => [path.split(sep).at(-1), text]));
   const oldOutputs = outputs(oldBundle);
   const currentOutputs = outputs(currentBundle);
@@ -281,6 +351,97 @@ test("main convergence adds only unused immutable Job policy initialization; Wor
     rest = rest.replace(call, "");
     assert.doesNotMatch(rest, /\binit_included_allowance_speed\b/u);
     assert.equal(rest, oldOutputs.get(name), `${name} preserves all remaining emitted runtime bytes`);
+  }
+});
+
+
+test("kernel 17→18 changes only fixed classification SQL tags and the closed family mirrors", async () => {
+  const historical = virtualCompilation(await kernel17Sources(), "historical-kernel17-classification");
+  const cwd = join(WORKER_ROOT, "cloud-run");
+  const prior = await computeAnalyticsKernelIdentity({ build: historical.build, options: BUILD_OPTIONS,
+    vendorRoot: VENDOR_ROOT, cwd, read: historical.read });
+  const current = await identityWith();
+  const entries = (await registry()).kernels;
+  const previous = entries[16];
+  const tagged = entries[17];
+  assert.equal(previous.kernelId, 17);
+  assert.equal(tagged.kernelId, 18);
+  assert.equal(prior.computeClosureSha256, previous.computeClosureSha256);
+  assert.equal(current.computeClosureSha256, tagged.computeClosureSha256);
+  assert.notEqual(current.computeSha256, prior.computeSha256, "the tagged source has its own compute class");
+  assert.deepEqual(current.names, prior.names, "all 227 closure inputs retain their identities");
+  assert.equal(current.inputs, 227);
+  for (const key of ENTRY_KEYS.filter((key) => !["kernelId", "computeClosureSha256"].includes(key))) {
+    assert.equal(tagged[key], previous[key], `kernel 18 preserves ${key}`);
+  }
+  for (const key of ["vendorManifestSha256", "pricerSha256", "pricingMethodVersion", "pricerInputs", "pricerCodeInputs"]) {
+    assert.equal(current[key], prior[key], `kernel 18 preserves ${key}`);
+  }
+  assert.deepEqual(current.pricerNames, prior.pricerNames);
+  const options = { ...BUILD_OPTIONS, absWorkingDir: cwd, write: false, metafile: true,
+    entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY, ANALYTICS_REPRICE_JOB_ENTRY],
+    outdir: join(cwd, "dist") };
+  const [oldBundle, currentBundle] = await Promise.all([historical.build(options), esbuild().build(options)]);
+  const outputs = (result) => new Map(result.outputFiles.map(({ path, text }) => [path.split(sep).at(-1), text]));
+  const oldOutputs = outputs(oldBundle);
+  const currentOutputs = outputs(currentBundle);
+  assert.deepEqual([...currentOutputs.keys()].sort(), [...oldOutputs.keys()].sort());
+  assert.equal(currentOutputs.get("analytics-refresh-worker.js"), oldOutputs.get("analytics-refresh-worker.js"),
+    "the compute Worker's complete emitted runtime is byte-identical");
+  for (const name of ["analytics-refresh.js", "analytics-reprice.js"]) {
+    let code = currentOutputs.get(name);
+    const replaceOnce = (before, after) => {
+      assert.equal(code.split(before).length, 2, `${name}: ${before} occurs exactly once`);
+      code = code.replace(before, after);
+    };
+    const adapter = /\nfunction (classificationReadClient\w*)\(client\) \{\n  return Object\.freeze\(\{\n    query\(sql, values\) \{\n      return client\.query\(analyticsV2Statement\("occurrences\.classification", sql\), values\);\n    \},\n    release\(discard\) \{\n      return client\.release\(discard\);\n    \}\n  \}\);\n\}\n/gu;
+    const adapters = [...code.matchAll(adapter)];
+    assert.equal(adapters.length, 1, `${name} has exactly the fixed-family pass-through adapter`);
+    const helperName = adapters[0][1];
+    code = code.replace(adapters[0][0], "\n");
+    const clientBindings = [...code.matchAll(new RegExp(`  const (classificationClient\\w*) = ${helperName}\\(client\\);\\n`, "gu"))];
+    assert.equal(clientBindings.length, 1, `${name} binds the occurrence reader once`);
+    const clientName = clientBindings[0][1];
+    code = code.replace(clientBindings[0][0], "");
+    replaceOnce(`await ${clientName}.query(`, "await client.query(");
+    replaceOnce(`readPostgresClassificationRecords(${clientName},`, "readPostgresClassificationRecords(client,");
+    replaceOnce(`applyPostgresClassificationOverlays(${clientName},`, "applyPostgresClassificationOverlays(client,");
+    replaceOnce(`${helperName}(client),`, "client,");
+    replaceOnce('      "occurrences.classification",\n', "");
+    replaceOnce('  "occurrences.classification",\n', "");
+    assert.equal(code, oldOutputs.get(name), `${name} preserves all remaining emitted runtime bytes`);
+
+    // Execute the emitted helper itself. The real tag primitive is byte-stable
+    // above; this fixed-family boundary must preserve caller/driver identity.
+    const factory = new Function("analyticsV2Statement", `${adapters[0][0]}return ${helperName};`);
+    const tagCalls = [];
+    const wrap = factory((family, sql) => {
+      tagCalls.push([family, sql]);
+      return `/* analytics_v2:${family} */ ${sql}`;
+    });
+    const calls = [];
+    const rows = Promise.resolve({ rows: [{ count: 1 }] });
+    const releaseResult = Symbol("synthetic-release-result");
+    const client = { query(sql, values) { calls.push([sql, values, this]); return rows; },
+      release(discard) { calls.push(["release", discard, this]); return releaseResult; } };
+    const wrapped = wrap(client);
+    assert.equal(Object.isFrozen(wrapped), true);
+    const values = ["synthetic-bind", 1];
+    assert.equal(wrapped.query("SELECT $1, $2", values), rows);
+    assert.deepEqual(tagCalls, [["occurrences.classification", "SELECT $1, $2"]]);
+    assert.equal(calls.length, 1, "no additional query or authority call");
+    assert.equal(calls[0][0], "/* analytics_v2:occurrences.classification */ SELECT $1, $2");
+    assert.equal(calls[0][1], values);
+    assert.equal(calls[0][2], client);
+    assert.equal(wrapped.release(true), releaseResult);
+    assert.deepEqual(calls[1], ["release", true, client]);
+    const rejection = new Error("synthetic-query-rejection");
+    const rejected = Promise.reject(rejection);
+    rejected.catch(() => {});
+    assert.equal(wrap({ query() { return rejected; } }).query("SELECT 1"), rejected);
+    await assert.rejects(rejected, (error) => error === rejection);
+    const thrown = new Error("synthetic-driver-throw");
+    assert.throws(() => wrap({ query() { throw thrown; } }).query("SELECT 1"), (error) => error === thrown);
   }
 });
 

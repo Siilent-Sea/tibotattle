@@ -108,6 +108,7 @@ export const ANALYTICS_V2_STATEMENT_FAMILIES = Object.freeze([
   "occurrences.legacy_sources",
   "occurrences.v12_sources",
   "occurrences.correction_sources",
+  "occurrences.classification",
   "occurrences.counts",
   "occurrences.first_evidence",
   "occurrences.watermark",
