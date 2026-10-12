@@ -640,6 +640,54 @@ A contract change has no in-place path. Run these steps in order:
    matches the live fenced edge.
 3. Run the gcp deploy from an edge commit with the same blob.
 
+### Community model speed routes (2026-10-10)
+
+The owner decisions of 2026-10-10
+([community model speed](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation))
+add two routes to the Worker policy, which moves from 51 to 53 routes on the
+origin and edge-port lines:
+
+- `GET /api/v1/community/model-performance?period&speedMode` (route
+  `community_model_performance`) is a public read. The edge classifies it with
+  `community/daily`: it is gated on `PUBLIC_ANALYTICS_MODE`, answers the
+  `PUBLICATION_DISABLED` pre-gate, and charges the same per-client
+  `PUBLIC_READ_RATE_LIMIT` budget with purpose `public_aggregate_read`, so the
+  two reads share one budget. The origin passes a verified 200 through with
+  `public, max-age=300`. An unpublished slot is
+  `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`; that is also what a D1-mode
+  Worker always answers. Every error is `no-store`.
+- `GET /api/v1/admin/performance-intake` (route `admin_performance_intake`) is
+  the seventh admin route. It is served only on the admin host, behind the
+  Access chokepoint, and forwarded with the Access assertion like the other
+  admin routes. It is read-only and has no activation control. In worker
+  mode, the D1 Worker answers it with
+  `503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` on the admin host and `404` on
+  the apex.
+
+The three accountless performance intake routes need no edge change; they
+were already forwarded as policy routes. Monitoring counts both new routes in
+the origin 5xx ratio. They are not on its explicit never-excluded list
+(`ORIGIN_5XX_NEVER_EXCLUDED_PATHS`), but no exclusion matches them, because
+they never answer `503 POSTGRES_ROUTE_NOT_PORTED`.
+
+Deploy order for this change:
+
+1. Origin migrate and roll of the integration commit, after the v1.2
+   activation-timeout fix is live, then the reprice and read-only checks
+   ([rollout](./gcp-rollout.md#migration-0079-community-model-speed)).
+2. One changed-site typed deploy from the edge-port line, in the live mode,
+   carrying the two routes, the admin section (the admin bundle ships with the
+   edge Worker) and the website reader. Prepare its receipt on the edge-port
+   line, as [Changing the public site](#changing-the-public-site) requires.
+   The owner may package it differently at deploy time.
+3. Owner activation of the performance runtime, through
+   [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation).
+
+Steps 1 and 2 may run in either order. Until the edge deploy, the live edge
+answers both new paths with its own 404, which the website reader shows as
+`none_published` and the admin section as unavailable. Until the origin roll,
+a new edge forwards both paths to an origin that answers 404 as well.
+
 ### Reading edge failures
 
 Edge logs are content-free JSON lines.
@@ -677,21 +725,22 @@ envelopes, with these owner-accepted differences (owner decisions of
 - **(iv) Unported routes send no `retry-after`.** They answer
   `503 POSTGRES_ROUTE_NOT_PORTED`, so clients that retry only on a
   `retry-after` do not retry them. Since round 12 every unported route is
-  retired (legacy enroll, Google and Apple sign-in, security reset,
-  participant export, the performance device and consent routes). Two
-  retirements are never this 503 (round 19, 2026-10-03):
-  - The accountless performance authorization answers production's exact
-    sequence: `401 AUTH_INVALID` for a session cookie, the Worker's
-    configuration and upload-registration `503`s, the accountless-ownership
-    limiter's `429 ATTEMPT_LIMIT_REACHED` (replayed from the edge's
-    outcome), `401 DEVICE_AUTH_INVALID` for a bearer that is not an active
-    accountless device, the body's `415`, `400 BODY_INVALID` or `413`, and
-    then the terminal `403 TELEMETRY_TRANSPORT_BLOCKED`. Nothing is granted.
-    Electron parks on any of these 4xx answers instead of retrying on the
-    shared accountless-ownership budget. What the origin does not reproduce
-    is listed in the
-    [round 19 amendment](../decisions/2026-09-04-accountless-sharing-policy.md#google-cloud-cutover-amendment-2026-10-02).
+  retired: legacy enroll, Google and Apple sign-in, security reset,
+  participant export and the signed-in performance consent route.
+  - The accountless performance grant, capability and report routes are not
+    in this list. Round 12 retired them and round 19 answered the grant with
+    a terminal 403, but the owner reversed both on 2026-10-10
+    ([performance sharing amendment](../decisions/2026-09-04-accountless-sharing-policy.md#performance-sharing-amendment-2026-10-10)).
+    They are ported and served by the origin's performance family. The grant
+    is no longer a definite 403: it runs the Worker's checks in the Worker's
+    order and answers 201 with the exact body echoed. Until the owner
+    activates the performance runtime, an authenticated grant, capability
+    poll or report upload answers `403 TELEMETRY_TRANSPORT_BLOCKED` and
+    nothing is granted or stored. Electron parks on that answer until a
+    restart or a renewed sharing preference re-grants. See
+    [Community model speed routes](#community-model-speed-routes-2026-10-10).
   - v0.x uploads (a v0.1 or v0.2 envelope or upload-authorization format)
+    are never this 503 (round 19, 2026-10-03). They
     answer d43c8f92's `403 TELEMETRY_TRANSPORT_BLOCKED` at the transport
     write-authority step, after the claim on `/api/v1/contributions`. An
     earlier refusal stays the Worker's own (for example `401

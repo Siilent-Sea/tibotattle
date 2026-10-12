@@ -290,7 +290,47 @@ plus conservative lower and upper bounds. Per-point sample and unresolved
 counts and contributor, device and report counts are always present; there is
 no contributor minimum. The
 [community model speed decision](../decisions/2026-10-10-community-model-speed.md)
-records these choices. Hosted intake and publication remain unbuilt.
+records these choices.
+
+### Google Cloud origin storage and contracts
+
+On the Google Cloud origin line, primary migration
+`0079_performance_telemetry.sql` (provisional number) implements hosted intake
+and publication in PostgreSQL. It is source only: no live database holds it.
+
+| Object | Contract |
+|---|---|
+| `telemetry_performance_field_dictionaries` | The three accepted dictionaries and their bucket schemes, immutable once seeded. Composite foreign keys carry the pairing to grants, capabilities, reports, cohorts and buckets. A new dictionary needs a migration that lifts the guard trigger around its own insert, plus the matching contract registry row |
+| `telemetry_performance_runtime` | Singleton seeded `staged` at revision 1; moves only to `active` at the next revision, inside the owner activation transaction with its own fresh audit row |
+| Grants and capabilities | Append-only rows; a grant stores its dictionary and `dictionary_basis` (`v12_parser_inference`, `default_no_manifest` pinned to `…2026-09-29.1`, or `client_declared` for v2 grants). The capability echoes the stored dictionary |
+| Reports, cohorts, buckets, receipts | One current report per device and day; replacements supersede, receipts are `accepted` or `replaced`. Speed buckets 0–60 (v1) or 0–95 (v2), TTFT 0–57, turn duration 1–57. `…2026-09-21.1` keeps `turn_context_service_tier`; only its Ultrafast labels are refused |
+| `telemetry_performance_refusal_counts` | Content-free counters by UTC day, route, closed code and status |
+| `analytics_v2_published_performance` | One forward-only head per slot (period 1, 7, 30 or all × Standard, Fast or Ultrafast), holding a verified `community-model-performance-v1` payload and its content digest. The fast-path output digest policy treats its run stamps and release instant as provenance and its slot, revision, payload and digest as semantic (`OUTPUT_DIGEST_POLICY_SHA256` `0634a309…cb5b`) |
+
+Participant-owned rows cascade from `participants` in the offline owner purge.
+The refusal counters and publication heads carry no participant, so they are
+recomputed rather than purged.
+
+Three wire and DTO contracts sit on top:
+
+- **Grant v2.** `accountless-performance-owner-v2` adds
+  `fieldDictionaryVersion` to the v1 body; the origin echoes the exact body.
+  The origin accepts v1 and v2, and the legacy D1 Worker accepts v1 only.
+- **Public read.** `GET /api/v1/community/model-performance` returns one
+  stored slot as `community-model-performance-v1`, re-verified against the
+  head's digest, revision, instant and slot before it is served.
+- **Admin view.** `admin-performance-intake-v0.1` is a closed, content-free
+  DTO of counts, days, instants and closed codes. It requires the run row's
+  performance block to have exactly the keys `deferredEmpty`, `published`,
+  `unchanged` and `withheld`, and answers 503 otherwise, so a change to that
+  block must move the reader and its test together.
+
+The analytics-refresh receipt gains a closed `performance` block (`reports`,
+`cohorts`, `excludedUnknownTurns`, `deferredFutureDays`, `published`,
+`unchanged`, `withheld`, `deferredEmpty`) only on runs that carry the stage.
+`deferredFutureDays` counts distinct days after the window's end that hold a
+current, non-empty report, not reports. The runtime probe's two performance
+gauges are described in [GCP ops probes](../runbooks/gcp-ops-probes.md#performance-intake-and-publication-signals).
 
 The [performance specification](../design/2026-09-20-performance-telemetry-contract.md)
 records the measurement, overlap, policy, delivery, erasure, restore and UI requirements.
