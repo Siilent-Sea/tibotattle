@@ -942,8 +942,9 @@ export async function createPostgresProductionRuntime({
         // analytics_v2 lives in primary (0059): no separate analytics pool.
         pools: { primary: dataPool },
         schemaOptions: { primarySchema },
+        // Origin-only secrets are deliberately absent from the Worker env.
         maintenance: createPostgresOwnerMaintenance({ pool: dataPool, objectStore, primarySchema,
-          cursorSecret: env.POSTGRES_RATE_LIMIT_SECRET, clock,
+          cursorSecret: keyHashSecret, clock,
           observeActivation: (invoke) => observeActivation("v1.1", invoke),
           distributionEnabled: configuration.plane === "production" }),
       })

@@ -413,6 +413,77 @@ test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): six more rout
   }
 });
 
+test("owner recovery preview receives the origin-only cursor secret through the production runtime", async (t) => {
+  const { clearAdminAccessJwksCacheForTests } = await vite.ssrLoadModule("/src/admin-access.ts");
+  const team = "synthetic-recovery.cloudflareaccess.com";
+  const audience = "d".repeat(64);
+  const owner = "owner@synthetic.example";
+  const keys = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048,
+    publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
+  const publicJwk = { ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: "synthetic-recovery-key", alg: "RS256" };
+  const now = Math.floor(Date.now() / 1000);
+  const signingInput = `${base64UrlJson({ alg: "RS256", kid: publicJwk.kid })}.${base64UrlJson({
+    iss: `https://${team}`, aud: audience, email: owner, sub: "synthetic-recovery-owner", iat: now - 1, exp: now + 300,
+  })}`;
+  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", keys.privateKey, new TextEncoder().encode(signingInput));
+  const assertion = `${signingInput}.${Buffer.from(signature).toString("base64url")}`;
+  t.mock.method(globalThis, "fetch", async (url) => {
+    assert.equal(String(url), `https://${team}/cdn-cgi/access/certs`, "only the synthetic Access certificate fetch is allowed");
+    return Response.json({ keys: [publicJwk] });
+  });
+  clearAdminAccessJwksCacheForTests();
+  try {
+    {
+      // Staging permits a synthetic Access owner. Both planes use the same
+      // maintenance composition; production's fixed owner pin stays intact.
+      const hostMode = "staging";
+      const seams = dependencies();
+      const statements = [];
+      const createPool = seams.dependencies.createIamPool;
+      const env = stagingEnv({ ACCESS_TEAM_DOMAIN: team, ACCESS_AUD: audience, ACCESS_ADMIN_EMAIL: owner });
+      const runtime = await host.createPostgresProductionRuntime({ processEnv: env, hostMode,
+        dependencies: { ...seams.dependencies, async createIamPool(options) {
+          const pool = await createPool(options);
+          pool.connect = async () => ({
+            async query(sql) {
+              statements.push(String(sql));
+              if (/^(?:BEGIN|SET LOCAL|COMMIT|ROLLBACK)\b/u.test(sql)) return { rows: [], rowCount: 0 };
+              if (sql.includes('"collection_controls"')) return { rows: [{ control_state: "operational", revision: "1",
+                enrollment_enabled: true, upload_registration_enabled: true, processing_enabled: true,
+                publication_enabled: true }], rowCount: 1 };
+              if (sql.includes("WITH candidates AS")) return { rows: [], rowCount: 0 };
+              throw new Error("unexpected synthetic recovery read");
+            }, release() {},
+          });
+          return pool;
+        } },
+      });
+      try {
+        assert.equal(runtime.configuration.workerEnvKeys.includes("POSTGRES_RATE_LIMIT_SECRET"), false,
+          "the origin-only secret must remain outside Worker bindings");
+        const request = new Request(invokerRequest("/api/v1/admin/action", { method: "POST", hostKind: "admin",
+          headers: { "cf-access-jwt-assertion": assertion, "x-usage-monitor-admin": "1",
+            "content-type": "application/json", origin: env.ADMIN_HOST_ORIGIN } }), {
+          body: JSON.stringify({ action: "run_maintenance", v11EvidenceAdoption: { dryRun: true, maxDevices: 1 } }),
+        });
+        const response = await runtime.productionDispatch(request);
+        const body = await response.json();
+        assert.equal(response.status, 200,
+          `${hostMode}: configured origin secret must reach the recovery task (${body.error?.code ?? "success"})`);
+        assert.equal(body.result.task, "v11_evidence_adoption");
+        assert.equal(body.result.dryRun, true);
+        assert.equal(body.result.examined, 0);
+        assert.ok(statements.some(sql => sql.startsWith("BEGIN") && sql.includes("READ ONLY")));
+        assert.ok(statements.every(sql => !/^(?:INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b/u.test(sql)));
+        assert.equal(JSON.stringify(body).includes(SECRETS.POSTGRES_RATE_LIMIT_SECRET), false);
+      } finally {
+        for (const pool of runtime.pools) await pool.end();
+        runtime.connector.close();
+      }
+    }
+  } finally { clearAdminAccessJwksCacheForTests(); }
+});
+
 test("HOST_MODE staging uses the staging plane's origin-tier limits (300/6), not production's", async () => {
   const seams = dependencies();
   const runtime = await host.createPostgresProductionRuntime({
