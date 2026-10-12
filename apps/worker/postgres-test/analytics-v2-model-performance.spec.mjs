@@ -27,8 +27,8 @@
  * store's content digests on every golden candidate, and that the store's
  * deferred-empty predicate equals GATE-Q 12's measure under the fold.
  *
- * Every identifier, payload and record is synthetic and content-free. Not
- * yet registered in apps/worker/package.json (SPD-X2b registers it).
+ * Every identifier, payload and record is synthetic and content-free.
+ * Registered in apps/worker/package.json's postgres:domain:check.
  *
  * Run: PG_TEST_SOCKET=/private/tmp/tibotattle-pg-<id>/socket PG_TEST_PORT=<port> \
  *   node --test --test-concurrency=1 postgres-test/analytics-v2-model-performance.spec.mjs

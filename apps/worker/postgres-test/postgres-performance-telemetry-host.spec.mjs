@@ -49,8 +49,7 @@
 //   the performance stage, then readPostgresAdminPerformanceIntake answers
 //   with that run's four-key performance block.
 //
-// Not registered in apps/worker/package.json here (HOT SPOT d: SPD-X2b
-// registers it). Run:
+// Registered in apps/worker/package.json's postgres:domain:check. Run:
 //   PG_TEST_SOCKET=/private/tmp/tibotattle-pg-.../socket PG_TEST_PORT=<port> \
 //     node --test --test-concurrency=1 ./postgres-test/postgres-performance-telemetry-host.spec.mjs
 import assert from "node:assert/strict";

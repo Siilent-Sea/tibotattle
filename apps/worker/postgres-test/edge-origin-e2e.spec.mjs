@@ -357,6 +357,15 @@ async function seedSchema(base, m, schema) {
     WHERE schema_version='telemetry-contribution-v1.1'`);
   await base.query(`UPDATE ${t("telemetry_v12_runtime")} SET state='active', changed_at=$1 WHERE id=1`, [now]);
   await base.query(`UPDATE ${t("telemetry_v12_typed_runtime")} SET state='active', changed_at=$1 WHERE id=1`, [now]);
+  // Production always holds this row (the cutover's usage-correction stage
+  // requires exactly one, and 0034's trigger keeps it immutable). The
+  // effective reader (occurrence-source.ts readOwnerScope, mirroring the
+  // d43c8f92 Worker's inner join) refuses every v1.2 owner without it, so a
+  // refresh over a schema built from migrations alone fails its read phase
+  // with ANALYTICS_V2_SOURCE_UNAVAILABLE once a v1.2 owner exists.
+  await base.query(`INSERT INTO ${t("telemetry_usage_correction_runtime")}
+      (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
+    VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', 'active', 200, 200)`);
   return t;
 }
 
@@ -2721,9 +2730,16 @@ let performanceLanePromise = null;
  * edge-test origin, Google front end and gcp edge (the same bundle, Access,
  * Sparkle and asset fixtures, and the run's client-key secret), so the
  * refresh Job reads only what this flow wrote. Its exchanges join the run's
- * S7 record. The main schema keeps the other S5 flows' synthetic residue:
- * after the S5 v1.2 flow, the deployable refresh's read phase fails there with
- * ANALYTICS_V2_SOURCE_UNAVAILABLE (seen 2026-10-11; not diagnosed here).
+ * S7 record. The main schema keeps the other S5 flows' synthetic residue,
+ * so the lane keeps the publication's counts (one report, one contributor,
+ * one device) exact and independent of those flows and of their order.
+ *
+ * The lane was first added because the deployable refresh failed over the
+ * main schema after the S5 v1.2 flow with ANALYTICS_V2_SOURCE_UNAVAILABLE
+ * (2026-10-11). Cause (diagnosed 2026-10-12): seedSchema did not insert the
+ * telemetry_usage_correction_runtime row that production always holds, and
+ * the effective reader refuses every v1.2 owner without it. seedSchema now
+ * inserts it, so the lane is isolation, not a workaround.
  */
 function performanceLane() {
   performanceLanePromise ??= (async () => {
