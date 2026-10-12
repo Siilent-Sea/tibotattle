@@ -674,37 +674,41 @@ each exclusion names one exact route and only its
 Deploy order for this change:
 
 1. Origin migrate and roll of the integration commit, after the v1.2
-   activation-timeout fix is live, then the reprice and the read-only checks
-   that need no edge change: `/api/ready` and the intake routes' staged
+   activation-timeout fix is live, then the read-only checks that need no
+   edge change: `/api/ready` and the intake routes' staged
    `403 TELEMETRY_TRANSPORT_BLOCKED`
    ([rollout](./gcp-rollout.md#migration-0079-community-model-speed)).
-2. The edge deploy from the edge-port line, in the live mode, carrying the
-   two routes, the admin section (the admin bundle ships with the edge Worker)
-   and the website reader. A single changed-site deploy of the edge-port
-   candidate is refused today: its `live..HEAD` scope also changes Worker,
-   admin and doc paths outside the web-only closure, which the
-   `--web-release-receipt` contract requires
+2. The edge deploy from the edge-port line, in the live mode, after step 1,
+   carrying the two routes, the admin section (the admin bundle ships with
+   the edge Worker) and the website reader. A single changed-site deploy of
+   the edge-port candidate is refused today: its `live..HEAD` scope also
+   changes Worker, admin and doc paths outside the web-only closure, which
+   the `--web-release-receipt` contract requires
    ([Changing the public site](#changing-the-public-site)). The supported
-   packaging is two typed deploys: a kept-site code deploy from a commit with
-   the web-only closure files reset to the live site source, then a web-only
-   changed-site release of those files prepared against that commit. The owner
-   chooses the packaging at deploy time.
+   packaging is two typed deploys: a kept-site code deploy from a commit R
+   with the web-only closure files reset to the live site source, then a
+   web-only changed-site release W of those files prepared against R. The
+   owner chooses the packaging at deploy time. Commit R and W on the
+   edge-port branch and push it before the first deploy: W becomes the live
+   `DEPLOYMENT_SOURCE_COMMIT`, and every later edge-mode deploy must descend
+   from it (`EDGE_MODE_SOURCE_NOT_DESCENDANT`).
 3. Read-only verification of the admin view and the public read through the
    new edge, which needs steps 1 and 2.
 4. Owner activation of the performance runtime, through
    [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation),
    which needs step 3.
 
-Steps 1 and 2 may run in either order, but steps 3 and 4 need both. Until the
-edge deploy, the live edge's route registry has neither new path, so it
-answers both with its own `404 NOT_FOUND` and never forwards them; the admin
-view the activation reads is therefore unreachable. Before that deploy the
-admin bundle has no performance-intake section at all. If the edge deploys
-first, it forwards both paths to an origin that answers 404 until the roll:
-the website reader then shows `none_published` and the admin section shows
-as unavailable. All of this reaches the origin only in gcp mode. In worker
-mode the Worker answers both paths itself, as described above, and in fenced
-mode every API path answers `503 MUTATION_BARRIER_ACTIVE`.
+In gcp mode, step 2 needs the roll. Before any write, the gcp deploy reads the
+origin's served commit through the [pre-gcp verifier](#5-pre-gcp-verifier) and
+refuses `EDGE_ORIGIN_COMMIT_MISMATCH` unless it equals `--origin-commit`; both
+typed deploys pass the rolled integration commit, and the post-deploy health
+check pins the same value. Until the edge deploy, the live edge's route
+registry has neither new path, so it answers both with its own
+`404 NOT_FOUND` and never forwards them; the admin view the activation reads
+is therefore unreachable. Before that deploy the admin bundle has no
+performance-intake section at all. All of this reaches the origin only in gcp
+mode. In worker mode the Worker answers both paths itself, as described above,
+and in fenced mode every API path answers `503 MUTATION_BARRIER_ACTIVE`.
 
 ### Reading edge failures
 
