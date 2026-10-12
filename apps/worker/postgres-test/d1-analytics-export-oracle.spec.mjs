@@ -35,6 +35,7 @@ import {
 } from "../src/d1-analytics-export-oracle.ts";
 import { readCacheRetentionCommunitySeries } from "../src/cache-retention-day.ts";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority.ts";
+import { STORAGE_GRAPH_METHOD, STORAGE_GRAPH_PROJECTION_METHOD } from "../src/storage-community-graph.ts";
 import { advanceStorageCommunityGraphWork } from "../src/storage-community-graph-work.ts";
 import { retireStorageCommunityGraphPublications } from "../src/storage-community-graph-publication.ts";
 
@@ -712,6 +713,41 @@ describe("D1 export oracle over synthetic sealed exports", () => {
     const error = await refusal(await scratch("from-day-gap-null", ({ analytics }) => removeCacheRetentionDay(analytics, removed)));
     assert.equal(error.code, "ANALYTICS_EXPORT_NOT_QUIESCENT");
     assert.deepEqual(error.reasons, ["cache_retention_incomplete"]);
+  }, RUN_TIMEOUT_MS);
+
+  it("import selection uses the publication projection identity and excludes raw or unknown method stamps", async () => {
+    const day = fixture.days.threeDaysAgo;
+    const baseline = cliRun.oracle.importSelection;
+    assert.ok(baseline.modelDays.some((entry) => entry.day === day));
+    assert.notEqual(STORAGE_GRAPH_PROJECTION_METHOD, STORAGE_GRAPH_METHOD);
+    const expected = baseline.modelDays.filter((entry) => entry.day !== day);
+    for (const [index, method] of [STORAGE_GRAPH_METHOD, `${STORAGE_GRAPH_PROJECTION_METHOD}:unknown`].entries()) {
+      const paths = await scratch(`model-method-${index}`, ({ analytics }) => {
+        const row = analytics.prepare("SELECT method FROM analytics_community_model_publications WHERE source_id=? AND day=?")
+          .get(fixture.sourceId, day);
+        assert.equal(row.method, STORAGE_GRAPH_PROJECTION_METHOD);
+        const rawCaches = analytics.prepare("SELECT count(*) AS n FROM analytics_community_graph_results WHERE source_id=? AND method=?")
+          .get(fixture.sourceId, STORAGE_GRAPH_METHOD).n;
+        assert.ok(rawCaches > 0, "raw result caches keep their separate calculation identity");
+        // Inject only an unsupported stamp on this disposable scratch copy.
+        // The retained publication pin predates later source changes, so the
+        // normal authority guard correctly forbids rewriting it in production.
+        analytics.exec("DROP TRIGGER analytics_model_authority_update");
+        assert.equal(analytics.prepare("UPDATE analytics_community_model_publications SET method=? WHERE source_id=? AND day=?")
+          .run(method, fixture.sourceId, day).changes, 1);
+        assert.equal(analytics.prepare("SELECT count(*) AS n FROM analytics_community_graph_results WHERE source_id=? AND method=?")
+          .get(fixture.sourceId, STORAGE_GRAPH_METHOD).n, rawCaches);
+      });
+      const db = open(paths, { readOnly: true });
+      try {
+        const selection = await readD1AnalyticsImportSelection({ source: db.ingestion, target: db.analytics,
+          sourceId: fixture.sourceId, sourceNamespace: fixture.sourceNamespace, pinnedNowMs: fixture.pinnedNowMs });
+        assert.deepEqual(selection.modelDays, expected, `${method} is not a current publication identity`);
+        assert.deepEqual(selection.daily, baseline.daily);
+      } finally {
+        db.close();
+      }
+    }
   }, RUN_TIMEOUT_MS);
 
   it("import selection omits a model day D1 withholds, and the forced graph recompute replaces it", async () => {
