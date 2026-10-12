@@ -369,9 +369,11 @@ accountless model-performance intake and its community publication
 ([community model speed](../decisions/2026-10-10-community-model-speed.md#admin-view-and-probes)).
 It returns counts, UTC days, instants and closed codes, never a contributor,
 device, enrollment or report identifier. Any source failure answers
-`503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` with no detail. The Cloudflare D1
-Worker answers the same route with that 503 on the admin host and with `404`
-on the apex, because it holds no performance intake.
+`503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` with no detail. A Cloudflare D1
+Worker built from the GCP or edge-port line answers the same route with that
+503 on the admin host and with `404` on the apex, because it holds no
+performance intake. The Worker live before the edge deploy (source
+`24411d5c3`) has no such route and answers `404 NOT_FOUND` on both hosts.
 
 The view covers the runtime state and policy revision, grant and capability
 heads by dictionary and basis, reports by evidence day and arrival day, the

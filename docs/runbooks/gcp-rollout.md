@@ -404,10 +404,12 @@ What the migration does to the rollout:
 Owner order, after the general preconditions:
 
 1. **Kernel registry order.** `owner`. The live registry must already hold
-   the v1.2 activation-timeout kernel (kernel 15 in the live order), and kernel
-   16 if it lands first. The performance stage's kernel entry is appended
-   after them as `max(live) + 1` at integration, and the owner adds only that
-   final `REGISTRY_PINS` line. `node cloud-run/build.mjs --check` must resolve
+   the v1.2 activation-timeout kernel (kernel 15 in the live order), and the
+   allowance kernel 16 if it lands first. The integration branch merges the
+   activation-timeout head and appends the performance stage's entry as
+   `max(live) + 1`, which is kernel 16 on that base; if another kernel lands
+   in production first, the entry is dropped and re-appended after it, with
+   its `REGISTRY_PINS` line. `node cloud-run/build.mjs --check` must resolve
    the commit's closure to that entry before the build
    (`CLOUD_RUN_BUILD_KERNEL_UNREGISTERED` otherwise).
 2. **Build, migrate and roll** the integration commit through steps 4 to 9 of
@@ -467,15 +469,23 @@ sizes counted every refusal, with refused polls at about twice read latency
 (p50 35–99 ms). Only a locked or unavailable counter table adds up to 1 second
 of tail latency per refusal. This is not a probe signal and needs no brake.
 
-### Refresh with future-dated v1.2 events (under diagnosis)
+### Refresh with future-dated v1.2 events
 
-> **Placeholder.** A separate diagnosis is running. In the local end-to-end
-> suite, the deployable analytics refresh failed with
-> `ANALYTICS_V2_SOURCE_UNAVAILABLE` in its read phase after a test wrote v1.2
-> events stamped later than the run's instant. The cause and its production
-> exposure are not established. The orchestrator fills in this subsection at
-> integration. Until then, treat a refresh that fails this way after a v1.2
-> activation as an incident, not as an expected outcome of this rollout.
+The analytics-refresh Job tolerates v1.2 events and chunk days later than its
+clock. v1.2 admission has no server-clock bound: it only requires each event to
+fall on its manifest's UTC day. The refresh then completes, and its receipt
+lists any future queued days as published, because the plan runs through
+`max(queued days, today)`. The performance stage is not affected: it excludes
+report days after yesterday and counts them as `deferredFutureDays`.
+
+A refresh that fails with `{"code":"ANALYTICS_V2_SOURCE_UNAVAILABLE","phase":"read"}`
+over v1.2 owners is therefore not a clock problem. First check that
+`telemetry_usage_correction_runtime` holds its id=1 row. The effective reader
+(`occurrence-source.ts` `readOwnerScope`, mirroring d43c8f92) refuses every
+v1.2 owner without it. Production always has the row: the cutover's
+usage-correction stage requires exactly one, and a trigger makes it immutable.
+A schema built from migrations alone, such as a test seed, lacks it and must
+insert it before running the refresh.
 
 ## Open gaps
 
@@ -490,7 +500,7 @@ of tail latency per refusal. This is not a probe signal and needs no brake.
 | Maintenance job in the rollout target | `built` (D-OPS4). The production target's jobs are the migration job, the refresh job and the maintenance job, and the staging target omits the maintenance job until its staging template exists. Not applied or rolled in any project |
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
 | Staging migrate-and-roll proof, with its live sub-checks | Open (see [staging proof](#staging-proof)) |
-| Migration 0079 rollout | Source and local PostgreSQL proof only. Not built, migrated, rolled or activated in any project; the refresh diagnosis above is open |
+| Migration 0079 rollout | Source and local PostgreSQL proof only. Not built, migrated, rolled or activated in any project |
 
 ## Evidence boundary
 
