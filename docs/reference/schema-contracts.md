@@ -303,13 +303,26 @@ and publication in PostgreSQL. It is source only: no live database holds it.
 | `telemetry_performance_field_dictionaries` | The three accepted dictionaries and their bucket schemes, immutable once seeded. Composite foreign keys carry the pairing to grants, capabilities, reports, cohorts and buckets. A new dictionary needs a migration that lifts the guard trigger around its own insert, plus the matching contract registry row |
 | `telemetry_performance_runtime` | Singleton seeded `staged` at revision 1; moves only to `active` at the next revision, inside the owner activation transaction with its own fresh audit row |
 | Grants and capabilities | Append-only rows; a grant stores its dictionary and `dictionary_basis` (`v12_parser_inference`, `default_no_manifest` pinned to `…2026-09-29.1`, or `client_declared` for v2 grants). The capability echoes the stored dictionary |
-| Reports, cohorts, buckets, receipts | One current report per device and day; replacements supersede, receipts are `accepted` or `replaced`. Speed buckets 0–60 (v1) or 0–95 (v2), TTFT 0–57, turn duration 1–57. `…2026-09-21.1` keeps `turn_context_service_tier`; only its Ultrafast labels are refused |
-| `telemetry_performance_refusal_counts` | Content-free counters by UTC day, route, closed code and status |
+| Reports, cohorts, buckets, receipts | One current report per device and day; replacements supersede, receipts are `accepted` or `replaced`. Speed buckets 0–60 (v1) or 0–95 (v2), TTFT 0–57, turn duration 1–57. `…2026-09-21.1` keeps `turn_context_service_tier`; only its Ultrafast labels are refused. Admission, not the table, bounds `report_day` to the server's UTC day minus 10 through plus 1 (see below) |
+| `telemetry_performance_refusal_counts` | Content-free counters by UTC day, route, closed code and status. A `409 TELEMETRY_RECORD_INVALID` is counted with its closed parser detail appended, for example `TELEMETRY_RECORD_INVALID_REPORT_DAY_OUT_OF_WINDOW` |
 | `analytics_v2_published_performance` | One forward-only head per slot (period 1, 7, 30 or all × Standard, Fast or Ultrafast), holding a verified `community-model-performance-v1` payload and its content digest. The fast-path output digest policy treats its run stamps and release instant as provenance and its slot, revision, payload and digest as semantic (`OUTPUT_DIGEST_POLICY_SHA256` `0634a309…cb5b`) |
 
 Participant-owned rows cascade from `participants` in the offline owner purge.
 The refusal counters and publication heads carry no participant, so they are
 recomputed rather than purged.
+
+**Report-day window.** Origin admission accepts a new report or a
+replacement only when its `day` lies from 10 days before through 1 day after
+the server's UTC day, inclusive
+(`POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_PAST_DAYS` and
+`…_FUTURE_DAYS` in `src/postgres-telemetry-performance-reports.ts`, computed
+from the request clock). Outside it the answer is
+`409 TELEMETRY_RECORD_INVALID` with the closed detail
+`REPORT_DAY_OUT_OF_WINDOW`, which only the refusal counter sees, and nothing
+is written. An exact replay of a stored revision is still idempotent. The
+window covers the client's 7-day backfill (the current day and the last 7
+completed days) plus 2–3 days of skew and offline delay. Widening the client
+backfill requires widening this window first.
 
 Three wire and DTO contracts sit on top:
 

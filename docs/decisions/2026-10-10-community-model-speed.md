@@ -201,8 +201,9 @@ their dictionary avoid that lag.
 
 The origin reads a current capability before it decrypts an upload, so a
 device without one is refused before any key work. Admission follows the
-Worker's order under a per-device-day advisory lock: idempotent replay,
-content conflict, capability dictionary, then source-revision order. A new
+Worker's order under a per-device-day advisory lock: idempotent replay, the
+report-day window, content conflict, capability dictionary, then
+source-revision order. A new
 revision supersedes the current one and writes its cohorts, buckets and one
 receipt (`accepted` or `replaced`). A replay writes no receipt and answers
 with `idempotency-replayed: true`.
@@ -211,8 +212,26 @@ with `idempotency-replayed: true`.
   `403 TELEMETRY_TRANSPORT_BLOCKED` (gate answer 6).
 - An invalid record is `409 TELEMETRY_RECORD_INVALID`. Its closed reason
   (`MODEL_UNREVIEWED`, `DICTIONARY_UNACCEPTED`, `SCHEME_MISMATCH`, `ORDER`,
-  `DUPLICATE_COHORT`, `DAY_MISMATCH`, `SIZE` or `SHAPE`) goes only to the
-  refusal counter, never to the response body.
+  `DUPLICATE_COHORT`, `DAY_MISMATCH`, `SIZE`, `SHAPE` or
+  `REPORT_DAY_OUT_OF_WINDOW`) goes only to the refusal counter, never to the
+  response body.
+- A report day must lie in a window around the server's UTC day: from 10 days
+  before it through 1 day after it, inclusive. The bounds are named constants
+  in the reports module, and the window is computed from the request clock
+  that admission already receives. A new report or a replacement outside the
+  window is `409 TELEMETRY_RECORD_INVALID`, counted as
+  `TELEMETRY_RECORD_INVALID_REPORT_DAY_OUT_OF_WINDOW`, and writes nothing. An
+  exact replay of a stored revision is still answered idempotent, because the
+  window is checked after the replay read. Without this bound, one device
+  could stretch the public `all` period back by years with one report, or
+  withhold every slot with a few hundred reports on distinct old weeks (the
+  fold's point and day limits). The window is admission-only: the 0079
+  trigger, the reader and the fold do not repeat it, and 0079 has not been
+  applied anywhere, so no stored row predates it.
+- The window is coupled to the client's 7-day backfill (decision 4): clients
+  re-send the current day and the last 7 completed days, so the window leaves
+  2–3 days for clock skew and offline delay. Widening the client backfill
+  requires widening this window first, server first.
 - A replacement may change dictionary from the prior revision's. This is the
   re-upload path for re-prepared backfill days after a client moves to
   `…2026-10-10.1`; the composed-host test proves it.
