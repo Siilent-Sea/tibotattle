@@ -89,14 +89,17 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 14: activation-only classification proof working sets share the
   // overlay reader's module; overlay reads and pricing identity unchanged.
   "2caee1ed3c56982a8cc6b945ca33ec727cc130ce9e4f7ad230582202d9594967",
-  // Kernel 15 (PROVISIONAL, SPD-G0, amended by SPD-P3 before any deploy): the
-  // community model speed contract port (performance-histogram-v2, dictionary
-  // adapters, community performance shape) and two new ErrorCode members reach
-  // the closure through the telemetry-contract barrel and errors.ts; SPD-P3
-  // adds the performance reader and fold as closure roots and wires them into
-  // the Job's read and compute composition; pricing identity unchanged.
-  // SPD-INT-G drops this entry and appends max(live)+1.
-  "6ac5d6c64bd9d18daef6836037ddd2172411d688d74fd76405781b42adb1cea1",
+  // Kernel 15: the activation proof leaves the overlay reader's module, so
+  // later proof changes stay outside the closure; overlay reads and pricing
+  // identity unchanged.
+  "c661f21794fd5321f94bfcd5fdaa75a4e2184bd9cd6c0725213d244171773da0",
+  // Kernel 16: the community model speed contract port (performance-histogram-v2,
+  // dictionary adapters, community performance shape) and two new ErrorCode
+  // members reach the closure through the telemetry-contract barrel and
+  // errors.ts; the performance reader and fold are closure roots wired into the
+  // Job's read and compute composition, over kernel 15's separated activation
+  // proof; pricing identity unchanged.
+  "95de72182235f5adc1c3e3a643168d359369363ef5f080c3f781ec1c55a36031",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
