@@ -19,10 +19,10 @@
 // the checked-in production limits, S5 shipped-client flows, S6 upstream
 // failures, S7 privacy on every exchange, S8 the Sparkle guard, S9 the golden
 // community/daily read and the live check's write tier on the golden-seeded
-// schema (EDGE_E2E_GOLDEN), S10 detector controls. S9 holds the golden's
-// withheld model dates to the oracle's per-date expectation (OD-12, decision
-// D7): EDGE_E2E_PER_DATE_EXPECTED, or for the committed Q-1 golden the one
-// `npm run gcp:fastpath:rehearsal` uses.
+// schema (EDGE_E2E_GOLDEN), S10 detector controls. The committed Q-1 input
+// uses a fresh, source-pinned current Worker/D1 reference under retained Node
+// 26.2.0; its historical golden/per-date comparison remains diagnostic. Other
+// goldens retain the historical oracle and per-date qualification (OD-12).
 //
 // Local only: nothing is deployed, nothing reaches Cloudflare or Google, and
 // every key, token, account, address and row is synthetic and content-free.
@@ -39,12 +39,12 @@ import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, webcrypto } from "node:crypto";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Miniflare } from "miniflare";
 import pg from "pg";
@@ -58,11 +58,20 @@ import {
   telemetryV12RequiredConsent,
 } from "@app-usagemonitor/telemetry-contract";
 import {
+  compareAnalyticsV2CurrentContract,
   compareAnalyticsV2Parity,
   perDateExpectationFor,
   withheldModelDatesOf,
 } from "../scripts/analytics-v2-parity-compare.mjs";
-import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import {
+  assertCurrentImageRuntime,
+  verifyCurrentImageRuntimePath,
+} from "../scripts/gcp-fastpath-rehearsal.mjs";
+import {
+  assertCurrentQ1TrustedRuntime,
+  validateCurrentQ1ReferenceBinding,
+} from "./fixtures/current-q1-d1-reference.mjs";
 import { buildEdgeBundle, readCompatibility } from "../scripts/edge-e2e/edge-bundle.mjs";
 import {
   EDGE_E2E_ADMIN_ORIGIN,
@@ -2283,28 +2292,167 @@ function familyTable(report) {
     { expected: entry.expected, compared: entry.compared, equal: entry.equal, diffCount: entry.diffCount }]));
 }
 
-/**
- * The Q-2 rehearsal on this commit, with --keep-schema: it seeds a rehearsal
- * schema from the golden (importers, then dist/analytics-refresh.mjs under
- * Node 22 at the golden's clock), reads community/daily from the plain
- * fast-path origin and reports its parity table. Its importers need a newer
- * node:sqlite than the image runtime has, so the rehearsal runs under
- * EDGE_E2E_REHEARSAL_NODE (default: `node` on PATH) and keeps this process's
- * Node 22 for its refresh and origin, as it does when run by hand.
- */
+const CURRENT_Q1 = GOLDEN === join(WORKER_ROOT, "analytics-v2-test", "golden");
+const S9_COMPARISON_MODE = CURRENT_Q1 ? "current-worker-d1" : "historical";
+const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
+const CURRENT_HELPER_PATH = "apps/worker/postgres-test/fixtures/current-q1-d1-reference.mjs";
+const REHEARSAL_CONTROLLER_PATH = "apps/worker/scripts/gcp-fastpath-rehearsal.mjs";
+const CURRENT_MIGRATION_ORDER = Object.freeze(["migrations", "typed-ingestion-migrations",
+  "ingestion-bridge-migrations", "typed-v11-admission-migrations", "analytics-migrations",
+  "deletion-ledger-migrations", "typed-v1-admission-migrations", "ingestion-isolation-migrations"]);
+const CURRENT_GATES = Object.freeze(["importersCompleted", "refreshFirstComplete", "readStatus200",
+  "secondRunZeroNewRevisions", "currentWorkerD1ProducerAccepted", "currentWorkerD1ReferenceComplete",
+  "currentWorkerD1Equality", "currentCandidateInputsUnchanged", "immutableCorpusDailyConserved"]);
+const SHA256 = /^[a-f0-9]{64}$/u;
+const jsonSha256 = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+async function regularFileSha256(path, maximumBytes = 512 * 1024 * 1024) {
+  const metadata = await lstat(path);
+  assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.size <= maximumBytes,
+    "a bounded regular file is required");
+  const hash = createHash("sha256");
+  for await (const bytes of createReadStream(path)) hash.update(bytes);
+  return hash.digest("hex");
+}
+
+/** Verify the retained binary before executing even its version command. */
+async function s9RehearsalNode() {
+  if (!CURRENT_Q1) return { node: process.env.EDGE_E2E_REHEARSAL_NODE || "node", runtime: null };
+  assert.equal(process.version, "v22.16.0", "S9 edge and origin retain the image runtime");
+  const named = process.env.EDGE_E2E_REHEARSAL_NODE;
+  assert.ok(typeof named === "string" && isAbsolute(named),
+    "current S9 requires the retained absolute EDGE_E2E_REHEARSAL_NODE");
+  const node = await realpath(named);
+  const runtime = { version: "v26.2.0", platform: process.platform, arch: process.arch,
+    binarySha256: await regularFileSha256(node) };
+  assertCurrentQ1TrustedRuntime(runtime);
+  const { stdout } = await execFileAsync(node, ["--version"], { timeout: 10_000, maxBuffer: 1_024 });
+  assert.equal(stdout.trim(), "v26.2.0", "the allowlisted retained runtime reports its exact version");
+  assert.equal(await regularFileSha256(node), runtime.binarySha256, "the retained binary is unchanged after its version probe");
+  return { node, runtime };
+}
+
+function ownedKeptRehearsalSchemas(report) {
+  assert.equal(report.reusedSchema, false, "S9 owns only a fresh rehearsal");
+  const match = /^typed_legacy_transfer_rehearsal_target_fastpath_([0-9a-f]{8})$/u.exec(report.schema);
+  assert.ok(match, "the fresh target has the generated rehearsal prefix and suffix");
+  const allowed = [report.schema, `typed_legacy_transfer_rehearsal_ctl_${match[1]}`];
+  assert.ok(Array.isArray(report.keptSchemas) && report.keptSchemas.length <= 2
+    && new Set(report.keptSchemas).size === report.keptSchemas.length
+    && report.keptSchemas.every((name) => allowed.includes(name)), "only this generated target/control pair is owned");
+  return report.keptSchemas;
+}
+
+async function preserveS9Artifact(suffix, value) {
+  if (!process.env.EDGE_E2E_REPORT) return;
+  await writeFile(`${resolve(process.env.EDGE_E2E_REPORT)}.${suffix}.json`, `${JSON.stringify(value, null, 2)}\n`,
+    { flag: "wx", mode: 0o600 });
+}
+
+async function verifyCurrentFilePin(entry) {
+  assert.deepEqual(Object.keys(entry).sort(), ["path", "sha256"]);
+  assert.ok(typeof entry.path === "string" && entry.path.startsWith("apps/worker/")
+    && !/[\0\r\n\\]/u.test(entry.path)
+    && entry.path.split("/").every((part) => part !== "" && part !== "." && part !== ".."));
+  assert.match(entry.sha256, SHA256);
+  assert.equal(await regularFileSha256(join(REPOSITORY_ROOT, entry.path), 32 * 1024 * 1024), entry.sha256,
+    `the named candidate input is unchanged: ${entry.path}`);
+}
+
+/** The receipt preserves the direct invocation, rather than attesting it cryptographically.
+ * Expected digests remain the controller's original pre-PG strings. */
+async function verifyCurrentS9Evidence({ report, evidence, runtime, imageRuntime, staged }) {
+  assert.ok(evidence, "current S9 requires all preserved producer sidecars");
+  const { reference, binding, acceptance } = evidence;
+  const original = report.currentReference;
+  assert.ok(original && original.qualification === "complete");
+  for (const field of ["sha256", "bindingSha256", "acceptanceSha256"]) assert.match(original[field], SHA256);
+  assert.equal(jsonSha256(reference), original.sha256, "the reference equals its original pre-PG digest");
+  assert.equal(jsonSha256(binding), original.bindingSha256, "the binding equals its original pre-PG digest");
+  assert.equal(jsonSha256(acceptance), original.acceptanceSha256, "the accepted receipt is preserved");
+  validateCurrentQ1ReferenceBinding({ reference, expected: binding });
+  assert.deepEqual(Object.keys(acceptance).sort(), ["schemaVersion", "evidenceScope", "cryptographicExecutionAttestation",
+    "actualHelperInvocation", "resultReturnedAfterOwnedCleanup", "accepted", "referenceSha256", "bindingSha256",
+    "sourceHead", "sourceSha256", "migrationSha256", "corpusSha256", "helper", "controller", "runtime"].sort());
+  assert.equal(acceptance.schemaVersion, "current-q1-d1-producer-acceptance-v1");
+  assert.equal(acceptance.evidenceScope, "direct-source-pinned-producer-controller");
+  assert.equal(acceptance.cryptographicExecutionAttestation, false);
+  for (const field of ["actualHelperInvocation", "resultReturnedAfterOwnedCleanup", "accepted"]) {
+    assert.equal(acceptance[field], true, `the controller's ${field} gate is closed`);
+  }
+  assert.equal(acceptance.referenceSha256, original.sha256);
+  assert.equal(acceptance.bindingSha256, original.bindingSha256);
+  assert.equal(original.schemaVersion, reference.schemaVersion);
+  assert.deepEqual(original.source, { head: binding.source.head, sha256: binding.source.sha256 });
+  assert.equal(acceptance.sourceHead, binding.source.head);
+  assert.equal(acceptance.sourceSha256, binding.source.sha256);
+  assert.equal(acceptance.migrationSha256, binding.migrationSha256);
+  assert.equal(original.migrationSha256, binding.migrationSha256);
+  assert.equal(acceptance.corpusSha256, binding.corpus.canonicalSha256);
+  assert.equal(original.corpusSha256, binding.corpus.canonicalSha256);
+  assert.deepEqual(acceptance.runtime, binding.runtime);
+  assert.deepEqual(original.runtime, binding.runtime);
+  assertCurrentQ1TrustedRuntime(binding.runtime);
+  for (const [key, value] of Object.entries(runtime)) assert.equal(binding.runtime[key], value);
+  const { stdout } = await execFileAsync("git", ["--no-optional-locks", "-C", REPOSITORY_ROOT, "rev-parse", "HEAD"],
+    { timeout: 10_000, maxBuffer: 1_024, env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" } });
+  assert.match(stdout, /^[a-f0-9]{40}\n$/u);
+  assert.equal(binding.source.head, stdout.trim(), "the producer was born on this candidate head");
+  for (const entry of binding.source.files) await verifyCurrentFilePin(entry);
+  assert.deepEqual(acceptance.helper, binding.source.files.find((entry) => entry.path === CURRENT_HELPER_PATH));
+  assert.equal(acceptance.helper.path, CURRENT_HELPER_PATH);
+  await verifyCurrentFilePin(acceptance.helper);
+  assert.equal(acceptance.controller.path, REHEARSAL_CONTROLLER_PATH);
+  await verifyCurrentFilePin(acceptance.controller);
+  const migrationPaths = [];
+  for (const directory of CURRENT_MIGRATION_ORDER) {
+    for (const name of (await readdir(join(WORKER_ROOT, directory))).filter((name) =>
+      /^\d{4}_[a-z0-9_-]+\.sql$/u.test(name)).sort()) migrationPaths.push(`apps/worker/${directory}/${name}`);
+  }
+  assert.deepEqual(binding.migrations.map(({ path }) => path), migrationPaths,
+    "the exact current migration set and maintained apply order are preserved");
+  const corpusPaths = ["corpus.json", ...["a", "b", "c", "d"].map((key) => `corpus-owner-${key}.json`)]
+    .map((name) => `apps/worker/analytics-v2-test/golden/corpus/${name}`);
+  assert.deepEqual(binding.corpus.files.map(({ path }) => path), corpusPaths);
+  const corpus = [];
+  for (const entry of binding.corpus.files) {
+    await verifyCurrentFilePin(entry);
+    corpus.push(JSON.parse(await readFile(join(REPOSITORY_ROOT, entry.path), "utf8")));
+  }
+  assert.equal(jsonSha256(corpus), original.corpusSha256, "the immutable raw Q-1 corpus is independently bound");
+  const inputs = report.currentPostgresInputs;
+  assert.equal(inputs?.schemaVersion, "current-q1-postgres-input-binding-v1");
+  assert.deepEqual(inputs.controller, acceptance.controller);
+  assert.deepEqual(inputs.primary, (await readPostgresMigrations({ role: "primary" }))
+    .map(({ name, sha256 }) => ({ name, sha256 })));
+  assert.deepEqual(inputs.staged.map(({ name }) => name), staged);
+  for (const entry of inputs.staged) await verifyCurrentFilePin({
+    path: `apps/worker/postgres/staged-migrations/primary/${entry.name}`, sha256: entry.sha256 });
+  assert.deepEqual(inputs.bundles.map(({ path }) => path), ["analytics-refresh.mjs", "server.mjs"]
+    .map((name) => `apps/worker/cloud-run/dist/${name}`));
+  for (const entry of inputs.bundles) await verifyCurrentFilePin(entry);
+  assertCurrentImageRuntime(imageRuntime);
+  assert.deepEqual(inputs.node22, { version: imageRuntime.version, sha256: imageRuntime.binarySha256 },
+    "the original report preserves the independently verified pre-producer image runtime");
+  assert.deepEqual(await verifyCurrentImageRuntimePath(process.execPath), imageRuntime,
+    "the retained image runtime is unchanged from its pre-producer binding");
+}
+
+/** The same controller directly produces fresh D1 evidence before querying PG.
+ * It retains the image Node 22.16 for PG refresh and the origin. */
 async function seededRehearsal() {
-  const node = process.env.EDGE_E2E_REHEARSAL_NODE || "node";
-  // The report goes to a file: the rehearsal exits right after writing it,
-  // which can cut a piped stdout short on macOS.
+  const imageRuntime = CURRENT_Q1 ? await verifyCurrentImageRuntimePath(process.execPath) : null;
+  const { node, runtime } = await s9RehearsalNode();
   const directory = await mkdtemp(join(tmpdir(), "edge-e2e-rehearsal-"));
   const out = join(directory, "report.json");
-  // A line whose code needs a staged (not yet promoted) primary migration
-  // rehearses with it applied, as its specs do (K-STAMP's kernel stamps).
+  let discardDirectory = false;
+  let result = null;
   const staged = (await readdir(join(WORKER_ROOT, "postgres", "staged-migrations", "primary")).catch(() => []))
     .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name)).sort();
   try {
     await execFileAsync(node,
       [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
+        "--comparison-mode", S9_COMPARISON_MODE,
         ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
         ...staged.flatMap((name) => ["--staged-primary", name])], {
         cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: 40 * 60_000,
@@ -2313,9 +2461,42 @@ async function seededRehearsal() {
           ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
           ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}) },
       }).catch(() => undefined);
-    return JSON.parse(await readFile(out, "utf8"));
+    const report = JSON.parse(await readFile(out, "utf8"));
+    assert.ok(report && typeof report === "object" && !Array.isArray(report), "a controller report is required");
+    ownedKeptRehearsalSchemas(report);
+    let artifactsPreserved = true;
+    // Return the parsed report even when preservation fails so the caller can
+    // close this controller's exact kept schemas before failing the test.
+    const preserve = async (suffix, value) => {
+      try { await preserveS9Artifact(suffix, value); } catch { artifactsPreserved = false; }
+    };
+    await preserve("s9-rehearsal", report);
+    let evidence = null;
+    if (CURRENT_Q1) {
+      // Parse and preserve the producer's original sidecars before removing the
+      // owned directory. Missing evidence cannot acquire a passing receipt.
+      const values = await Promise.allSettled(["current-reference", "current-reference-binding", "current-reference-acceptance"]
+        .map(async (suffix) => {
+          const value = JSON.parse(await readFile(`${out}.${suffix}.json`, "utf8"));
+          await preserve(suffix, value);
+          return value;
+        }));
+      if (values.every(({ status }) => status === "fulfilled")) evidence = {
+        reference: values[0].value, binding: values[1].value, acceptance: values[2].value };
+    }
+    discardDirectory = artifactsPreserved && (!CURRENT_Q1 || evidence !== null);
+    result = { report, evidence, runtime, imageRuntime, staged, artifactsPreserved, temporaryOutputRemoved: false };
+    return result;
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    // Keep the sole private diagnostic bytes if ownership or any required
+    // sidecar is unreadable, or a requested wx preservation failed. Cleanup
+    // failure returns through S9's schema cleanup rather than skipping it.
+    if (discardDirectory) {
+      try {
+        await rm(directory, { recursive: true, force: true });
+        result.temporaryOutputRemoved = true;
+      } catch { /* The caller fails inside its exact schema cleanup boundary. */ }
+    }
   }
 }
 
@@ -2327,19 +2508,34 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
   const golden = JSON.parse(await readFile(join(GOLDEN, "community-daily-response.json"), "utf8"));
   const goldenPreview = JSON.parse(await readFile(join(GOLDEN, "preview.json"), "utf8"));
   const manifest = JSON.parse(await readFile(join(GOLDEN, "manifest.json"), "utf8"));
-  const rehearsal = await seededRehearsal();
-  const kept = Array.isArray(rehearsal.keptSchemas) ? rehearsal.keptSchemas : [];
+  const seeded = await seededRehearsal();
+  const rehearsal = seeded.report;
+  let kept = [];
   let origin = null;
   let instance = null;
   try {
+    kept = ownedKeptRehearsalSchemas(rehearsal);
+    assert.equal(seeded.artifactsPreserved, true, "requested evidence is preserved without overwriting an existing artifact");
+    assert.equal(seeded.temporaryOutputRemoved, true, "complete producer evidence was read and owned temporary output was removed");
     assert.notEqual(rehearsal.status, "error", JSON.stringify(rehearsal.error ?? null));
+    if (CURRENT_Q1) {
+      assert.equal(rehearsal.schemaVersion, "gcp-fastpath-current-rehearsal-report-v1");
+      assert.equal(rehearsal.comparisonMode, "current-worker-d1");
+      assert.equal(rehearsal.status, "pass", "all current producer, equality, input and idempotency gates passed");
+      for (const name of CURRENT_GATES) assert.equal(rehearsal.gates?.[name], true, name);
+      assert.ok(Object.values(rehearsal.gates).every((value) => value === true), "every retained gate passed");
+      assert.equal(rehearsal.historicalComparison?.qualifying, false);
+      assert.deepEqual(rehearsal.historicalComparison.parity, rehearsal.parity);
+      assert.deepEqual(rehearsal.historicalComparison.perDate, rehearsal.perDate);
+      await verifyCurrentS9Evidence({ ...seeded, report: rehearsal });
+    }
     assert.equal(rehearsal.steps.read.status, 200);
     assert.ok(rehearsal.parity?.families, "the rehearsal produced a parity table");
     // The rehearsal keeps its one primary schema and the importers' control
     // schema; there is no deletion-ledger schema (LEAD-SIMP).
     const [schema, controlSchema] = kept;
     assert.equal(kept.length, 2, JSON.stringify(kept));
-    assert.match(controlSchema, /^typed_legacy_transfer_rehearsal_ctl_[0-9a-f]{8}$/u);
+    assert.equal(controlSchema, `typed_legacy_transfer_rehearsal_ctl_${schema.slice(-8)}`);
     assert.equal(kept.some((name) => /ledger/u.test(name)), false, "no ledger schema is created");
     // What scripts/gcp-fastpath-test-deploy.mjs gives an edge-test origin over a
     // seeded schema: the golden's source (without it every typed route of the
@@ -2368,21 +2564,54 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.ok(answer.body.equals(direct.body), "the edge read equals a direct origin read byte for byte");
     const actualPreview = (await f.base.query(`SELECT preview FROM "${schema}".analytics_v2_preview WHERE id = 1`))
       .rows[0]?.preview ?? null;
-    // The rehearsal's own compare: the golden's withheld model dates, held to
-    // the per-date expectation when there is one.
+    const actual = JSON.parse(answer.text);
+    await preserveS9Artifact("s9-response", actual);
+    await preserveS9Artifact("s9-preview", actualPreview);
+    // Historical comparison remains byte-strict. Current qualification records
+    // its table separately and grants none of its historical waivers.
     const perDateExpected = PER_DATE_EXPECTED === null ? null
       : perDateExpectationFor(JSON.parse(await readFile(PER_DATE_EXPECTED, "utf8")), manifest);
-    const parity = compareAnalyticsV2Parity({ golden, actual: JSON.parse(answer.text), goldenPreview, actualPreview,
+    const parity = compareAnalyticsV2Parity({ golden, actual, goldenPreview, actualPreview,
       withheldModelDates: withheldModelDatesOf(manifest), perDateExpected });
     assert.deepEqual(familyTable(parity), familyTable(rehearsal.parity),
       "the edge read reproduces the rehearsal's parity table on this commit");
-    if (perDateExpected !== null) {
+    let currentContractParity = null;
+    if (CURRENT_Q1) {
+      // Conserve the immutable corpus independently of current D1 equality.
+      // Historical contract and cache differences retain their own diagnostics.
+      assert.ok(Array.isArray(golden.days) && golden.days.length > 0, "the immutable corpus contains daily evidence");
+      assert.deepEqual(parity.days, { golden: golden.days.length, actual: golden.days.length,
+        missingInActual: [], extraInActual: [] }, "every immutable corpus day is covered exactly");
+      for (const family of ["daily-days", "daily-totals", "daily-cells", "daily-other"]) {
+        const entries = parity.families.filter((entry) => entry.family === family);
+        assert.equal(entries.length, 1, `the immutable corpus has exactly one ${family} comparison`);
+        const expectedCount = family === "daily-days" ? 1 : golden.days.length;
+        assert.equal(entries[0].expected, false, `${family} has no historical difference waiver`);
+        assert.equal(entries[0].compared, expectedCount, `${family} compares the complete immutable corpus`);
+        assert.equal(entries[0].equal, expectedCount, `${family} conserves every compared value`);
+        assert.equal(entries[0].diffCount, 0, `the immutable corpus conserves ${family}`);
+      }
+      // Current equality includes refusals in the served response and preview.
+      // PG's internal run history remains separate diagnostic evidence.
+      currentContractParity = compareAnalyticsV2CurrentContract({ reference: seeded.evidence.reference,
+        referenceBinding: seeded.evidence.binding, referenceSha256: rehearsal.currentReference.sha256,
+        actual, actualPreview });
+      assert.deepEqual(familyTable(currentContractParity), familyTable(rehearsal.currentContractParity),
+        "the edge read reproduces the current Worker/D1 rehearsal table");
+      assert.equal(currentContractParity.equal, true, "the full current response and preview equal fresh D1");
+      assert.equal(currentContractParity.unexpectedDiffs, 0);
+    } else if (perDateExpected !== null) {
       assert.equal(parity.unexpectedDiffs, 0, "the edge read equals the golden and its per-date expectation");
     }
-    f.rows.push({ stage: "S9", id: "golden", bytes: answer.body.length,
+    f.rows.push({ stage: "S9", id: "golden", comparisonMode: S9_COMPARISON_MODE, bytes: answer.body.length,
       sha256: createHash("sha256").update(answer.body).digest("hex"), cacheControl: answer.header("cache-control"),
-      unexpectedDiffs: parity.unexpectedDiffs, unexpectedFamilies: parity.unexpectedFamilies,
-      families: familyTable(parity), rehearsalStatus: rehearsal.status });
+      unexpectedDiffs: (currentContractParity ?? parity).unexpectedDiffs,
+      unexpectedFamilies: (currentContractParity ?? parity).unexpectedFamilies,
+      families: familyTable(currentContractParity ?? parity), rehearsalStatus: rehearsal.status,
+      ...(CURRENT_Q1 ? { historicalComparison: { qualifying: false, families: familyTable(parity),
+        unexpectedDiffs: parity.unexpectedDiffs, unexpectedFamilies: parity.unexpectedFamilies },
+        currentContractParity: { ...currentContractParity, families: familyTable(currentContractParity) },
+        currentReference: rehearsal.currentReference } : {}) });
 
     // The live check's write tier, unchanged, through the same edge: accountless
     // enrollment, ownership and v1.2 authorization, then one shipped-client v1.2
@@ -2401,8 +2630,11 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
   } finally {
     await instance?.dispose().catch(() => {});
     await origin?.close().catch(() => {});
-    for (const name of [...kept].reverse()) {
-      if (/^[a-z_][a-z0-9_]{0,62}$/u.test(name)) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+    for (const name of [...kept].reverse()) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+    if (kept.length > 0) {
+      const remaining = await f.base.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1::text[]) ORDER BY nspname",
+        [kept]);
+      assert.deepEqual(remaining.rows, [], "the exact owned generated schemas are independently absent");
     }
   }
 });
@@ -2451,6 +2683,6 @@ test("S7 privacy over every exchange of the run; the gcp edge never touched stor
       transportRetries: f.transportRetries,
       rows: f.rows,
     };
-    await writeFile(resolve(process.env.EDGE_E2E_REPORT), `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(resolve(process.env.EDGE_E2E_REPORT), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx", mode: 0o600 });
   }
 });

@@ -23,7 +23,7 @@
 //     it on 127.0.0.1 from a child process under the same Node 22 (the
 //     image runtime);
 //  6. GETs /api/v1/community/daily?from=<golden from>&to=<golden to>;
-//  7. compares the response and the stored preview with the golden
+//  7. In the default historical mode, compares the response and stored preview with the golden
 //     (scripts/analytics-v2-parity-compare.mjs, publication fields only
 //     normalized) and reports every difference per family. The model dates
 //     the golden manifest lists as withheld (modelPublications.missing) may
@@ -39,7 +39,18 @@
 //  8. runs analytics-refresh again and checks it creates no new revision;
 //  9. drops every schema it created (unless --keep-schema).
 //
+// Current Q-1 mode directly invokes the source-pinned Worker/D1 helper on the
+// immutable synthetic corpus before any PG query. It requires the verified
+// Node 26.2.0 binary, full current response/preview/cache equality and all
+// importer/idempotency gates and immutable daily conservation; other historical
+// contract differences remain separate diagnostics.
+// --out preserves the original fresh reference, pre-execution input binding and
+// acceptance receipt with wx. The receipt is an audit trail, not cryptographic
+// execution attestation. No saved-reference or injected-producer CLI path exists.
+//
 // Options:
+//   --comparison-mode <mode>    historical (default) or current-worker-d1;
+//                               current mode accepts only immutable Q-1 inputs
 //   --golden <dir>              the oracle golden (required)
 //   --dump <usage-monitor-db.json>
 //                               the golden's source dump when the golden does not
@@ -99,12 +110,15 @@ import { chmod, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "
 import { createServer } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
 
 import {
+  ANALYTICS_V2_CURRENT_CONTRACT_REPORT_VERSION,
+  ANALYTICS_V2_PARITY_REPORT_VERSION,
+  compareAnalyticsV2CurrentContract,
   compareAnalyticsV2Parity,
   perDateExpectationFor,
   withheldModelDatesOf,
@@ -152,6 +166,7 @@ import {
 } from "./postgres-v12-transfer.mjs";
 
 export const GCP_FASTPATH_REHEARSAL_REPORT_VERSION = "gcp-fastpath-rehearsal-report-v1";
+export const GCP_FASTPATH_CURRENT_REHEARSAL_REPORT_VERSION = "gcp-fastpath-current-rehearsal-report-v1";
 
 const execFileAsync = promisify(execFile);
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -196,10 +211,38 @@ function fail(code, details) {
   throw new RehearsalError(code, details);
 }
 
+/** Current qualification always preserves its original producer evidence.
+ * This value-only guard must precede all filesystem or runtime operations. */
+export function currentRehearsalOutputDestinations(out) {
+  if (typeof out !== "string" || out.length === 0 || out.length > 4_096
+    || /[\u0000-\u001f\u007f]/u.test(out) || !isAbsolute(out)
+    || resolve(out) !== out || dirname(out) === out) {
+    fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--out" });
+  }
+  return [out, `${out}.current-reference.json`, `${out}.current-reference-binding.json`,
+    `${out}.current-reference-acceptance.json`];
+}
+
+/** Preflight only; wx remains mandatory at every eventual write to close races. */
+export async function assertCurrentRehearsalOutputsNew(out) {
+  const destinations = currentRehearsalOutputDestinations(out);
+  let parent;
+  try { parent = await lstat(dirname(out)); } catch { fail("REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE"); }
+  if (!parent.isDirectory() || parent.isSymbolicLink()) fail("REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE");
+  for (const [index, path] of destinations.entries()) {
+    let exists = false;
+    try { await lstat(path); exists = true; } catch (error) {
+      if (error?.code !== "ENOENT") fail("REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE", { destination: index });
+    }
+    if (exists) fail("REHEARSAL_CURRENT_OUTPUT_EXISTS", { destination: index });
+  }
+  return destinations;
+}
+
 export function parseArguments(argv) {
   const options = {
     golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
-    dump: null, perDateExpected: null, ownerReference: null, dense: false,
+    dump: null, perDateExpected: null, ownerReference: null, dense: false, comparisonMode: "historical",
     refreshTimeoutMinutes: DEFAULT_REFRESH_TIMEOUT_MINUTES, reuseSchema: null, stagedPrimary: [],
     refreshWorkers: 1, refreshModelBlockSize: 10, refreshModelFanOut: "auto", syntheticRevisionFloor: false,
   };
@@ -210,11 +253,19 @@ export function parseArguments(argv) {
     }
     return value;
   };
+  let comparisonModeSeen = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--golden") options.golden = valueOf(++index, argument);
     else if (argument === "--keep-schema") options.keepSchema = true;
     else if (argument === "--dense") options.dense = true;
+    else if (argument === "--comparison-mode") {
+      const mode = valueOf(++index, argument);
+      if (comparisonModeSeen || !["historical", "current-worker-d1"].includes(mode)) {
+        fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+      }
+      comparisonModeSeen = true; options.comparisonMode = mode;
+    }
     else if (argument === "--synthetic-revision-floor") options.syntheticRevisionFloor = true;
     else if (argument === "--out") options.out = valueOf(++index, argument);
     else if (argument === "--node22") options.node22 = valueOf(++index, argument);
@@ -254,6 +305,13 @@ export function parseArguments(argv) {
   for (const key of ["out", "dump", "perDateExpected", "ownerReference"]) {
     if (options[key] !== null) options[key] = resolve(options[key]);
   }
+  if (options.comparisonMode === "current-worker-d1" && options.reuseSchema !== null) {
+    fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--reuse-schema" });
+  }
+  if (options.comparisonMode === "current-worker-d1") currentRehearsalOutputDestinations(options.out);
+  if (options.comparisonMode === "current-worker-d1" && (options.dense || options.ownerReference !== null)) {
+    fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--comparison-mode" });
+  }
   if (options.dense) {
     // A dense golden carries its own per-date expectation and owner references.
     if (options.perDateExpected !== null || options.ownerReference !== null) {
@@ -275,10 +333,95 @@ export function parseArguments(argv) {
   return options;
 }
 
+/** Historical declarations remain confined to historical qualification.
+ * Current qualification requires the complete independently bound D1 result. */
+export function rehearsalComparisonGates({ comparisonMode, parity, currentContractParity,
+  hasAllowanceBreakdowns, perDate, producerAcceptance }) {
+  if (comparisonMode === "historical") return {
+    parityZeroUnexpected: parity?.unexpectedDiffs === 0,
+    ...(hasAllowanceBreakdowns ? { breakdownsV13Declared: parity?.breakdownsV13?.accepted === true } : {}),
+    ...(perDate === undefined ? {} : { perDateEqual: perDate.equal === true }),
+  };
+  if (comparisonMode !== "current-worker-d1") fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--comparison-mode" });
+  const bound = currentContractParity?.schemaVersion === ANALYTICS_V2_CURRENT_CONTRACT_REPORT_VERSION
+    && currentContractParity.comparisonMode === "current-worker-d1"
+    && currentContractParity.referenceBound === true && currentContractParity.referenceComplete === true;
+  const producerAccepted = producerAcceptance?.schemaVersion === "current-q1-d1-producer-acceptance-v1"
+    && producerAcceptance.accepted === true && producerAcceptance.actualHelperInvocation === true
+    && producerAcceptance.resultReturnedAfterOwnedCleanup === true && producerAcceptance.cryptographicExecutionAttestation === false;
+  // These immutable daily families predate the evolving allowance/catalog
+  // contracts. Equality between two current runtimes alone cannot conserve
+  // their corpus amounts. Missing families or incomplete comparisons fail.
+  const days = parity?.days;
+  const coverage = parity?.schemaVersion === ANALYTICS_V2_PARITY_REPORT_VERSION
+    && Number.isSafeInteger(days?.golden) && days.golden > 0 && days.actual === days.golden
+    && Array.isArray(days.missingInActual) && days.missingInActual.length === 0
+    && Array.isArray(days.extraInActual) && days.extraInActual.length === 0;
+  const conserved = coverage && Array.isArray(parity?.families)
+    && ["daily-days", "daily-totals", "daily-cells", "daily-other"].every((name) => {
+      const found = parity.families.filter((entry) => entry?.family === name);
+      const expected = name === "daily-days" ? 1 : days.golden;
+      return found.length === 1 && found[0].expected === false && found[0].diffCount === 0
+        && found[0].compared === expected && found[0].equal === expected;
+    });
+  return { currentWorkerD1ProducerAccepted: producerAccepted,
+    currentWorkerD1ReferenceComplete: producerAccepted && bound,
+    currentWorkerD1Equality: producerAccepted && bound && currentContractParity.equal === true && currentContractParity.unexpectedDiffs === 0,
+    immutableCorpusDailyConserved: conserved === true };
+}
+
 async function sha256OfFile(path) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest("hex");
+}
+
+/** Pin the actual PG runner inputs independently of its output. */
+async function currentPostgresInputBinding({ node22, node22Version, stagedPrimary }) {
+  if (node22Version !== "v22.16.0") fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
+  const imageRuntime = await verifyCurrentImageRuntimePath(node22);
+  const primary = (await readPostgresMigrations({ role: "primary" })).map(({ name, sha256 }) => ({ name, sha256 }));
+  const staged = [];
+  for (const name of [...stagedPrimary].sort()) staged.push({ name,
+    sha256: await sha256OfFile(join(WORKER_ROOT, "postgres", "staged-migrations", "primary", name)) });
+  const bundles = [];
+  for (const name of ["analytics-refresh.mjs", "server.mjs"]) bundles.push({
+    path: `apps/worker/cloud-run/dist/${name}`, sha256: await sha256OfFile(join(CLOUD_RUN_ROOT, "dist", name)) });
+  return { schemaVersion: "current-q1-postgres-input-binding-v1", primary, staged, bundles,
+    controller: { path: "apps/worker/scripts/gcp-fastpath-rehearsal.mjs", sha256: await sha256OfFile(fileURLToPath(import.meta.url)) },
+    node22: { version: imageRuntime.version, sha256: imageRuntime.binarySha256 } };
+}
+
+const CURRENT_IMAGE_NODE22_PINS = Object.freeze({
+  "darwin/arm64": "a45751fbfe88440bebff63cd44814e4ed6deb642bc3e3c4a14c4f8ae0ed9e019",
+  "linux/x64": "8142d37c6f2f372ef040419e7a111a6baf17df89f8078d02447d6c639ae20c1d",
+});
+
+export function assertCurrentImageRuntime({ version, platform, arch, binarySha256 }) {
+  const expected = CURRENT_IMAGE_NODE22_PINS[`${platform}/${arch}`];
+  if (version !== "v22.16.0" || typeof expected !== "string" || binarySha256 !== expected) {
+    fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
+  }
+}
+
+/** Hash only an explicit regular retained executable, before probing it. */
+export async function verifyCurrentImageRuntimePath(node) {
+  if (typeof node !== "string" || !isAbsolute(node) || resolve(node) !== node
+    || /[\u0000-\u001f\u007f]/u.test(node)) fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
+  let metadata;
+  try { metadata = await lstat(node); } catch { fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID"); }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 512 * 1024 * 1024) {
+    fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
+  }
+  const identity = { version: "v22.16.0", platform: process.platform, arch: process.arch,
+    binarySha256: await sha256OfFile(node) };
+  assertCurrentImageRuntime(identity);
+  const after = await lstat(node);
+  if (!after.isFile() || after.isSymbolicLink() || after.dev !== metadata.dev || after.ino !== metadata.ino
+    || after.size !== metadata.size || after.mtimeMs !== metadata.mtimeMs || after.ctimeMs !== metadata.ctimeMs) {
+    fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
+  }
+  return identity;
 }
 
 /**
@@ -810,17 +953,31 @@ async function spawnOrigin({ node, endpoint, schema, nowMs }) {
   };
 }
 
-async function main() {
-  if (process.argv.includes("--origin-child")) {
-    await originChild();
-    return;
+/** Direct controller callers retain the same fresh-import boundary as CLI.
+ * Refuse current schema reuse before any runtime, file, binding or PG access. */
+export async function runRehearsal(options) {
+  if (options.comparisonMode === "current-worker-d1" && options.reuseSchema !== null) {
+    fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--reuse-schema" });
   }
-  const options = parseArguments(process.argv.slice(2));
+  if (options.comparisonMode === "current-worker-d1") {
+    currentRehearsalOutputDestinations(options.out);
+    await assertCurrentRehearsalOutputsNew(options.out);
+  }
   const [major, minor] = process.versions.node.split(".").map(Number);
   if (major < 22 || (major === 22 && minor < 13)) fail("REHEARSAL_NODE_UNSUPPORTED");
-  if (!existsSync(options.node22)) fail("REHEARSAL_NODE22_MISSING");
-  const node22Version = (await execFileAsync(options.node22, ["--version"])).stdout.trim();
-  if (!/^v22\./u.test(node22Version)) fail("REHEARSAL_NODE22_MISSING");
+  let node22Version;
+  if (options.comparisonMode === "current-worker-d1") {
+    const retained = await verifyCurrentImageRuntimePath(options.node22);
+    node22Version = (await execFileAsync(options.node22, ["--version"])).stdout.trim();
+    if (node22Version !== retained.version
+      || JSON.stringify(await verifyCurrentImageRuntimePath(options.node22)) !== JSON.stringify(retained)) {
+      fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
+    }
+  } else {
+    if (!existsSync(options.node22)) fail("REHEARSAL_NODE22_MISSING");
+    node22Version = (await execFileAsync(options.node22, ["--version"])).stdout.trim();
+    if (!/^v22\./u.test(node22Version)) fail("REHEARSAL_NODE22_MISSING");
+  }
   for (const path of [DIST_REFRESH, DIST_SERVER]) if (!existsSync(path)) fail("REHEARSAL_DIST_MISSING", { path });
 
   const golden = JSON.parse(await readFile(join(options.golden, "community-daily-response.json"), "utf8"));
@@ -861,7 +1018,9 @@ async function main() {
   const created = [];
   const timings = {};
   const report = {
-    schemaVersion: GCP_FASTPATH_REHEARSAL_REPORT_VERSION,
+    schemaVersion: options.comparisonMode === "historical" ? GCP_FASTPATH_REHEARSAL_REPORT_VERSION
+      : GCP_FASTPATH_CURRENT_REHEARSAL_REPORT_VERSION,
+    ...(options.comparisonMode === "historical" ? {} : { comparisonMode: options.comparisonMode }),
     startedAt: new Date().toISOString(),
     node: { rehearsal: process.version, analyticsRefresh: node22Version },
     golden: { nowMs, now: nowIso, from: golden.from, to: golden.to, sourceCommit: manifest.sourceCommit,
@@ -878,7 +1037,50 @@ async function main() {
   pool.on("error", () => {});
   let origin = null;
   let workDirectory = null;
+  let currentReference = null, currentReferenceBinding = null, currentReferenceSha256 = null;
+  let currentReferenceCapture = null, currentPostgresInputs = null, currentProducerAcceptance = null;
   try {
+    if (options.comparisonMode === "current-worker-d1") {
+      // Capture the candidate's input closure before D1 execution, and before
+      // any PG read. The expected DTOs come solely from current Worker/D1.
+      const { captureCurrentQ1ReferenceBinding, runCurrentQ1D1Reference, validateCurrentQ1ReferenceBinding } =
+        await import("../postgres-test/fixtures/current-q1-d1-reference.mjs");
+      currentReferenceCapture = captureCurrentQ1ReferenceBinding;
+      currentPostgresInputs = await currentPostgresInputBinding({ node22: options.node22, node22Version,
+        stagedPrimary: options.stagedPrimary });
+      report.currentPostgresInputs = currentPostgresInputs;
+      currentReferenceBinding = await timed(timings, "current-d1:input-binding", captureCurrentQ1ReferenceBinding);
+      const window = currentReferenceBinding.corpusStructure.window;
+      if (golden.from !== window.fromDay || golden.to !== window.throughDay
+        || nowMs !== currentReferenceBinding.runtime.pinnedNowMs
+        || manifest.sourceCommit !== currentReferenceBinding.corpus.sourceCommit) fail("REHEARSAL_CURRENT_CORPUS_MISMATCH");
+      currentReference = await timed(timings, "current-d1:replay", runCurrentQ1D1Reference);
+      validateCurrentQ1ReferenceBinding({ reference: currentReference, expected: currentReferenceBinding });
+      currentReferenceSha256 = createHash("sha256").update(JSON.stringify(currentReference)).digest("hex");
+      const bindingSha256 = createHash("sha256").update(JSON.stringify(currentReferenceBinding)).digest("hex");
+      // This wx receipt preserves what this controller actually invoked and
+      // accepted before PG. It is an audit trail, not cryptographic execution
+      // attestation, and arbitrary saved receipts cannot enter this CLI path.
+      currentProducerAcceptance = Object.freeze({ schemaVersion: "current-q1-d1-producer-acceptance-v1",
+        evidenceScope: "direct-source-pinned-producer-controller", cryptographicExecutionAttestation: false,
+        actualHelperInvocation: true, resultReturnedAfterOwnedCleanup: true,
+        accepted: currentReference.qualification === "complete", referenceSha256: currentReferenceSha256, bindingSha256,
+        sourceHead: currentReferenceBinding.source.head, sourceSha256: currentReferenceBinding.source.sha256,
+        migrationSha256: currentReferenceBinding.migrationSha256, corpusSha256: currentReferenceBinding.corpus.canonicalSha256,
+        helper: currentReferenceBinding.source.files.find((entry) => entry.path === "apps/worker/postgres-test/fixtures/current-q1-d1-reference.mjs"),
+        controller: currentPostgresInputs.controller, runtime: currentReferenceBinding.runtime });
+      const acceptanceSha256 = createHash("sha256").update(JSON.stringify(currentProducerAcceptance)).digest("hex");
+      report.currentReference = { schemaVersion: currentReference.schemaVersion, qualification: currentReference.qualification,
+        sha256: currentReferenceSha256, bindingSha256, acceptanceSha256, source: { head: currentReferenceBinding.source.head,
+          sha256: currentReferenceBinding.source.sha256 }, migrationSha256: currentReferenceBinding.migrationSha256,
+        corpusSha256: currentReferenceBinding.corpus.canonicalSha256, runtime: currentReferenceBinding.runtime };
+      if (options.out !== null) {
+        await writeFile(`${options.out}.current-reference.json`, `${JSON.stringify(currentReference, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+        await writeFile(`${options.out}.current-reference-binding.json`, `${JSON.stringify(currentReferenceBinding, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+        await writeFile(`${options.out}.current-reference-acceptance.json`, `${JSON.stringify(currentProducerAcceptance, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+      }
+      if (currentReference.qualification !== "complete") fail("REHEARSAL_CURRENT_REFERENCE_INCOMPLETE");
+    }
     const version = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
     if (Math.floor(version.rows[0].version / 10_000) !== 17) fail("REHEARSAL_POSTGRES_17_REQUIRED");
 
@@ -911,6 +1113,10 @@ async function main() {
           ...(staged.length === 0 ? {} : { staged }),
         };
         if (primary.applied !== expected.length) fail("REHEARSAL_MIGRATION_INCOMPLETE");
+        if (currentPostgresInputs !== null && (JSON.stringify(primary.migrations.map(({ name, sha256 }) => ({ name, sha256 })))
+          !== JSON.stringify(currentPostgresInputs.primary) || JSON.stringify(staged) !== JSON.stringify(currentPostgresInputs.staged))) {
+          fail("REHEARSAL_CURRENT_MIGRATION_BINDING_CHANGED");
+        }
       });
 
       // 2. The sealed SQLite rebuild of the oracle's USAGE_MONITOR_DB dump.
@@ -995,6 +1201,14 @@ async function main() {
       }));
     }
 
+    if (options.comparisonMode === "current-worker-d1") {
+      report.historicalComparison = { qualifying: false, parity: report.parity,
+        ...(report.perDate === undefined ? {} : { perDate: report.perDate }) };
+      report.currentContractParity = await timed(timings, "current-contract-parity", async () =>
+        compareAnalyticsV2CurrentContract({ reference: currentReference, referenceBinding: currentReferenceBinding,
+          referenceSha256: currentReferenceSha256, actual, actualPreview }));
+    }
+
     // 8. A second run at the same clock must create no revision.
     const second = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
       timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers,
@@ -1013,17 +1227,31 @@ async function main() {
       newRevisions: changed.length,
       maxRevision: afterSecond.reduce((max, row) => Math.max(max, row.revision), 0),
     };
+    // Internal PG kernel run/refusal history is a distinct diagnostic. Current
+    // equality covers refusal fields in the served DTOs; sparse D1 native
+    // probe evidence is not a matching PG kernel refusal protocol.
     report.runs = await refusalSummary(pool, schema);
+    if (currentReferenceCapture !== null) {
+      const { validateCurrentQ1ReferenceBinding } = await import("../postgres-test/fixtures/current-q1-d1-reference.mjs");
+      const after = await currentReferenceCapture();
+      validateCurrentQ1ReferenceBinding({ reference: currentReference, expected: after });
+      if (JSON.stringify(after) !== JSON.stringify(currentReferenceBinding)
+        || JSON.stringify(await currentPostgresInputBinding({ node22: options.node22, node22Version,
+          stagedPrimary: options.stagedPrimary })) !== JSON.stringify(currentPostgresInputs)) {
+        fail("REHEARSAL_CURRENT_CANDIDATE_INPUTS_CHANGED");
+      }
+      report.currentCandidateInputsUnchanged = true;
+    }
 
     report.gates = {
       importersCompleted: true,
       refreshFirstComplete: first.exitCode === 0,
       readStatus200: response.status === 200,
       secondRunZeroNewRevisions: second.exitCode === 0 && second.receipt?.state === "complete" && changed.length === 0,
-      parityZeroUnexpected: report.parity.unexpectedDiffs === 0,
-      ...(actual.allowanceBreakdowns === undefined ? {}
-        : { breakdownsV13Declared: report.parity.breakdownsV13.accepted === true }),
-      ...(report.perDate === undefined ? {} : { perDateEqual: report.perDate.equal === true }),
+      ...(options.comparisonMode === "historical" ? {} : { currentCandidateInputsUnchanged: report.currentCandidateInputsUnchanged === true }),
+      ...rehearsalComparisonGates({ comparisonMode: options.comparisonMode, parity: report.parity,
+        currentContractParity: report.currentContractParity, hasAllowanceBreakdowns: actual.allowanceBreakdowns !== undefined,
+        perDate: report.perDate, producerAcceptance: currentProducerAcceptance }),
       ...(report.ownerParity === undefined ? {} : { ownerParityZeroUnexpected: report.ownerParity.unexpectedDiffs === 0 }),
       ...(syntheticFloor === null ? {} : { revisionFloorRespected: report.steps.revisionFloor.offFloorDays === 0
         && report.steps.revisionFloor.flooredDays > 0 && report.steps.revisionFloor.receipt?.present === true }),
@@ -1033,6 +1261,7 @@ async function main() {
     report.status = "error";
     report.error = {
       code: typeof error?.code === "string" ? error.code : "REHEARSAL_FAILED",
+      ...(options.comparisonMode === "current-worker-d1" && error?.diagnostic ? { diagnostic: error.diagnostic } : {}),
       ...(error instanceof RehearsalError ? { details: error.details } : {}),
       ...(error?.details && !(error instanceof RehearsalError) ? { details: error.details } : {}),
       ...Object.fromEntries(["table", "column", "sqlState", "field"].filter((key) =>
@@ -1060,10 +1289,24 @@ async function main() {
     report.finishedAt = new Date().toISOString();
   }
   const text = `${JSON.stringify(report, null, 2)}\n`;
-  process.stdout.write(text);
-  if (options.out !== null) await writeFile(options.out, text, { flag: "wx" });
+  if (options.comparisonMode === "current-worker-d1") {
+    // Do not emit a qualifying report until the final wx report is preserved.
+    await writeFile(options.out, text, { flag: "wx", mode: 0o600 });
+    process.stdout.write(text);
+  } else {
+    process.stdout.write(text);
+    if (options.out !== null) await writeFile(options.out, text, { flag: "wx" });
+  }
   process.exitCode = report.status === "pass" ? 0 : report.status === "gate_failed" ? 1 : 2;
   process.exit(process.exitCode);
+}
+
+async function main() {
+  if (process.argv.includes("--origin-child")) {
+    await originChild();
+    return;
+  }
+  await runRehearsal(parseArguments(process.argv.slice(2)));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
