@@ -412,7 +412,7 @@ minimums.
 | --- | --- | --- | --- | --- |
 | `…2026-09-21.1` | 0.1.24–0.1.26 | no `ultrafast` | `performance-histogram-v1` | accepted |
 | `…2026-09-29.1` | 0.1.27 onward | adds `ultrafast` | `performance-histogram-v1` | accepted |
-| `…2026-10-10.1` | none yet | same as `…09-29.1` | `performance-histogram-v2` | accepted (server first) |
+| `…2026-10-10.1` | none (no client release planned, 2026-10-12) | same as `…09-29.1` | `performance-histogram-v2` | accepted, unused |
 
 Each older dictionary is a strict vocabulary subset of the latest, and the
 reviewed model catalog only grows, so the reader adapter is an identity map
@@ -469,13 +469,13 @@ records the contracts.
 | Independent capability and grant | Built: accountless grant v1 and v2, per-device dictionary resolution (`v12_parser_inference`, `default_no_manifest`, `client_declared`) and an exact-echo capability. The signed-in consent route stays retired |
 | Encrypted delivery and typed storage | Built: primary migration `0079` with append-only reports, cohorts, buckets and receipts, an immutable dictionary registry and composite dictionary/scheme keys |
 | Idempotent per-device revisions | Built: replay writes no receipt; replacements supersede; a replacement may change dictionary; content conflicts and lower revisions answer 409 |
-| All released dictionaries | Built: `…2026-09-21.1`, `…2026-09-29.1` and `…2026-10-10.1` admitted; a dictionary that differs from the capability answers 403 |
+| All accepted dictionaries | Built: `…2026-09-21.1`, `…2026-09-29.1` and `…2026-10-10.1` admitted; a dictionary that differs from the capability answers 403 |
 | Owner activation | Built: owner-only `run_maintenance` task in one transaction with its own audit row; no UI control. Not run against a live project |
 | Erasure | Offline owner purge only (append-only decision): participant rows cascade; publication heads are recomputed by the next refresh. No online deletion |
 | Hosted publication | Built: analytics-refresh performance stage, twelve `community-model-performance-v1` slots, the public read route and the deferred-empty first publication. No slot published |
 | Admin visibility and probes | Built: read-only `admin-performance-intake-v0.1` route and two runtime-probe gauges. The admin UI section ships from the edge-port line |
 | Restore | Follows the database restore path in [GCP brake and incidents](../runbooks/gcp-brake-and-incidents.md#database-or-data-loss), whose real-recovery tooling is not built; the do-not-restore list applies to performance rows with the rest of a participant's data |
-| Installed-client and deployed-service qualification | Open: needs the rollout, the owner activation and client 0.1.29 |
+| Installed-client and deployed-service qualification | Open: needs the rollout and the owner activation, then reports from released clients 0.1.24–0.1.28. No client release is planned ([no new client amendment](../decisions/2026-10-10-community-model-speed.md#no-new-client-amendment-2026-10-12)) |
 
 ## Qualification checkpoint — 2026-09-20
 
