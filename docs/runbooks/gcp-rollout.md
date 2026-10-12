@@ -366,6 +366,117 @@ The first production rollout pre-stages the origin (checklist PROD-3):
    passing after one lifecycle pass (run in process, not through the job);
    no project has run the roll's pass.
 
+## Migration 0079 (community model speed)
+
+This section adds the steps specific to the community model speed rollout to
+the general [sequence](#sequence). It follows the owner decisions of
+2026-10-10 ([community model speed](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)),
+including decision 10: nothing here starts until the v1.2 activation-timeout
+fix is live and verified. Every step marked `owner` is a protected operation
+that needs its own authorization. The migration number is provisional: the
+integrator renumbers `0079_performance_telemetry.sql`, with its pin set, if the
+live primary head already holds 0079 or higher, and the steps below then apply
+to the new number.
+
+What the migration does to the rollout:
+
+- **Expand-only.** Every relation and function is new, so the migrate step's
+  classifier finds no contract operation and `CONTRACT_MIGRATIONS` gains no
+  entry. The previous revision issues no SQL against the new tables.
+- **Locks.** The new foreign keys take `SHARE ROW EXCLUSIVE` on
+  `participants`, `device_credentials`, `accountless_enrollment_ledger` and
+  `analytics_v2_kernels` for the migration transaction, within the runner's
+  5-second lock timeout. Apply it with every trigger paused and no execution
+  running, as `migrate` already requires (`ROLLOUT_JOBS_NOT_PAUSED`,
+  `ROLLOUT_JOBS_RUNNING`). A lock timeout rolls the migration back; rerun it.
+- **Exact-receipt write outage.** From the first applied statement until
+  `roll` moves the service, the previous revision's receipt no longer matches
+  its manifest, so it answers its storage-gated routes with
+  `503 BACKEND_STORAGE_UNAVAILABLE` ([the accepted write outage](#the-accepted-write-outage)).
+  That includes every upload route, not only performance. Run `roll`
+  immediately.
+- **Edge mode.** The production hostnames reach this origin only while the
+  live edge is in `gcp` mode. In `worker` mode the Worker answers every
+  request in steps 5, 7 and 8 itself, and in `fenced` mode they answer
+  `503 MUTATION_BARRIER_ACTIVE`, so those checks and the activation wait for
+  `gcp` mode.
+
+Owner order, after the general preconditions:
+
+1. **Kernel registry order.** `owner`. The live registry must already hold
+   the v1.2 activation-timeout kernel (kernel 15 in the live order), and kernel
+   16 if it lands first. The performance stage's kernel entry is appended
+   after them as `max(live) + 1` at integration, and the owner adds only that
+   final `REGISTRY_PINS` line. `node cloud-run/build.mjs --check` must resolve
+   the commit's closure to that entry before the build
+   (`CLOUD_RUN_BUILD_KERNEL_UNREGISTERED` otherwise).
+2. **Build, migrate and roll** the integration commit through steps 4 to 9 of
+   the [sequence](#sequence). `owner`. Keep the migrate receipt: its
+   `migrations.historySha256` is the deployment digest the activation request
+   names.
+3. **Reprice under the new kernel**, immediately after the roll. `owner`. Run
+   the analytics reprice Job in plan mode, review the plan, then execute it
+   with the reviewed plan digest
+   ([historical spend repricing](./2026-10-09-historical-spend-repricing.md)).
+   Price equivalences stamped by the previous kernel stay hidden until this
+   run completes under the new one. Resume the triggers under steps 10 and 11
+   of the sequence; the maintenance trigger must resume within the 2-hour
+   readiness window that step 9 describes.
+4. **Monitoring policy apply.** `owner`. The rendered policies changed: the
+   performance capability and report paths joined the paths never excluded
+   from the origin 5xx ratio, and the retired consent route is the only
+   performance path still excluded. The public model-performance and admin
+   intake routes are counted like every other route that is not excluded.
+   Re-plan and apply under a fresh plan digest
+   ([monitoring](../../apps/worker/cloud-run/infra/monitoring.md#protected-monitoring-apply)).
+5. **Read-only checks before the edge deploy.** While the runtime is staged,
+   only the paths the live edge already forwards can be checked:
+   - `/api/ready` reads `ready`;
+   - authenticated grants, capability polls and report uploads from installed
+     clients answer `403 TELEMETRY_TRANSPORT_BLOCKED`, never a 5xx.
+
+   Do not expect the admin view or the public read yet. The live edge's route
+   registry has neither new path, so until step 6 it answers both itself with
+   `404 NOT_FOUND` and never forwards them to the origin.
+6. **Edge changed-site deploy** from the edge-port line: the two new routes,
+   the admin section and the website reader
+   ([production edge modes](./production-edge-modes.md#community-model-speed-routes-2026-10-10)).
+   `owner`. The intake routes need no edge change. This deploy may also run
+   before step 2, because a new edge forwards both new paths to an origin that
+   answers them with its own 404 until the roll. Steps 7 and 8 need both the
+   roll and this deploy.
+7. **Read-only verification through the edge.** While the runtime is staged:
+   - `GET /api/v1/admin/performance-intake` on the admin host answers 200 with
+     runtime `staged` at revision 1, the rolled `sourceCommit`, and a
+     `historySha256` equal to the migrate receipt's;
+   - every `GET /api/v1/community/model-performance` slot answers
+     `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED` with `no-store`;
+   - the step 5 refusals show up as refusal counters in the admin view.
+8. **Owner activation**, only through
+   [the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation),
+   and only after step 7 passes. `owner`. There is no admin UI control.
+9. **First reports and publication.** Reports arrive as clients restart and
+   re-grant. The first publication comes at the next analytics refresh after a
+   report with an included record exists.
+10. **Client 0.1.29**, which emits `…2026-10-10.1` and sends grant v2, ships
+    only after steps 2 to 8. `owner`.
+
+During the staged window, each refused capability poll upserts one refusal
+counter row. Local measurement at concurrency 24 and 64 on the production pool
+sizes counted every refusal, with refused polls at about twice read latency
+(p50 35–99 ms). Only a locked or unavailable counter table adds up to 1 second
+of tail latency per refusal. This is not a probe signal and needs no brake.
+
+### Refresh with future-dated v1.2 events (under diagnosis)
+
+> **Placeholder.** A separate diagnosis is running. In the local end-to-end
+> suite, the deployable analytics refresh failed with
+> `ANALYTICS_V2_SOURCE_UNAVAILABLE` in its read phase after a test wrote v1.2
+> events stamped later than the run's instant. The cause and its production
+> exposure are not established. The orchestrator fills in this subsection at
+> integration. Until then, treat a refresh that fails this way after a v1.2
+> activation as an incident, not as an expected outcome of this rollout.
+
 ## Open gaps
 
 | Gap | State |
@@ -379,6 +490,7 @@ The first production rollout pre-stages the origin (checklist PROD-3):
 | Maintenance job in the rollout target | `built` (D-OPS4). The production target's jobs are the migration job, the refresh job and the maintenance job, and the staging target omits the maintenance job until its staging template exists. Not applied or rolled in any project |
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
 | Staging migrate-and-roll proof, with its live sub-checks | Open (see [staging proof](#staging-proof)) |
+| Migration 0079 rollout | Source and local PostgreSQL proof only. Not built, migrated, rolled or activated in any project; the refresh diagnosis above is open |
 
 ## Evidence boundary
 

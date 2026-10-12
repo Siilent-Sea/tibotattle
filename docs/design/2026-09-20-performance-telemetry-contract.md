@@ -456,6 +456,27 @@ keeps its bucket scheme, so it still validates and digests only under that
 source dictionary. An older dictionary's `other` can include modes it did not
 know, so `other` is never compared across source dictionaries.
 
+## Google Cloud origin status
+
+The Google Cloud origin line carries the hosted side of gates 3 to 5 in source.
+Each row is source with local PostgreSQL 17 or composed-host proof only. None
+is migrated, deployed, activated or published, and the
+[community model speed decision](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)
+records the contracts.
+
+| Requirement | GCP-line source status |
+| --- | --- |
+| Independent capability and grant | Built: accountless grant v1 and v2, per-device dictionary resolution (`v12_parser_inference`, `default_no_manifest`, `client_declared`) and an exact-echo capability. The signed-in consent route stays retired |
+| Encrypted delivery and typed storage | Built: primary migration `0079` with append-only reports, cohorts, buckets and receipts, an immutable dictionary registry and composite dictionary/scheme keys |
+| Idempotent per-device revisions | Built: replay writes no receipt; replacements supersede; a replacement may change dictionary; content conflicts and lower revisions answer 409 |
+| All released dictionaries | Built: `…2026-09-21.1`, `…2026-09-29.1` and `…2026-10-10.1` admitted; a dictionary that differs from the capability answers 403 |
+| Owner activation | Built: owner-only `run_maintenance` task in one transaction with its own audit row; no UI control. Not run against a live project |
+| Erasure | Offline owner purge only (append-only decision): participant rows cascade; publication heads are recomputed by the next refresh. No online deletion |
+| Hosted publication | Built: analytics-refresh performance stage, twelve `community-model-performance-v1` slots, the public read route and the deferred-empty first publication. No slot published |
+| Admin visibility and probes | Built: read-only `admin-performance-intake-v0.1` route and two runtime-probe gauges. The admin UI section ships from the edge-port line |
+| Restore | Follows the database restore path in [GCP brake and incidents](../runbooks/gcp-brake-and-incidents.md#database-or-data-loss), whose real-recovery tooling is not built; the do-not-restore list applies to performance rows with the rest of a participant's data |
+| Installed-client and deployed-service qualification | Open: needs the rollout, the owner activation and client 0.1.29 |
+
 ## Qualification checkpoint — 2026-09-20
 
 All new measurement fixtures are synthetic and content-free. No upload,
