@@ -9,7 +9,7 @@ import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/
 import { currentTelemetryV1Chunk } from "../src/telemetry-v1-repository";
 import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../src/telemetry-v1";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-compatibility";
-import { readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage } from "../src/telemetry-usage-effective-reader";
+import { readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
 
 interface Bindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -49,9 +49,10 @@ async function makeInsert(
   eventIds: readonly string[],
   totals: boolean,
   supersedes: Awaited<ReturnType<typeof currentTelemetryV1Chunk>> = null,
+  recordDay = day,
 ) {
   const records = eventIds.map((eventId, index) => {
-    const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(day, "a", {
+    const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(recordDay, "a", {
       eventId,
       totalInputContextTokens: totals ? 150 : null,
       components: {
@@ -64,14 +65,14 @@ async function makeInsert(
     if (!projected) throw new Error("synthetic effective projection missing");
     return JSON.parse(projected.canonicalRecord) as TelemetryV1UsageEvent;
   });
-  const envelopeDigest = await sha256Hex(`synthetic-effective-reader-envelope:${revision}`);
+  const envelopeDigest = await sha256Hex(`synthetic-effective-reader-envelope:${fixture.deviceId}:${recordDay}:${revision}`);
   const principal = await authenticateDevice(db(), fixture.authorization);
   const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 1000);
   const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
     envelopeDigest, bodyBytes: 1000, contentType: "application/json",
   });
   const chunk = parseTelemetryV1Chunk({
-    schemaVersion: "telemetry-contribution-v1.0", chunkId: `usage:${day}:0`, chunkRevision: revision,
+    schemaVersion: "telemetry-contribution-v1.0", chunkId: `usage:${recordDay}:0`, chunkRevision: revision,
     chunkDigest: await sha256Hex(canonicalTelemetryV11Json(records)), parserVersion: "synthetic-effective-reader-v1",
     consent: {
       telemetrySchemaVersion: "telemetry-contribution-v1.0",
@@ -114,6 +115,38 @@ function countSemanticVariantQueries(database: D1Database): { database: D1Databa
     },
   });
   return { database: wrapped, count: () => queries };
+}
+
+function captureCandidateStatement(database: D1Database): {
+  database: D1Database;
+  candidate: () => { sql: string; values: (string | number | null | ArrayBuffer)[] } | null;
+} {
+  let captured: { sql: string; values: (string | number | null | ArrayBuffer)[] } | null = null;
+  const wrapped = new Proxy(database, {
+    get(target, property, receiver) {
+      if (property === "prepare") {
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.includes("v1_scoped_records AS MATERIALIZED")) return statement;
+          return new Proxy(statement, {
+            get(statementTarget, statementProperty, statementReceiver) {
+              if (statementProperty === "bind") {
+                return (...values: (string | number | null | ArrayBuffer)[]) => {
+                  captured = { sql, values };
+                  return statementTarget.bind(...values);
+                };
+              }
+              const value = Reflect.get(statementTarget, statementProperty, statementReceiver);
+              return typeof value === "function" ? value.bind(statementTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { database: wrapped, candidate: () => captured };
 }
 
 describe("effective mixed v1 usage reader", () => {
@@ -181,8 +214,83 @@ describe("effective mixed v1 usage reader", () => {
     expect(secondPage.rows.map((row) => row.occurrenceId)).toEqual([eventIds[2]]);
     expect(secondPage.next).toBeNull();
   });
-});
 
+  it("uses the indexed stored-day fence and still expands a cross-day occurrence conflict", async () => {
+    const nextDay = "2026-09-21";
+    const shared = `event:v2:${"a".repeat(64)}`;
+    const dayOneOnly = `event:v2:${"b".repeat(64)}`;
+    const dayTwoOnly = `event:v2:${"c".repeat(64)}`;
+    const firstDevice = await createV11DeviceFixture(db());
+    const first = await makeInsert(firstDevice, 1, [shared, dayOneOnly], true);
+    await insertTypedTelemetryV1Chunk(db(), first, sourceNamespace);
+    const secondDevice = await createV11DeviceFixture(db(), { participantId: firstDevice.participantId });
+    const second = await makeInsert(secondDevice, 1, [shared, dayTwoOnly], true, null, nextDay);
+    await insertTypedTelemetryV1Chunk(db(), second, sourceNamespace);
+
+    const firstSource = await db().prepare(`SELECT storage_row_id FROM typed_telemetry_compatibility_records
+      WHERE participant_id=? AND device_id=? AND format_code=10 AND occurrence_id=? LIMIT 2`)
+      .bind(firstDevice.participantId, firstDevice.deviceId, shared).first<{ storage_row_id: number }>();
+    if (!firstSource) throw new Error("synthetic cross-day typed source missing");
+    const immutableTrigger = await db().prepare(`SELECT sql FROM sqlite_master
+      WHERE type='trigger' AND name='typed_telemetry_record_immutable'`).first<{ sql: string }>();
+    if (!immutableTrigger) throw new Error("typed evidence immutability trigger missing");
+    await db().prepare("DROP TRIGGER typed_telemetry_record_immutable").run();
+    try {
+      await db().prepare("UPDATE typed_telemetry_records SET observed_day=? WHERE id=?")
+        .bind(Date.parse(`${nextDay}T00:00:00.000Z`) / 86_400_000, firstSource.storage_row_id).run();
+    } finally {
+      await db().prepare(immutableTrigger.sql).run();
+    }
+
+    const owner = await ownerFor(firstDevice.participantId);
+    const captured = captureCandidateStatement(db());
+    const page = await readEffectiveUsageOwnerDayPage(captured.database, {
+      sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+      authorityEpoch: owner.authority_epoch, day: nextDay, limit: 200,
+    });
+    expect(page.rows.map((row) => row.occurrenceId)).toEqual([shared, dayTwoOnly]);
+    expect(page.rows[0]).toMatchObject({ status: "base_conflict", eventTime: null,
+      eventTimeConflict: true, sourceCount: 2 });
+    expect(page.rows[1]).toMatchObject({ status: "compatible", eventTimeConflict: false, sourceCount: 1 });
+
+    const query = captured.candidate();
+    if (!query) throw new Error("indexed physical candidate query was not captured");
+    const plan = (await db().prepare(`EXPLAIN QUERY PLAN ${query.sql}`).bind(...query.values)
+      .all<{ detail: string }>()).results.map((row) => row.detail).join("\n");
+    expect(plan).toMatch(/SEARCH physical_record USING (?:COVERING )?INDEX typed_telemetry_day \([^)]*observed_day>\?[^)]*observed_day<\?/u);
+
+    expect(await readEffectiveTelemetryOwnerDays(db(), {
+      sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+      authorityEpoch: owner.authority_epoch, stream: "usage", fromDay: day, throughDay: nextDay,
+    })).toEqual([day, nextDay]);
+  });
+
+  it("preserves pre-compact v11 reader refusal", async () => {
+    await reset();
+    await applyD1Migrations(db(), bindings.TEST_MIGRATIONS);
+    await applyD1Migrations(db(), bindings.TEST_TYPED_INGESTION_MIGRATIONS);
+    await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await applyD1Migrations(db(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS
+      .filter((migration) => !/^0006_compact_admission_proofs\.sql$/u.test(migration.name)));
+    await applyD1Migrations(db(), bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS
+      .filter((migration) => !/^(0008|0010|0011|0012|0013|0014|0015)_/u.test(migration.name)));
+    await initializeStorageSource(db(), "synthetic-effective-usage-reader-legacy-layout");
+    await initializeTypedV1Admission(db(), sourceNamespace);
+
+    const fixture = await createV11DeviceFixture(db());
+    await insertTypedTelemetryV1Chunk(db(), await makeInsert(fixture, 1,
+      [`event:v2:${"d".repeat(64)}`], true), sourceNamespace);
+    const owner = await ownerFor(fixture.participantId);
+    const options = { sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+      authorityEpoch: owner.authority_epoch, day, limit: 200 };
+    // The baseline reader already statically joins compact manifest membership,
+    // so this schema has always been unavailable; the proof-count optimization
+    // must not introduce a legacy fallback or a new pre-compact contract.
+    await expect(readEffectiveUsageOwnerDayPage(db(), options))
+      .rejects.toMatchObject({ code: "EFFECTIVE_USAGE_UNAVAILABLE" });
+  });
+});
 
 it('pages a dense correction archive without materializing the whole day',async()=>{
  const fixture=await createV11DeviceFixture(db());
