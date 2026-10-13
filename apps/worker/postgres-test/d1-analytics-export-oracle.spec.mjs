@@ -2,10 +2,20 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmod, copyFile, lstat, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, it, vi } from "vitest";
+import { build } from "esbuild";
+import { canonicalTelemetryV11Json } from "@app-usagemonitor/telemetry-contract";
+import { createV11DeviceFixture, v11UsageRecord } from "../test/helpers/telemetry-v11.ts";
+import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth.ts";
+import { insertTypedTelemetryV1Chunk } from "../src/typed-v1-admission.ts";
+import { telemetryV11LegacyProjection } from "../src/telemetry-v11-compatibility.ts";
+import { parseTelemetryV1Chunk } from "../src/telemetry-v1.ts";
+import { advanceStorageAnalytics } from "../src/storage-analytics-runtime.ts";
+import { advanceStorageCommunityDaily } from "../src/storage-community-daily.ts";
+import { readEffectiveTelemetryOwnerDayPage } from "../src/telemetry-usage-effective-reader.ts";
 import { buildD1AnalyticsExportFixture } from "./fixtures/d1-analytics-export-fixture.mjs";
 import { openSealedSqliteD1 } from "../cloud-run/sealed-sqlite-d1-adapter.mjs";
 import { runD1AnalyticsExportOracleCli } from "../cloud-run/d1-analytics-export-oracle.mjs";
@@ -141,6 +151,24 @@ function headRow(analytics, day) {
   return analytics.prepare(`SELECT p.revision,p.payload_json,p.authority_json FROM analytics_community_daily_heads h
     JOIN analytics_community_daily_publications p ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision
     WHERE h.day=?`).get(day);
+}
+
+async function loadFrozenGraphDayProjectionKernel() {
+  const sourcePath = fileURLToPath(new URL("../vendor/analytics-d43c8f92/apps/worker/src/graph-day-projection.ts", import.meta.url));
+  const tsconfigPath = fileURLToPath(new URL("../vendor/analytics-d43c8f92/tsconfig.json", import.meta.url));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-frozen-graph-day-kernel-")));
+  await chmod(directory, 0o700);
+  const outfile = join(directory, "kernel.mjs");
+  try {
+    await build({ stdin: { contents: await readFile(sourcePath, "utf8"), resolveDir: dirname(sourcePath),
+      sourcefile: sourcePath, loader: "ts" }, outfile, mainFields: ["module", "main"], bundle: true,
+      platform: "node", format: "esm", target: "node22", logLevel: "silent", tsconfig: tsconfigPath });
+    const module = await import(pathToFileURL(outfile).href);
+    return { module, close: () => rm(directory, { recursive: true, force: true }) };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 beforeAll(async () => {
@@ -616,6 +644,218 @@ describe("D1 export oracle over synthetic sealed exports", () => {
     assert.equal(await lstat(out).catch(() => null), null);
     assert.equal(await lstat(`${out}.sha256`).catch(() => null), null);
     assert.deepEqual((await readdir(root)).filter((name) => name.includes("partial")), []);
+  }, RUN_TIMEOUT_MS);
+
+  it("retires a frozen effective graph only after the current daily identity advances", async () => {
+    const paths = await scratch("effective-graph-identity");
+    const db = open(paths);
+    const originalFixtureHashes = await Promise.all(Object.values(fixture.paths).map(fileSha256));
+    let frozen;
+    try {
+      frozen = await loadFrozenGraphDayProjectionKernel();
+      const kernel = frozen.module;
+      assert.equal(typeof kernel.retireGraphDayProjectionPage, "function");
+      assert.equal(typeof kernel.writeGraphDayProjection, "function");
+      assert.equal(typeof kernel.readGraphDayProjection, "function");
+      assert.equal(typeof kernel.reduceGraphDayProjection, "function");
+      assert.equal(kernel.GRAPH_DAY_EFFECTIVE_DEVICE_ID, "effective-owner");
+      assert.equal(kernel.GRAPH_DAY_EFFECTIVE_MANIFEST_ID, "effective-owner-day");
+
+      // Activate correction admission only on this private scratch copy so
+      // the current daily producer writes its complete effective-source identity.
+      await db.ingestion.prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+      const owners = await readStorageCommunityOwnerPage(db.ingestion);
+      const effectiveOwners = owners.filter((owner) => owner.hasEffective === true && owner.ownerDigest !== null);
+      let selected = null;
+      for (const day of [fixture.days.yesterday, fixture.days.twoDaysAgo]) {
+        for (const owner of effectiveOwners) {
+          if (!owner.hasV1) continue;
+          const hasUsage = await db.ingestion.prepare("SELECT 1 AS present FROM telemetry_v1_chunks WHERE participant_id=? AND stream='usage' AND chunk_day=? AND superseded_at IS NULL AND accepted_record_count>0 LIMIT 1")
+            .bind(owner.participantId, day).first();
+          if (!hasUsage) continue;
+
+          let compatible = true;
+          for (const candidateOwner of effectiveOwners) {
+            for (const stream of ["usage", "quota", "session"]) {
+              const page = await readEffectiveTelemetryOwnerDayPage(db.ingestion, {
+                sourceNamespace: fixture.sourceNamespace, ownerDigest: candidateOwner.ownerDigest,
+                ownerRevision: candidateOwner.ownerRevision, authorityEpoch: candidateOwner.authorityEpoch,
+                day, stream, limit: 50,
+              });
+              if (page.next !== null || page.rows.some((row) => row.status !== "compatible" || row.recordJson === null)) {
+                compatible = false;
+                break;
+              }
+            }
+            if (!compatible) break;
+          }
+          if (compatible) {
+            selected = { day, owner };
+            break;
+          }
+        }
+        if (selected) break;
+      }
+      assert.ok(selected, "the scratch export has a recent, conflict-free v1 owner day");
+
+      const bindings = { source: db.ingestion, target: db.analytics, sourceId: fixture.sourceId,
+        sourceNamespace: fixture.sourceNamespace };
+      async function settleDailyDay(day) {
+        for (let pass = 0; pass < 4; pass += 1) {
+          const progress = await advanceStorageCommunityDaily({ ...bindings, day,
+            nowMs: fixture.pinnedNowMs, maxOwners: 16 });
+          if (progress.state === "published" || progress.state === "unchanged") return progress;
+          assert.equal(progress.state, "progress", "only a bounded owner-page continuation is retried");
+        }
+        assert.fail("the bounded current daily lane did not settle");
+      }
+      async function readOwnerDay() {
+        const row = await db.analytics.prepare("SELECT owner_revision,source_format,fingerprint,complete FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=?")
+          .bind(fixture.sourceId, selected.day, selected.owner.ownerDigest).first();
+        assert.ok(row, "the current daily producer stored the selected owner day");
+        assert.equal(row.complete, 1);
+        assert.equal(row.source_format, "effective");
+        assert.equal(typeof row.fingerprint, "string");
+        const fingerprint = JSON.parse(row.fingerprint);
+        assert.deepEqual(Object.keys(fingerprint).sort(), ["dependencyDigest", "method", "streams"]);
+        assert.equal(fingerprint.method, "effective-daily-cursor-v2");
+        assert.match(fingerprint.dependencyDigest, /^[a-f0-9]{64}$/u);
+        assert.deepEqual(Object.keys(fingerprint.streams).sort(), ["quota", "session", "usage"]);
+        assert.deepEqual(fingerprint.streams, { usage: null, quota: null, session: null });
+        return { row, fingerprint };
+      }
+      async function valueCount(valueKey) {
+        return db.analytics.prepare("SELECT count(*) AS n FROM analytics_graph_day_values WHERE value_key=?")
+          .bind(valueKey).first("n");
+      }
+      async function pageCount(valueKey) {
+        return db.analytics.prepare("SELECT count(*) AS n FROM analytics_graph_day_pages WHERE value_key=?")
+          .bind(valueKey).first("n");
+      }
+      function graphKey(fingerprint) {
+        return { sourceId: fixture.sourceId, sourceLayout: "effective", sourceNamespace: fixture.sourceNamespace,
+          ownerDigest: selected.owner.ownerDigest, deviceId: kernel.GRAPH_DAY_EFFECTIVE_DEVICE_ID,
+          manifestId: kernel.GRAPH_DAY_EFFECTIVE_MANIFEST_ID, manifestDigest: fingerprint.dependencyDigest,
+          day: selected.day };
+      }
+      async function storeGraph(ownerDay) {
+        const projection = kernel.reduceGraphDayProjection(selected.day, []);
+        const result = await kernel.writeGraphDayProjection({ target: db.analytics, key: graphKey(ownerDay.fingerprint),
+          projection,
+          effectiveQuota: { quotaRowsRead: 0, ownerRevision: ownerDay.row.owner_revision } });
+        assert.equal(result.status, "stored");
+        return { ...result, projection };
+      }
+      async function retire(limit = 1) {
+        return kernel.retireGraphDayProjectionPage(db.analytics, fixture.sourceId,
+          { limit, nowMs: fixture.pinnedNowMs });
+      }
+
+      await settleDailyDay(selected.day);
+      const baseline = await readOwnerDay();
+      assert.equal(baseline.row.owner_revision, selected.owner.ownerRevision);
+      const oldGraph = await storeGraph(baseline);
+      const beforeSourceChange = await retire();
+      assert.deepEqual(beforeSourceChange, { state: "idle", values: 0, pages: 0, refusals: 0 });
+      assert.equal(await valueCount(oldGraph.valueKey), 1);
+
+      // Append a real admitted v1 usage chunk to the selected participant on
+      // the same day. Both source delivery and the daily refresh below use the
+      // current Worker entry points; all writes remain in the scratch set.
+      const device = await createV11DeviceFixture(db.ingestion, {
+        participantId: selected.owner.participantId, nowEpoch: fixture.pinnedNowMs,
+      });
+      const eventId = `event:v2:${crypto.randomUUID().replaceAll("-", "").padEnd(64, "0")}`;
+      const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(selected.day, "f", {
+        eventId, eventTime: `${selected.day}T15:05:00.000Z`,
+      }));
+      assert.ok(projected);
+      const records = [JSON.parse(projected.canonicalRecord)];
+      const envelopeDigest = await sha256Hex(`synthetic-graph-identity:${crypto.randomUUID()}`);
+      const bodyBytes = 4096;
+      const principal = await authenticateDevice(db.ingestion, device.authorization);
+      const authorization = await createDeviceUploadAuthorization(db.ingestion, principal, envelopeDigest, bodyBytes);
+      const claim = await claimDeviceUploadAuthorization(db.ingestion, `Upload ${authorization.uploadAuthorization}`, {
+        envelopeDigest, bodyBytes, contentType: "application/json",
+      });
+      const chunk = parseTelemetryV1Chunk({
+        schemaVersion: "telemetry-contribution-v1.0", chunkId: `usage:${selected.day}:0`, chunkRevision: 1,
+        chunkDigest: await sha256Hex(canonicalTelemetryV11Json(records)), parserVersion: "synthetic-graph-identity-v1",
+        consent: { telemetrySchemaVersion: "telemetry-contribution-v1.0",
+          fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
+          privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0" },
+        records,
+      });
+      const admission = await insertTypedTelemetryV1Chunk(db.ingestion, {
+        chunkRowId: `chunk:synthetic-graph-identity:${crypto.randomUUID()}`,
+        participantId: device.participantId, deviceId: device.deviceId, chunk, envelopeDigest,
+        r2Key: `synthetic/graph-identity:${crypto.randomUUID()}`,
+        deviceUploadAuthorizationId: claim.authorizationId,
+        createdAt: new Date(fixture.pinnedNowMs).toISOString(), supersedes: null,
+      }, fixture.sourceNamespace);
+      assert.deepEqual(admission, { acceptedRecords: 1, replay: false });
+
+      const updatedOwners = await readStorageCommunityOwnerPage(db.ingestion);
+      const updatedOwner = updatedOwners.find((owner) => owner.ownerDigest === selected.owner.ownerDigest);
+      assert.ok(updatedOwner, "the admitted append keeps the same source owner identity");
+      assert.ok(updatedOwner.ownerRevision > baseline.row.owner_revision);
+
+      let deliveryIdle = false;
+      let deliveredSteps = 0;
+      for (let step = 0; step < 16; step += 1) {
+        const result = await advanceStorageAnalytics(bindings);
+        if (result.state === "idle") {
+          deliveryIdle = true;
+          break;
+        }
+        deliveredSteps += 1;
+      }
+      assert.ok(deliveryIdle, "the bounded current delivery lane reached idle");
+      assert.ok(deliveredSteps > 0, "the admitted chunk reached current analytics storage");
+      const beforeDailyRefresh = await readOwnerDay();
+      assert.equal(beforeDailyRefresh.row.owner_revision, baseline.row.owner_revision);
+      assert.equal(beforeDailyRefresh.fingerprint.dependencyDigest, baseline.fingerprint.dependencyDigest);
+      const beforeRefreshRetirement = await retire();
+      assert.deepEqual(beforeRefreshRetirement, { state: "idle", values: 0, pages: 0, refusals: 0 });
+      assert.equal(await valueCount(oldGraph.valueKey), 1);
+
+      await settleDailyDay(selected.day);
+      const refreshed = await readOwnerDay();
+      assert.notEqual(refreshed.fingerprint.dependencyDigest, baseline.fingerprint.dependencyDigest);
+      assert.ok(baseline.row.owner_revision <= refreshed.row.owner_revision);
+      assert.equal(refreshed.row.owner_revision, updatedOwner.ownerRevision);
+      const newGraph = await storeGraph(refreshed);
+      assert.notEqual(newGraph.valueKey, oldGraph.valueKey);
+
+      let retiredValues = 0, retiredPages = 0, retiredRefusals = 0, finalRetirement;
+      for (let pass = 0; pass < 4; pass += 1) {
+        finalRetirement = await retire();
+        retiredValues += finalRetirement.values;
+        retiredPages += finalRetirement.pages;
+        retiredRefusals += finalRetirement.refusals;
+        if (finalRetirement.state === "idle") break;
+      }
+      assert.equal(finalRetirement.state, "idle", "bounded retirement reaches a stable empty pass");
+      assert.equal(retiredValues, 1, "the graph keyed by the old completed dependency is retired");
+      assert.ok(retiredPages > 0, "the old graph's immutable payload page is retired");
+      assert.equal(retiredRefusals, 0);
+      assert.equal(await valueCount(oldGraph.valueKey), 0);
+      assert.equal(await pageCount(oldGraph.valueKey), 0, "the old immutable payload pages are retired");
+      assert.equal(await valueCount(newGraph.valueKey), 1, "the graph under the new dependency remains current");
+      assert.equal(await pageCount(newGraph.valueKey), newGraph.totalParts,
+        "the new immutable payload remains complete");
+      const rereadNewGraph = await kernel.readGraphDayProjection({ target: db.analytics,
+        key: graphKey(refreshed.fingerprint) });
+      assert.equal(rereadNewGraph.status, "ready", "the surviving payload remains readable after retirement");
+      assert.deepEqual(rereadNewGraph.projection, newGraph.projection,
+        "the frozen reader reconstructs the complete new graph after the old payload is retired");
+      assert.deepEqual(await retire(), { state: "idle", values: 0, pages: 0, refusals: 0 });
+      assert.deepEqual(await Promise.all(Object.values(fixture.paths).map(fileSha256)), originalFixtureHashes,
+        "only the private scratch copies were written");
+    } finally {
+      db.close();
+      if (frozen) await frozen.close();
+    }
   }, RUN_TIMEOUT_MS);
 
   it("the graph recompute runs with the fold off: no ':fits-1' or ':model-1' checkpoint namespace", async () => {

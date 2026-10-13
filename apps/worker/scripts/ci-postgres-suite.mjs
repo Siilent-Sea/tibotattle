@@ -57,12 +57,13 @@
  *     node scripts/ci-postgres-suite.mjs
  *   node scripts/ci-postgres-suite.mjs --plan    # static checks only, no database
  *
- * CI may schedule the closed CORE and EDGE_E2E partitions on independent
- * clusters with --partition <name> --receipt <new-file>. Each is partial
- * evidence. --aggregate <core-receipt> <edge-receipt> recomputes the full plan,
- * binds the provider run/attempt, exact checkout and pinned runtime versions,
- * requires both producer jobs to succeed, and evaluates every canonical file
- * exactly once. No-flag execution remains the complete serial gate.
+ * CI may schedule the closed CORE_A, CORE_B and EDGE_E2E partitions on
+ * independent clusters with --partition <name> --receipt <new-file>. Each is
+ * partial evidence. --aggregate accepts exactly one same-run receipt per
+ * partition, recomputes the full plan, binds the provider run/attempt, exact
+ * checkout, pinned runtimes and generated build inputs, requires every
+ * producer job to succeed, and evaluates every canonical file exactly once.
+ * No-flag execution remains the complete serial gate.
  * Progress JSON on stderr contains canonical file ownership and elapsed time
  * only; stdout continues to contain one result summary.
  */
@@ -89,7 +90,111 @@ export const PROFILE_SOCKET = "SOCKET";
 export const PROFILE_HOST = "HOST";
 export const PROFILE_EDGE_E2E = "EDGE_E2E";
 export const NODE_RUNNER = "node";
-export const PARTITIONS = Object.freeze(["CORE", "EDGE_E2E"]);
+export const EDGE_PARTITION_FILES = Object.freeze([
+  "postgres-test/edge-origin-e2e.spec.mjs",
+]);
+export const CORE_PARTITION_FILES = Object.freeze({
+  CORE_A: Object.freeze([
+    "postgres-test/v12-domain-roundtrip.spec.mjs",
+    "postgres-test/postgres-community-graph-roundtrip.spec.mjs",
+    "postgres-test/postgres-community-graph-cohort.spec.mjs",
+    "postgres-test/postgres-community-allowance-fits.spec.mjs",
+    "postgres-test/postgres-community-daily-roundtrip.spec.mjs",
+    "postgres-test/postgres-community-daily-host.spec.mjs",
+    "postgres-test/postgres-analytics-event-tuple.spec.mjs",
+    "postgres-test/postgres-ingestion-journal-transfer.spec.mjs",
+    "postgres-test/d1-analytics-export-oracle.spec.mjs",
+    "postgres-test/postgres-identity-authority-transfer.spec.mjs",
+    "postgres-test/postgres-legacy-contribution-transfer.spec.mjs",
+    "postgres-test/cutover-source-seal-rehearsal.spec.mjs",
+    "postgres-test/postgres-production-telemetry-modes.spec.mjs",
+    "postgres-test/postgres-production-transfer.spec.mjs",
+    "postgres-test/community-allowance-rich-days.spec.mjs",
+    "postgres-test/v12-domain-forward.check.mjs",
+    "postgres-test/v12-ready-manifest-retention.spec.mjs",
+    "postgres-test/typed-legacy-effective-reader.spec.mjs",
+    "postgres-test/postgres-device-lifecycle.spec.mjs",
+    "postgres-test/postgres-device-sync-reads.spec.mjs",
+    "postgres-test/postgres-personal-session.spec.mjs",
+    "postgres-test/postgres-telemetry-v12-consent.spec.mjs",
+    "postgres-test/postgres-google-enrollment.spec.mjs",
+    "postgres-test/postgres-accountless-retention-import.spec.mjs",
+    "postgres-test/postgres-owner-journal-emitter-precheck.spec.mjs",
+    "postgres-test/postgres-admin-audit.spec.mjs",
+    "postgres-test/postgres-admission-isolation.spec.mjs",
+    "postgres-test/postgres-lifecycle-state.spec.mjs",
+    "postgres-test/postgres-transfer-target.spec.mjs",
+    "postgres-test/postgres-transport-floor-parity.spec.mjs",
+    "postgres-test/postgres-v12-owner-bridge.spec.mjs",
+    "postgres-test/staged-migrations-harness.spec.mjs",
+    "postgres-test/typed-telemetry-live-allocators.spec.mjs",
+    "postgres-test/typed-v12-domain-unchanged.spec.mjs",
+    "postgres-test/postgres-fastpath-identity-copy.spec.mjs",
+    "postgres-test/postgres-origin-edge-test.spec.mjs",
+    "postgres-test/postgres-test-runtime-grants.spec.mjs",
+    "postgres-test/append-only-residue.spec.mjs",
+    "postgres-test/online-erasure-absence.spec.mjs",
+    "postgres-test/postgres-admin-console.spec.mjs",
+    "postgres-test/postgres-admin-reconstruction-progress.spec.mjs",
+    "postgres-test/postgres-lifecycle-pass.spec.mjs",
+    "postgres-test/ops-runtime-probe.spec.mjs",
+    "postgres-test/analytics-v2-interim-public-read.spec.mjs",
+    "postgres-test/postgres-production-host.spec.mjs",
+    "postgres-test/catalog-manifest-store.spec.mjs",
+    "postgres-test/identity-link-rotation-kept-routes.spec.mjs",
+    "postgres-test/analytics-v2-reprice.spec.mjs",
+    "postgres-test/classification-correction.spec.mjs",
+    "postgres-test/postgres-github-distribution-sync.spec.mjs",
+    "postgres-test/github-distribution-manifest-visibility.spec.mjs",
+    "postgres-test/legacy-typed-telemetry-roundtrip.spec.mjs",
+    "postgres-test/telemetry-format-authority-roundtrip.spec.mjs",
+    "postgres-test/v12-transport-roundtrip.spec.mjs",
+  ]),
+  CORE_B: Object.freeze([
+    "postgres-test/typed-v12-effective-reader-scope.spec.mjs",
+    "postgres-test/usage-correction-transfer.spec.mjs",
+    "postgres-test/accountless-renewal.spec.mjs",
+    "postgres-test/postgres-maintenance.spec.mjs",
+    "postgres-test/postgres-google-handoff.spec.mjs",
+    "postgres-test/postgres-owner-journal-authority.spec.mjs",
+    "postgres-test/postgres-collection-controls.spec.mjs",
+    "postgres-test/postgres-device-bearer-auth.spec.mjs",
+    "postgres-test/postgres-host-diagnostics.spec.mjs",
+    "postgres-test/postgres-signin-primitives.spec.mjs",
+    "postgres-test/postgres-storage-community-authority.spec.mjs",
+    "postgres-test/postgres-transport-write-authority.spec.mjs",
+    "postgres-test/postgres-upload-path-analytics-retirement.spec.mjs",
+    "postgres-test/typed-v12-predecessor-day-count.spec.mjs",
+    "postgres-test/typed-v12-storage-constraint.spec.mjs",
+    "postgres-test/postgres-origin-fastpath.spec.mjs",
+    "postgres-test/analytics-v2-occurrence-source.spec.mjs",
+    "postgres-test/read-expansion-real-boundaries.spec.mjs",
+    "postgres-test/analytics-v2-read-plan.spec.mjs",
+    "postgres-test/analytics-v2-refresh.spec.mjs",
+    "postgres-test/analytics-v2-owner-sets.spec.mjs",
+    "postgres-test/analytics-v2-price-cards.spec.mjs",
+    "postgres-test/analytics-v2-pricing-classes.spec.mjs",
+    "postgres-test/analytics-v2-community-daily-route.spec.mjs",
+    "postgres-test/postgres-v12-transfer.spec.mjs",
+    "postgres-test/postgres-telemetry-v11-live.spec.mjs",
+    "postgres-test/postgres-legacy-contribution-admission.spec.mjs",
+    "postgres-test/postgres-origin-intake.spec.mjs",
+    "postgres-test/postgres-function-search-path.spec.mjs",
+    "postgres-test/analytics-v2-revision-floor.spec.mjs",
+    "postgres-test/unseen-token-probe.spec.mjs",
+    "postgres-test/analytics-v2-historical-spend.spec.mjs",
+    "postgres-test/postgres-production-migrations.spec.mjs",
+    "postgres-test/device-credential-renewal.spec.mjs",
+    "postgres-test/legacy-source-membership-roundtrip.spec.mjs",
+    "postgres-test/postgres-device-pairing-claim.spec.mjs",
+    "postgres-test/postgres-device-pairing.spec.mjs",
+    "postgres-test/postgres-quarantine-reconciliation.spec.mjs",
+    "postgres-test/typed-v12-normalized.spec.mjs",
+    "postgres-test/upload-authorization-roundtrip.spec.mjs",
+  ]),
+});
+export const CORE_PARTITIONS = Object.freeze(Object.keys(CORE_PARTITION_FILES));
+export const PARTITIONS = Object.freeze([...CORE_PARTITIONS, "EDGE_E2E"]);
 export const TOOLCHAIN_NODE_VERSION = "v26.2.0";
 
 /**
@@ -1268,9 +1373,35 @@ export function partitionPostgresPlan(plan, partition) {
     ![PROFILE_SOCKET, PROFILE_HOST, PROFILE_EDGE_E2E].includes(profile)
     || profile === PROFILE_EDGE_E2E && (SCRIPT_PROFILES[source] !== profile || runner !== scriptRunner(source)));
   if (invalid) throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "canonical profile ownership drift");
-  const files = plan.files.filter(({ profile }) => partition === "CORE"
-    ? profile === PROFILE_SOCKET || profile === PROFILE_HOST : profile === PROFILE_EDGE_E2E);
+  const edgeFiles = plan.files.filter(({ profile }) => profile === PROFILE_EDGE_E2E);
+  if (partition === "EDGE_E2E") {
+    if (edgeFiles.length === 0) throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "empty partition");
+    if (JSON.stringify(edgeFiles.map(({ file }) => file).sort())
+        !== JSON.stringify([...EDGE_PARTITION_FILES].sort())) {
+      throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "canonical EDGE partition ownership drift");
+    }
+    return Object.freeze({ ...plan, files: Object.freeze(edgeFiles) });
+  }
+
+  const coreFiles = plan.files.filter(({ profile }) => profile === PROFILE_SOCKET || profile === PROFILE_HOST);
+  const assignedFiles = CORE_PARTITIONS.flatMap((name) => CORE_PARTITION_FILES[name]);
+  const assigned = new Set(assignedFiles);
+  if (assigned.size !== assignedFiles.length
+      || JSON.stringify([...assigned].sort()) !== JSON.stringify(coreFiles.map(({ file }) => file).sort())) {
+    throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "canonical CORE shard ownership drift");
+  }
+  const owners = new Map(CORE_PARTITIONS.flatMap((name) => CORE_PARTITION_FILES[name].map((file) => [file, name])));
+  for (const config of VITEST_REGISTRATION_CONFIGS) {
+    const groupOwners = new Set(coreFiles.filter(({ runner }) => runner === `vitest:${config}`)
+      .map(({ file }) => owners.get(file)));
+    if (groupOwners.size > 1) {
+      throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "Vitest config group split across CORE shards");
+    }
+  }
+  const ownedFiles = new Set(CORE_PARTITION_FILES[partition]);
+  const files = coreFiles.filter(({ file }) => ownedFiles.has(file));
   if (files.length === 0) throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "empty partition");
+  if (files.length !== ownedFiles.size) throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "CORE shard manifest has missing files");
   return Object.freeze({ ...plan, files: Object.freeze(files) });
 }
 
@@ -1283,9 +1414,9 @@ export function parseSuiteArguments(argv) {
       options.partition = argv[++index];
     } else if (argument === "--receipt" && options.receipt === null && argv[index + 1] && !argv[index + 1].startsWith("--")) {
       options.receipt = argv[++index];
-    } else if (argument === "--aggregate" && options.aggregate === null && argv.length === index + 3
+    } else if (argument === "--aggregate" && options.aggregate === null && argv.length === index + 1 + PARTITIONS.length
         && argv.slice(index + 1).every((value) => value && !value.startsWith("--"))) {
-      options.aggregate = argv.slice(index + 1); index += 2;
+      options.aggregate = argv.slice(index + 1); index += PARTITIONS.length;
     } else throw new CiPostgresSuiteError("CI_SUITE_USAGE", "unsupported or duplicate argument");
   }
   if (options.aggregate !== null && (options.plan || options.partition !== null || options.receipt !== null)
@@ -1364,11 +1495,20 @@ export async function postgresExecutionInputs({ workerRoot = WORKER_ROOT, builde
 function validExecutionInputs(inputs, { partition, ownership }) {
   return exactKeys(inputs, ["buildSourceSha256", "builderNode", "bundles"])
     && inputs.buildSourceSha256 === ownership.buildSourceSha256
-    && inputs.builderNode === (partition === "CORE" ? TOOLCHAIN_NODE_VERSION : EDGE_E2E_NODE_VERSION)
+    && inputs.builderNode === (partition === "EDGE_E2E" ? EDGE_E2E_NODE_VERSION : TOOLCHAIN_NODE_VERSION)
     && Array.isArray(inputs.bundles)
     && JSON.stringify(inputs.bundles.map((entry) => entry?.path)) === JSON.stringify(ownership.paths)
     && inputs.bundles.every((entry) => exactKeys(entry, ["path", "sha256", "bytes"])
       && SHA256.test(entry.sha256) && Number.isSafeInteger(entry.bytes) && entry.bytes > 0 && entry.bytes <= 32 * 1024 * 1024);
+}
+
+function sameExecutionInputs(left, right) {
+  return left.buildSourceSha256 === right.buildSourceSha256
+    && left.builderNode === right.builderNode
+    && left.bundles.length === right.bundles.length
+    && left.bundles.every((bundle, index) => bundle.path === right.bundles[index].path
+      && bundle.sha256 === right.bundles[index].sha256
+      && bundle.bytes === right.bundles[index].bytes);
 }
 
 export function assertCleanPostgresCheckout({ workerRoot = WORKER_ROOT, git = execFileSync, environment = process.env } = {}) {
@@ -1447,6 +1587,7 @@ export function aggregatePostgresReceipts({ plan, context, receipts, jobResults,
   const planned = new Map(plan.files.map((entry) => [entry.file, entry]));
   const seenFiles = new Set();
   const seenGroups = new Set();
+  let coreExecutionInputs = null;
   for (const receipt of receipts) {
     if (!exactKeys(receipt, ["version", "scope", "partition", ...Object.keys(context), "inventory", "records", "environmentGaps", "planFailureCodes", "executionInputs"])
         || receipt.version !== RECEIPT_VERSION || receipt.scope !== "partition" || !PARTITIONS.includes(receipt.partition)
@@ -1454,6 +1595,10 @@ export function aggregatePostgresReceipts({ plan, context, receipts, jobResults,
       return refuse("PARTITION_PROVENANCE_INVALID");
     }
     if (!validExecutionInputs(receipt.executionInputs, { partition: receipt.partition, ownership })) return refuse("PARTITION_BUILD_INPUT_INVALID");
+    if (receipt.partition !== "EDGE_E2E") {
+      if (coreExecutionInputs === null) coreExecutionInputs = receipt.executionInputs;
+      else if (!sameExecutionInputs(coreExecutionInputs, receipt.executionInputs)) return refuse("CORE_BUILD_INPUT_MISMATCH");
+    }
     seenPartitions.add(receipt.partition);
     const selected = partitionPostgresPlan(plan, receipt.partition).files.map(({ file, profile, runner }) => ({ file, profile, runner }));
     if (JSON.stringify(receipt.inventory) !== JSON.stringify(selected)
@@ -1535,7 +1680,7 @@ export async function main(argv, {
       return JSON.parse(await readFile(path, "utf8"));
     }));
     const summary = aggregatePostgresReceipts({ plan, context, receipts,
-      jobResults: { CORE: environment.CI_POSTGRES_CORE_RESULT, EDGE_E2E: environment.CI_POSTGRES_EDGE_E2E_RESULT },
+      jobResults: Object.fromEntries(PARTITIONS.map((partition) => [partition, environment[`CI_POSTGRES_${partition}_RESULT`]])),
       ownership: await loadOwnership() });
     writeSummary(summary);
     if (summary.status !== "passed") setExitCode(1);
@@ -1561,7 +1706,7 @@ export async function main(argv, {
   const context = options.receipt === null ? null : await readContext({ plan, environment, probeImage: true });
   let execution = null;
   let executionInputs = null;
-  const builderNode = options.partition === "CORE" ? TOOLCHAIN_NODE_VERSION : EDGE_E2E_NODE_VERSION;
+  const builderNode = options.partition === "EDGE_E2E" ? EDGE_E2E_NODE_VERSION : TOOLCHAIN_NODE_VERSION;
   const summary = await execute({ plan, partition: options.partition, environment,
     onRecords: (value) => { execution = value; },
     onExecutionInputs: async () => {

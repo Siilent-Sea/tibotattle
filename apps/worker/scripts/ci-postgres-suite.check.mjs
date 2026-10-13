@@ -51,6 +51,8 @@ import {
   planPostgresSuite,
   probeEdgeE2eEnvironment,
   PROFILE_EDGE_E2E,
+  PARTITIONS,
+  VITEST_REGISTRATION_CONFIGS,
   readSocketProfileInput,
   runPostgresSuite,
   SCRIPT_PROFILES,
@@ -1423,12 +1425,12 @@ test("only the SOCKET profile is exported to the GitHub environment file", async
 // Complete CI scheduling proof: partition receipts never qualify the whole plan alone.
 const receiptContextFixture = Object.freeze({ sourceHead: "a".repeat(40), planDigest: "b".repeat(64),
   runId: "1234", runAttempt: "2", toolchainNode: "v26.2.0", imageNode: "v22.16.0" });
-const partitionJobsPassed = Object.freeze({ CORE: "success", EDGE_E2E: "success" });
+const partitionJobsPassed = Object.freeze(Object.fromEntries(PARTITIONS.map((partition) => [partition, "success"])));
 async function mockPartitionReceipts({ skipFile = null, probe = edgeAvailable } = {}) {
   const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
   const receipts = [];
   const calls = [];
-  for (const partition of ["CORE", "EDGE_E2E"]) {
+  for (const partition of PARTITIONS) {
     const mock = fakeSuiteRunner({ plan, skipFile });
     let execution = null;
     const summary = await runPostgresSuite({ workerRoot: WORKER_ROOT, plan, partition,
@@ -1444,14 +1446,26 @@ async function mockPartitionReceipts({ skipFile = null, probe = edgeAvailable } 
 const aggregateMock = ({ plan, receipts, context = receiptContextFixture, jobResults = partitionJobsPassed }) =>
   aggregatePostgresReceipts({ plan, receipts, context, jobResults, ownership: buildOwnershipFixture });
 
-test("closed CORE and EDGE_E2E partitions execute the exact full canonical plan once", async () => {
+test("closed CORE shards and EDGE_E2E execute the exact full canonical plan once without splitting Vitest configs", async () => {
   const { plan, receipts, calls } = await mockPartitionReceipts();
-  const core = partitionPostgresPlan(plan, "CORE");
+  const core = PARTITIONS.filter((partition) => partition !== "EDGE_E2E")
+    .map((partition) => partitionPostgresPlan(plan, partition));
   const edge = partitionPostgresPlan(plan, "EDGE_E2E");
+  assert.equal(plan.files.length, 95, "canonical PostgreSQL suite size is reviewed explicitly");
+  assert.equal(core.length, 2, "exactly two reviewed CORE shards");
+  assert.deepEqual(core.map(({ files }) => files.length), [54, 40], "CORE_A/CORE_B cardinalities are reviewed explicitly");
+  assert.equal(edge.files.length, 1, "exactly one reviewed EDGE file");
   assert.deepEqual(edge.files.map(({ file, runner, profile }) => ({ file, runner, profile })),
     [{ file: EDGE_SPEC, runner: "script:edge:e2e", profile: "EDGE_E2E" }]);
-  assert.equal(core.files.length + edge.files.length, plan.files.length);
-  assert.equal(new Set([...core.files, ...edge.files].map(({ file }) => file)).size, plan.files.length);
+  const partitionFiles = [...core.flatMap(({ files }) => files), ...edge.files];
+  assert.equal(partitionFiles.length, plan.files.length);
+  assert.equal(new Set(partitionFiles.map(({ file }) => file)).size, plan.files.length);
+  for (const config of VITEST_REGISTRATION_CONFIGS) {
+    const groupFiles = plan.files.filter(({ runner }) => runner === `vitest:${config}`);
+    const owners = core.filter(({ files }) => files.some(({ runner }) => runner === `vitest:${config}`));
+    assert.equal(owners.length, groupFiles.length === 0 ? 0 : 1, `${config} remains indivisible`);
+    assert.deepEqual(owners.flatMap(({ files }) => files.filter(({ runner }) => runner === `vitest:${config}`)), groupFiles);
+  }
   assert.equal(calls.filter(({ command, args }) => command === EDGE_NODE && args[0] === "./cloud-run/build.mjs").length, 1);
   const aggregate = aggregateMock({ plan, receipts });
   assert.equal(aggregate.status, "passed");
@@ -1460,19 +1474,23 @@ test("closed CORE and EDGE_E2E partitions execute the exact full canonical plan 
   assert.equal(aggregate.tests, plan.files.length);
   assert.equal(aggregate.passedByPass.EDGE_E2E, 1);
   assert.deepEqual(aggregate.failures, []);
-  assert.throws(() => partitionPostgresPlan(plan, "SOCKET"), /CI_SUITE_PARTITION_INVALID/u);
-  assert.throws(() => partitionPostgresPlan({ ...plan, files: core.files }, "EDGE_E2E"), /empty partition/u);
-  assert.throws(() => partitionPostgresPlan({ ...plan, files: [...plan.files, { file: "extra", profile: "UNKNOWN" }] }, "CORE"), /ownership drift/u);
+  assert.throws(() => partitionPostgresPlan(plan, "CORE"), /CI_SUITE_PARTITION_INVALID/u);
+  assert.throws(() => partitionPostgresPlan({ ...plan, files: plan.files.filter(({ profile }) => profile !== "EDGE_E2E") }, "EDGE_E2E"), /empty partition/u);
+  assert.throws(() => partitionPostgresPlan({ ...plan, files: [...plan.files, { file: "extra", profile: "UNKNOWN" }] }, "CORE_A"), /ownership drift/u);
+  assert.throws(() => partitionPostgresPlan({ ...plan, files: [...plan.files, { file: "postgres-test/new-core.spec.mjs", profile: "SOCKET", runner: "node" }] }, "CORE_A"), /canonical CORE shard ownership drift/u);
+  const edgeEntry = plan.files.find(({ profile }) => profile === "EDGE_E2E");
+  assert.throws(() => partitionPostgresPlan({ ...plan, files: [...plan.files, { ...edgeEntry, file: "postgres-test/new-edge.spec.mjs" }] }, "EDGE_E2E"),
+    /canonical EDGE partition ownership drift/u);
 });
 
 test("partition command modes are explicit, closed and preserve no-flag whole execution", () => {
   assert.deepEqual(parseSuiteArguments([]), { plan: false, partition: null, receipt: null, aggregate: null });
-  assert.deepEqual(parseSuiteArguments(["--partition", "CORE", "--receipt", "/synthetic/core.json"]),
-    { plan: false, partition: "CORE", receipt: "/synthetic/core.json", aggregate: null });
-  assert.deepEqual(parseSuiteArguments(["--aggregate", "/synthetic/core.json", "/synthetic/edge.json"]).aggregate,
-    ["/synthetic/core.json", "/synthetic/edge.json"]);
-  for (const arguments_ of [["--partition", "SOCKET"], ["--receipt", "receipt.json"], ["--plan", "--receipt", "receipt.json"],
-    ["--partition", "CORE", "--partition", "EDGE_E2E"], ["--aggregate", "one"], ["--aggregate", "one", "two", "three"],
+  assert.deepEqual(parseSuiteArguments(["--partition", "CORE_A", "--receipt", "/synthetic/core-a.json"]),
+    { plan: false, partition: "CORE_A", receipt: "/synthetic/core-a.json", aggregate: null });
+  assert.deepEqual(parseSuiteArguments(["--aggregate", "core-a.json", "core-b.json", "edge.json"]).aggregate,
+    ["core-a.json", "core-b.json", "edge.json"]);
+  for (const arguments_ of [["--partition", "CORE"], ["--receipt", "receipt.json"], ["--plan", "--receipt", "receipt.json"],
+    ["--partition", "CORE_A", "--partition", "EDGE_E2E"], ["--aggregate", "one"], ["--aggregate", "one", "two"], ["--aggregate", "one", "two", "three", "four"],
     ["--plan", "--aggregate", "one", "two"], ["--filter", EDGE_SPEC]]) {
     assert.throws(() => parseSuiteArguments(arguments_), /CI_SUITE_USAGE/u, JSON.stringify(arguments_));
   }
@@ -1485,7 +1503,7 @@ test("aggregate refuses omitted, duplicate, extra or cross-owned partition inven
   }
   const mutate = (change) => { const copy = structuredClone(receipts); change(copy); return aggregateMock({ plan, receipts: copy }); };
   const first = (copy) => copy[0].records.find(({ files }) => files.length > 0);
-  for (const change of [
+  for (const [index, change] of [
     (copy) => copy[0].inventory.pop(),
     (copy) => copy[0].inventory.push({ file: "postgres-test/unplanned.spec.mjs", profile: "SOCKET", runner: "node" }),
     (copy) => copy[0].records.splice(0, 1),
@@ -1498,8 +1516,8 @@ test("aggregate refuses omitted, duplicate, extra or cross-owned partition inven
     (copy) => first(copy).files[0].extra = "unknown",
     (copy) => copy[0].records.push({ profile: "SOCKET", runner: "node", file: null, exitCode: 0, cancelled: 0, parseFailures: [], files: [] }),
     (copy) => { const record = first(copy); const moved = record.files.pop(); copy[0].records.push({ ...record, files: [moved] }); },
-    (copy) => copy[1].inventory[0].runner = "node",
-  ]) assert.equal(mutate(change).status, "failed");
+    (copy) => copy[1].inventory[0].runner = "vitest:vitest.postgres.config.ts",
+  ].entries()) assert.equal(mutate(change).status, "failed", `mutation ${index}`);
 });
 
 test("aggregate binds exact source, complete plan, runtimes and provider run attempt", async () => {
@@ -1510,9 +1528,8 @@ test("aggregate binds exact source, complete plan, runtimes and provider run att
   }
   const unknown = structuredClone(receipts); unknown[0].providerBranch = "untrusted";
   assert.equal(aggregateMock({ plan, receipts: unknown }).status, "failed");
-  for (const result of ["failure", "cancelled", "skipped", undefined, "pending"]) {
-    assert.equal(aggregateMock({ plan, receipts, jobResults: { CORE: result, EDGE_E2E: "success" } }).status, "failed");
-    assert.equal(aggregateMock({ plan, receipts, jobResults: { CORE: "success", EDGE_E2E: result } }).status, "failed");
+  for (const partition of PARTITIONS) for (const result of ["failure", "cancelled", "skipped", undefined, "pending"]) {
+    assert.equal(aggregateMock({ plan, receipts, jobResults: { ...partitionJobsPassed, [partition]: result } }).status, "failed", partition);
   }
   assert.equal(aggregateMock({ plan, receipts, jobResults: { ...partitionJobsPassed, EXTRA: "success" } }).status, "failed");
   assert.equal(aggregateMock({ plan, receipts, context: { ...receiptContextFixture, toolchainNode: "v26.2.1" } }).status, "failed");
@@ -1539,7 +1556,7 @@ test("aggregate never qualifies failures, skipped, todo, cancelled, parse failur
     const copy = structuredClone(receipts); change(copy[0].records[0]);
     assert.equal(aggregateMock({ plan, receipts: copy }).status, "failed");
   }
-  const gap = structuredClone(receipts); gap[1].environmentGaps.push({ code: "ENVIRONMENT_GAP", file: EDGE_SPEC, profile: "EDGE_E2E" });
+  const gap = structuredClone(receipts); gap.at(-1).environmentGaps.push({ code: "ENVIRONMENT_GAP", file: EDGE_SPEC, profile: "EDGE_E2E" });
   assert.equal(aggregateMock({ plan, receipts: gap }).status, "failed");
   const failedPlan = structuredClone(receipts); failedPlan[0].planFailureCodes.push("UNREGISTERED_POSTGRES_SPEC");
   assert.equal(aggregateMock({ plan, receipts: failedPlan }).status, "failed");
@@ -1554,21 +1571,27 @@ test("actual runner skips and edge environment gaps remain failing aggregate evi
 });
 
 test("progress and receipts exclude child payload, test names, diagnostic paths and failure text", async () => {
-  const plan = { files: [{ file: "postgres-test/synthetic.spec.mjs", profile: "SOCKET", runner: "node", source: "synthetic" }],
-    hostProfileFiles: [], failures: [] };
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
   const progress = []; let execution;
-  await runPostgresSuite({ workerRoot: WORKER_ROOT, plan, partition: "CORE",
+  await runPostgresSuite({ workerRoot: WORKER_ROOT, plan, partition: "CORE_B",
     environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" }, onOutput: () => {},
     onProgress: (entry) => progress.push(entry), now: () => 100,
     onRecords: (value) => { execution = value; },
     run: async () => ({ exitCode: 1, stdout: passingTapFor("SECRET_SYNTHETIC_TEST_NAME")
       .replace("ok 1 -", "not ok 1 -").replace("# pass 1", "# pass 0").replace("# fail 0", "# fail 1") }),
   });
-  execution.records[0].files.get(plan.files[0].file).tests[0].detail = "SECRET_SYNTHETIC_PAYLOAD /private/path.sql";
-  const receipt = createPostgresReceipt({ plan, context: receiptContextFixture, partition: "CORE", execution, executionInputs: executionInputsFixture("CORE") });
+  const firstRecordedFile = execution.records[0].files.keys().next().value;
+  execution.records[0].files.get(firstRecordedFile).tests[0].detail = "SECRET_SYNTHETIC_PAYLOAD /private/path.sql";
+  const receipt = createPostgresReceipt({ plan, context: receiptContextFixture, partition: "CORE_B", execution, executionInputs: executionInputsFixture("CORE_B") });
   const serialized = JSON.stringify({ progress, receipt });
   assert.doesNotMatch(serialized, /SECRET_SYNTHETIC|private\/path|path\.sql/u);
-  assert.deepEqual(progress.map(({ phase }) => phase), ["started", "completed"]);
+  assert.equal(progress.length, execution.records.length * 2);
+  for (let index = 0; index < execution.records.length; index += 1) {
+    assert.equal(progress[index * 2].phase, "started");
+    assert.equal(progress[index * 2 + 1].phase, "completed");
+    assert.equal(progress[index * 2].runner, execution.records[index].runner);
+    assert.equal(progress[index * 2 + 1].runner, execution.records[index].runner);
+  }
   for (const entry of progress) assert.deepEqual(Object.keys(entry).sort(), ["elapsedMs", "event", "files", "phase", "profile", "runner"]);
 });
 
@@ -1598,7 +1621,7 @@ const generatedOutputNames = ["server", "oauth-gateway", "test-migrations", "tes
   "ops-runtime-probe-job", "ops-backup-audit-job"].map((name) => `dist/${name}.mjs`).sort();
 const buildOwnershipFixture = Object.freeze({ buildSourceSha256: "c".repeat(64), paths: generatedOutputNames });
 const executionInputsFixture = (partition) => ({ buildSourceSha256: buildOwnershipFixture.buildSourceSha256,
-  builderNode: partition === "CORE" ? "v26.2.0" : "v22.16.0",
+  builderNode: partition === "EDGE_E2E" ? "v22.16.0" : "v26.2.0",
   bundles: generatedOutputNames.map((path) => ({ path, sha256: "d".repeat(64), bytes: 12 })) });
 
 async function withGeneratedInputFixture(callback) {
@@ -1636,9 +1659,20 @@ test("generated execution bindings derive all13 canonical outputs, bind bytes an
 
 test("complete aggregate binds perpartition generated bytes and exact canonical ownership without inventing cross-runtime equality", async () => {
   const { plan, receipts } = await mockPartitionReceipts();
+  assert.deepEqual(receipts[0].executionInputs, receipts[1].executionInputs,
+    "CORE_A and CORE_B on the same Node toolchain must bind identical build outputs");
   const different = structuredClone(receipts);
-  different[1].executionInputs.bundles[0].sha256 = "e".repeat(64);
+  different[2].executionInputs.bundles[0].sha256 = "e".repeat(64);
   assert.equal(aggregateMock({ plan, receipts: different }).status, "passed", "actual runtime-specific outputs are recorded independently");
+  for (const mutate of [
+    (inputs) => { inputs.bundles[0].sha256 = "e".repeat(64); },
+    (inputs) => { inputs.bundles[0].bytes += 1; },
+  ]) {
+    const changedCore = structuredClone(receipts);
+    mutate(changedCore[1].executionInputs);
+    assert.equal(aggregateMock({ plan, receipts: changedCore }).status, "failed",
+      "same-runtime CORE receipts cannot disagree on bundle bytes or digest");
+  }
   for (const mutate of [
     (inputs) => { inputs.bundles.pop(); },
     (inputs) => { inputs.bundles.push(structuredClone(inputs.bundles[0])); },
@@ -1676,14 +1710,15 @@ test("source guards refuse an imported non-spec root module or staged index muta
 
 async function injectableCli(plan, { skipFile = null, context = receiptContextFixture, inputsChanged = false } = {}) {
   const summaries = []; const exits = []; let bindings = 0;
-  const environment = { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432", CI_POSTGRES_CORE_RESULT: "success", CI_POSTGRES_EDGE_E2E_RESULT: "success" };
+    const environment = { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432",
+      ...Object.fromEntries(PARTITIONS.map((partition) => [`CI_POSTGRES_${partition}_RESULT`, "success"])) };
   return { summaries, exits, environment, dependencies: {
     loadPlan: async () => plan, readContext: async () => context, environment,
     execute: async (options) => runPostgresSuite({ ...options, workerRoot: WORKER_ROOT,
       run: fakeSuiteRunner({ plan, skipFile }).run, onOutput: () => {}, onProgress: () => {}, probeEdgeE2e: edgeAvailable }),
     loadOwnership: async () => buildOwnershipFixture,
     bindInputs: async ({ builderNode }) => {
-      const inputs = executionInputsFixture(builderNode === "v26.2.0" ? "CORE" : "EDGE_E2E");
+      const inputs = executionInputsFixture(builderNode === "v26.2.0" ? "CORE_A" : "EDGE_E2E");
       if (inputsChanged && bindings++ > 0) inputs.bundles[0].sha256 = "e".repeat(64);
       return inputs;
     },
@@ -1691,12 +1726,12 @@ async function injectableCli(plan, { skipFile = null, context = receiptContextFi
   } };
 }
 
-test("actual CLI orchestration writes exclusive0600 CORE/EDGE receipts and one aggregate summary", async () => {
+test("actual CLI orchestration writes exclusive0600 CORE_A/CORE_B/EDGE receipts and one aggregate summary", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-pg-cli-check-"));
   const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
   try {
     const paths = [];
-    for (const partition of ["CORE", "EDGE_E2E"]) {
+    for (const partition of PARTITIONS) {
       const path = join(root, `${partition}.json`); paths.push(path);
       const cli = await injectableCli(plan);
       await main(["--partition", partition, "--receipt", path], cli.dependencies);
@@ -1721,24 +1756,24 @@ test("actual CLI orchestration refuses missing/unsafe receipts, provider failure
   const root = await mkdtemp(join(tmpdir(), "tibotattle-pg-cli-refusal-"));
   const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
   try {
-    const paths = [join(root, "core.json"), join(root, "edge.json")];
+    const paths = PARTITIONS.map((partition) => join(root, `${partition}.json`));
     const { receipts } = await mockPartitionReceipts();
     for (let index = 0; index < paths.length; index += 1) await writeFile(paths[index], JSON.stringify(receipts[index]));
     const failedJob = await injectableCli(plan); failedJob.environment.CI_POSTGRES_EDGE_E2E_RESULT = "cancelled";
     await main(["--aggregate", ...paths], failedJob.dependencies);
     assert.equal(failedJob.summaries[0].status, "failed"); assert.deepEqual(failedJob.exits, [1]);
     const skipped = await injectableCli(plan, { skipFile: "postgres-test/typed-v12-normalized.spec.mjs" });
-    await main(["--partition", "CORE", "--receipt", join(root, "skipped.json")], skipped.dependencies);
+    await main(["--partition", "CORE_B", "--receipt", join(root, "skipped.json")], skipped.dependencies);
     assert.equal(skipped.summaries[0].status, "failed"); assert.deepEqual(skipped.exits, [1]);
     const changed = await injectableCli(plan, { inputsChanged: true });
-    await assert.rejects(main(["--partition", "CORE", "--receipt", join(root, "changed.json")], changed.dependencies), /generated execution inputs are absent or changed/u);
+    await assert.rejects(main(["--partition", "CORE_A", "--receipt", join(root, "changed.json")], changed.dependencies), /generated execution inputs are absent or changed/u);
     const drift = await injectableCli(plan); let reads = 0;
     drift.dependencies.readContext = async () => reads++ === 0 ? receiptContextFixture : { ...receiptContextFixture, sourceHead: "e".repeat(40) };
-    await assert.rejects(main(["--partition", "CORE", "--receipt", join(root, "drift.json")], drift.dependencies), /source or runtime changed/u);
+    await assert.rejects(main(["--partition", "CORE_A", "--receipt", join(root, "drift.json")], drift.dependencies), /source or runtime changed/u);
     const missing = await injectableCli(plan);
-    await assert.rejects(main(["--aggregate", join(root, "missing.json"), paths[1]], missing.dependencies), { code: "ENOENT" });
+    await assert.rejects(main(["--aggregate", join(root, "missing.json"), paths[1], paths[2]], missing.dependencies), { code: "ENOENT" });
     const link = join(root, "link.json"); await symlink(paths[0], link);
-    await assert.rejects(main(["--aggregate", link, paths[1]], missing.dependencies), /bounded regular file/u);
+    await assert.rejects(main(["--aggregate", link, paths[1], paths[2]], missing.dependencies), /bounded regular file/u);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
