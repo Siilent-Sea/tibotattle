@@ -11,7 +11,9 @@ status: accepted
 > instruction that no new client be released for it. It mirrors the community
 > speed report-day window. The source change is on the GCP line only. It is not
 > deployed: the origin roll, analytics kernel 18 and its reprice are separate,
-> owner-run gates.
+> owner-run gates. On the unified release line the kernel is 19, shared with
+> community model speed; see the
+> [combined kernel amendment](#combined-kernel-amendment-2026-10-12).
 
 ## Context
 
