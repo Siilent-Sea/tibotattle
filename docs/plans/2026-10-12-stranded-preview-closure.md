@@ -2,14 +2,14 @@
 title: Close the stranded v1.1 preview failure
 date: 2026-10-12
 type: plan
-status: rollout-waiting-for-analytics
+status: closed-preview-verified
 ---
 
-The owner admin preview still fails with `BACKEND_STORAGE_UNAVAILABLE`.
-Completion requires the corrected origin to serve traffic and a successful
-read-only preview through the actual admin UI. Source tests alone do not close
-the incident. Activating recovered uploads and verifying their later publication
-remain distinct operations under the
+Closed on 2026-10-13: the corrected origin serves production traffic and the
+actual owner admin Preview succeeds. It examined six devices and reported two
+eligible devices with 182 new days; no uploads were activated. Both schedules
+are restored and public readiness returned HTTP 200. Activating recovered
+uploads and verifying their later publication remain distinct operations under the
 [recovery runbook](../runbooks/2026-10-11-stranded-telemetry-recovery.md).
 
 ## Verified starting evidence (2026-10-12 snapshot)
@@ -95,7 +95,7 @@ product-blob equivalence, secret and identity exclusion, the frozen-clock
 boundary assertions, real predecessor/activation behavior and scoped changes.
 Review is separate from the runtime results above and does not authorize release.
 
-## Authorized rollout checkpoint (2026-10-13)
+## Authorized rollout checkpoint (2026-10-13, before deployment)
 
 The owner approved publishing the isolated branch, the guarded production
 build and rollout, scheduler restoration, and a live read-only Preview check.
@@ -113,36 +113,101 @@ the edge-origin contract blobs match.
 
 Both scheduler triggers were recorded live `ENABLED`, then paused by the
 guarded operator at 06:25 UTC. Preflight subsequently passed with one naturally
-running analytics execution. Migration and traffic movement await its terminal
-state. At this checkpoint the serving source remains `7a4bc73e`.
+running analytics execution. Migration and traffic movement awaited its terminal
+state. At that checkpoint the serving source remained `7a4bc73e`.
 
 The separate operations change records the two already-enabled schedules in
 the committed desired state; it changes no cadence, runtime code or image pin.
 Its five-file patch passed 114 focused tests and independent review. Historical
 first-apply fixtures retain `PAUSED`, and creation still pauses before granting
-the executor role. After verified rollout, resume uses the pause receipt alone,
-without `--only`, preserving membership and unchanged-since-pause checks. The
-operator's maintenance pass precedes this resume. Keep the deployed runtime
-source bound to `eacfad5a1`; the operations commit is separate evidence.
+the executor role. This operations commit is
+`bbcbc264d33faed3ee1d4c83d7ca21ef2d2ce797`, separate from the deployed runtime
+source. Receipt-only restoration was the initial plan; the maintenance
+timestamp refusal and explicitly reviewed restoration are recorded below.
 
-## Ownership and remaining gates
+## Deployment and live verification (2026-10-13)
 
-1. The existing integration owner retains PR #292 and main. This branch owns
-   only the narrow origin correction. Local checks and independent review are
-   complete; bind the recorded final local commit to the protected rollout.
-2. Use the existing guarded operator and production deployment lock. A build
-   dry run resolves the intended production source bucket and lock without
-   external writes. Obtain fresh infrastructure, backup and edge readbacks,
-   image provenance and the required migration receipt. An unchanged schema
-   does not waive the operator's receipt requirements.
-3. Continue under the recorded approval after the running analytics job drains.
-   The other lane confirmed diagnostic-job cleanup. Refresh time-bounded
-   receipts as needed; never interrupt the job or bypass a rollout refusal.
-4. Read back the serving source and run the real admin preview. Keep opaque
-   cursors in memory and retain only aggregate results. A healthy endpoint
-   without a successful preview is insufficient.
-5. Review any eligible cohort before activation. Preserve separate authorization
-   and receipts for activation and subsequent journal/publication verification.
+The existing nightly analytics execution completed successfully at 08:17:39 UTC.
+It was never cancelled or restarted. Fresh preflight then proved both triggers
+paused, no running jobs, clean infrastructure and a healthy backup audit.
+
+The guarded operator took a successful on-demand backup, executed the migration
+job and verified its image-bound receipt at 08:41:00 UTC: 78 migrations, manifest
+SHA-256 `4d2ade49a0cbea0d26fb8e54eb7a551cc51e53e5aa3293da64750ce8d7260284`.
+No schema change was introduced by this candidate. A new 08:41:41 UTC edge
+capture verified source `94bad7999fe1e7d998aa3739c2958b56ab22a53f` and matching
+contract blob `c3a8b69cf7dd7ad471b3196df69d789921202d1d` before the roll.
+
+The roll completed at 08:44:21 UTC under the shared deployment lock. The origin
+and all three jobs were read back on the qualified image and `eacfad5a1` source.
+The serving revision is `tibotattle-origin-00015-9r4`, with 100% traffic and the
+same image digest confirmed independently from the revision. Kernel 16 and its
+closure above are unchanged. The operator completed a maintenance pass before
+checking the public health source.
+
+The live admin Preview subsequently reported:
+
+| Aggregate | Count |
+|---|---:|
+| Devices examined | 6 |
+| Eligible for activation checks | 2 |
+| New days | 182 |
+| Accepted days kept | 33 |
+| Syncing now, left to the app | 2 |
+| On v1.2, left to the app | 1 |
+| History outside this recovery scope | 1 |
+| Covered-day replacement refusal | 1 |
+
+The actual page displayed “Nothing was changed.” The saved screenshot
+has SHA-256 `f8c0bd71fac6656206b843ee6fec175853fa9ec64f6f0a829ce69afefee33898`.
+Only aggregate results and screenshot evidence were retained; no cursor or
+participant identifier was copied into this record.
+
+## Scheduler restoration and readiness
+
+The original receipt resumed analytics at 08:46:57 UTC. Maintenance correctly
+refused receipt-only restoration with `CHANGED_AFTER_PAUSE_ALL`: its recorded
+`lastAttemptTime` advanced from absent to 06:25:16 UTC after the 06:25:14 UTC
+pause receipt, while `userUpdateTime` remained unchanged. This does not prove
+the cause of that late timestamp. The refusal and original receipt were kept.
+
+Independent review confirmed the operator's documented explicit-target mode
+for restoring that one managed trigger under the owner's existing restoration
+approval. A fresh clean infrastructure check, successful maintenance execution,
+healthy serving source, and exact one-trigger dry plan preceded the write.
+The maintenance-only plan restored its prior `ENABLED` state at 08:48:14 UTC.
+No guard, receipt, cadence, authentication target or runtime pin was changed.
+The proposed interim restoration during the drain was never applied.
+
+Final readback was clean with no reasons. Both triggers are `ENABLED` at their
+original schedules: analytics `0 3 * * *`, maintenance `* * * * *`. Scheduled
+maintenance executions completed successfully after restoration. The first
+passes reported a reconciliation backlog, while the pre-pause pass had been
+complete. Normal bounded maintenance cleared it: at 08:55:09 UTC, a cache-busted
+public `/api/ready` returned HTTP 200 `ready`, with fresh lifecycle, matching
+maintenance cycle, and completed retention, restore replay and reconciliation.
+The separately delegated aggregate rebuild remains explicitly unconfirmed and
+does not gate this readiness contract.
+
+Cache-busted public health returned HTTP 200 and the exact deployed source.
+The public page and crawler check also confirmed matching Open Graph/Twitter
+images, `summary_large_image`, a real 1200-by-630 PNG, and permissive robots.
+
+The private operator records retain the build, backup, migration, edge capture,
+roll, both restoration receipts, final readbacks and screenshot hash. This is
+production Preview qualification; it is not proof of recovered-data publication.
+
+## Ownership and remaining authorization
+
+The existing integration owner retains PR #292 and main, including its broader
+checks and the additional monitoring-test expectation for committed `ENABLED`
+schedulers. This lane published the narrow origin and operations commits and
+completed their authorized production rollout.
+
+Activation of the two eligible devices has not run. It requires the separate
+owner decision already identified before deployment, a fresh Preview if the
+current result expires, and the recovery runbook's audited activation and
+journal/publication checks. Preview eligibility is rechecked at activation.
 
 No new production reads of participant rows, temporary diagnostic jobs, secret
 rotation, desktop release or data migration are needed to establish this cause.
