@@ -56,10 +56,20 @@
  *   PG_TEST_TCP_HOST=127.0.0.1 PG_TEST_TCP_PORT=55432 \
  *     node scripts/ci-postgres-suite.mjs
  *   node scripts/ci-postgres-suite.mjs --plan    # static checks only, no database
+ *
+ * CI may schedule the closed CORE and EDGE_E2E partitions on independent
+ * clusters with --partition <name> --receipt <new-file>. Each is partial
+ * evidence. --aggregate <core-receipt> <edge-receipt> recomputes the full plan,
+ * binds the provider run/attempt, exact checkout and pinned runtime versions,
+ * requires both producer jobs to succeed, and evaluates every canonical file
+ * exactly once. No-flag execution remains the complete serial gate.
+ * Progress JSON on stderr contains canonical file ownership and elapsed time
+ * only; stdout continues to contain one result summary.
  */
 
-import { spawn } from "node:child_process";
-import { access, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { spawn, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { access, lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -79,6 +89,8 @@ export const PROFILE_SOCKET = "SOCKET";
 export const PROFILE_HOST = "HOST";
 export const PROFILE_EDGE_E2E = "EDGE_E2E";
 export const NODE_RUNNER = "node";
+export const PARTITIONS = Object.freeze(["CORE", "EDGE_E2E"]);
+export const TOOLCHAIN_NODE_VERSION = "v26.2.0";
 
 /**
  * package.json scripts beyond postgres:domain:check whose ./postgres-test/
@@ -809,6 +821,7 @@ export function parseNodeTap(text, { absoluteFile, cwd }) {
     tests: Object.freeze(tests),
     fileFailure,
     parseFailures: Object.freeze(parseFailures),
+    cancelled: trailer.cancelled ?? 0,
   });
 }
 
@@ -1085,10 +1098,17 @@ export async function runPostgresSuite({
   onOutput = reportFailingOutput,
   plan: suppliedPlan = null,
   probeEdgeE2e = probeEdgeE2eEnvironment,
+  partition = null,
+  onRecords = () => {},
+  onExecutionInputs = async () => {},
+  onProgress = (entry) => process.stderr.write(`${JSON.stringify(entry)}\n`),
+  now = () => Date.now(),
 } = {}) {
   const profile = readSocketProfileInput(environment);
-  const plan = suppliedPlan ?? await planPostgresSuite({ workerRoot });
+  const canonicalPlan = suppliedPlan ?? await planPostgresSuite({ workerRoot });
+  const plan = partition === null ? canonicalPlan : partitionPostgresPlan(canonicalPlan, partition);
   if (plan.failures.length > 0) {
+    onRecords({ plan, records: [], environmentGaps: [] });
     return Object.freeze({
       status: "failed",
       files: plan.files.length,
@@ -1101,6 +1121,11 @@ export async function runPostgresSuite({
   }
   const records = [];
   const environmentGaps = [];
+  const started = now();
+  const progress = (phase, pass, runner, files) => onProgress(Object.freeze({
+    event: "postgres-suite-progress", phase, profile: pass, runner,
+    files: Object.freeze(files), elapsedMs: Math.max(0, now() - started),
+  }));
   const reportDirectory = await mkdtemp(join(tmpdir(), "tibotattle-pg-suite-"));
   try {
     const socketEnvironment = passEnvironment(environment, PROFILE_SOCKET, profile);
@@ -1108,6 +1133,8 @@ export async function runPostgresSuite({
       const planned = plan.files.filter(({ runner }) => runner === `vitest:${config}`);
       if (planned.length === 0) continue;
       const outputFile = join(reportDirectory, `${config}.json`);
+      await onExecutionInputs();
+      progress("started", PROFILE_SOCKET, `vitest:${config}`, planned.map(({ file }) => file));
       const { exitCode } = await run(process.execPath, [
         join(workerRoot, "node_modules", "vitest", "vitest.mjs"),
         "run",
@@ -1123,6 +1150,7 @@ export async function runPostgresSuite({
         report = null;
       }
       const parsed = parseVitestReport(report, { workerRoot });
+      progress("completed", PROFILE_SOCKET, `vitest:${config}`, planned.map(({ file }) => file));
       for (const [file, result] of parsed.files) {
         if (result.tests.some(({ status }) => status !== "passed") || result.fileFailure) {
           const details = result.tests.filter(({ status }) => status === "failed")
@@ -1145,6 +1173,8 @@ export async function runPostgresSuite({
       for (const entry of plan.files) {
         if (entry.runner !== NODE_RUNNER || entry.profile !== pass) continue;
         const absoluteFile = join(workerRoot, entry.file);
+        await onExecutionInputs();
+        progress("started", pass, NODE_RUNNER, [entry.file]);
         const { exitCode, stdout } = await run(process.execPath, [
           "--test",
           "--test-concurrency=1",
@@ -1152,6 +1182,7 @@ export async function runPostgresSuite({
           `./${entry.file}`,
         ], { cwd: workerRoot, env: passEnv, captureStdout: true });
         const parsed = parseNodeTap(stdout, { absoluteFile, cwd: workerRoot });
+        progress("completed", pass, NODE_RUNNER, [entry.file]);
         onOutput({ file: entry.file, text: stdout, result: parsed });
         records.push({
           pass,
@@ -1160,6 +1191,7 @@ export async function runPostgresSuite({
           exitCode,
           files: new Map([[entry.file, { tests: parsed.tests, fileFailure: parsed.fileFailure }]]),
           parseFailures: parsed.parseFailures,
+          cancelled: parsed.cancelled,
         });
       }
     }
@@ -1200,6 +1232,8 @@ export async function runPostgresSuite({
       }
       if (prerequisiteFailed) continue;
       const absoluteFile = join(workerRoot, entry.file);
+      await onExecutionInputs();
+      progress("started", PROFILE_EDGE_E2E, entry.runner, [entry.file]);
       const { exitCode, stdout } = await run(runtime.node, [
         ...EDGE_E2E_NODE_FLAGS,
         "--test",
@@ -1208,6 +1242,7 @@ export async function runPostgresSuite({
         `./${entry.file}`,
       ], { cwd: workerRoot, env: passEnv, captureStdout: true });
       const parsed = parseNodeTap(stdout, { absoluteFile, cwd: workerRoot });
+      progress("completed", PROFILE_EDGE_E2E, entry.runner, [entry.file]);
       onOutput({ file: entry.file, text: stdout, result: parsed });
       records.push({
         pass: PROFILE_EDGE_E2E,
@@ -1216,12 +1251,260 @@ export async function runPostgresSuite({
         exitCode,
         files: new Map([[entry.file, { tests: parsed.tests, fileFailure: parsed.fileFailure }]]),
         parseFailures: parsed.parseFailures,
+        cancelled: parsed.cancelled,
       });
     }
   } finally {
     await rm(reportDirectory, { recursive: true, force: true });
   }
+  onRecords({ plan, records, environmentGaps });
   return evaluatePostgresSuite({ plan, records, environmentGaps });
+}
+
+// Closed scheduling partitions; the default runner still executes the whole plan.
+export function partitionPostgresPlan(plan, partition) {
+  if (!PARTITIONS.includes(partition)) throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "unknown partition");
+  const invalid = plan.files.some(({ profile, runner, source }) =>
+    ![PROFILE_SOCKET, PROFILE_HOST, PROFILE_EDGE_E2E].includes(profile)
+    || profile === PROFILE_EDGE_E2E && (SCRIPT_PROFILES[source] !== profile || runner !== scriptRunner(source)));
+  if (invalid) throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "canonical profile ownership drift");
+  const files = plan.files.filter(({ profile }) => partition === "CORE"
+    ? profile === PROFILE_SOCKET || profile === PROFILE_HOST : profile === PROFILE_EDGE_E2E);
+  if (files.length === 0) throw new CiPostgresSuiteError("CI_SUITE_PARTITION_INVALID", "empty partition");
+  return Object.freeze({ ...plan, files: Object.freeze(files) });
+}
+
+export function parseSuiteArguments(argv) {
+  const options = { plan: false, partition: null, receipt: null, aggregate: null };
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--plan" && !options.plan) options.plan = true;
+    else if (argument === "--partition" && options.partition === null && PARTITIONS.includes(argv[index + 1])) {
+      options.partition = argv[++index];
+    } else if (argument === "--receipt" && options.receipt === null && argv[index + 1] && !argv[index + 1].startsWith("--")) {
+      options.receipt = argv[++index];
+    } else if (argument === "--aggregate" && options.aggregate === null && argv.length === index + 3
+        && argv.slice(index + 1).every((value) => value && !value.startsWith("--"))) {
+      options.aggregate = argv.slice(index + 1); index += 2;
+    } else throw new CiPostgresSuiteError("CI_SUITE_USAGE", "unsupported or duplicate argument");
+  }
+  if (options.aggregate !== null && (options.plan || options.partition !== null || options.receipt !== null)
+      || options.receipt !== null && (options.partition === null || options.plan)) {
+    throw new CiPostgresSuiteError("CI_SUITE_USAGE", "incompatible modes");
+  }
+  return Object.freeze(options);
+}
+
+const RECEIPT_VERSION = 1;
+const SHA256 = /^[a-f0-9]{64}$/u;
+const GIT_HEAD = /^[a-f0-9]{40}$/u;
+const PROVIDER_NUMBER = /^[1-9][0-9]{0,19}$/u;
+const MAX_TESTS_PER_FILE = 100_000;
+const RECEIPT_PARSE_FAILURES = new Set(["TAP_INCOMPLETE", "TAP_PARSE_MISMATCH", "VITEST_REPORT_INVALID", "PREREQUISITE_FAILED"]);
+const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
+  && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+
+/** Bind the canonical plan and execution-owning inputs, without recording file contents. */
+export async function postgresPlanDigest(plan, { workerRoot = WORKER_ROOT } = {}) {
+  const sources = [...new Set(["package.json", ...VITEST_REGISTRATION_CONFIGS,
+    "scripts/ci-postgres-suite.mjs", ...plan.files.map(({ file }) => file)])].sort();
+  const sourceDigests = [];
+  for (const file of sources) sourceDigests.push([file, sha256(await readFile(join(workerRoot, file)))]);
+  return sha256(JSON.stringify({ files: plan.files, hostProfileFiles: plan.hostProfileFiles,
+    failures: plan.failures, sourceDigests }));
+}
+
+function validContext(context) {
+  return exactKeys(context, ["sourceHead", "planDigest", "runId", "runAttempt", "toolchainNode", "imageNode"])
+    && Object.values(context).every((value) => typeof value === "string")
+    && GIT_HEAD.test(context.sourceHead) && SHA256.test(context.planDigest)
+    && PROVIDER_NUMBER.test(context.runId) && PROVIDER_NUMBER.test(context.runAttempt)
+    && context.toolchainNode === TOOLCHAIN_NODE_VERSION && context.imageNode === EDGE_E2E_NODE_VERSION;
+}
+
+/** Derive generated output ownership from the existing build's declared outputs. */
+export async function postgresBuildOwnership({ workerRoot = WORKER_ROOT } = {}) {
+  const source = await readFile(join(workerRoot, "cloud-run", "build.mjs"));
+  const declarations = [...source.toString("utf8").matchAll(/\boutputs:\s*(\[[^\]]+\])/gu)];
+  let paths;
+  try { paths = declarations.length === 1 ? JSON.parse(declarations[0][1]) : null; } catch { paths = null; }
+  if (!Array.isArray(paths) || paths.length === 0 || paths.length > 100
+      || paths.some((path) => typeof path !== "string" || !/^dist\/[a-z0-9-]+\.mjs$/u.test(path))
+      || new Set(paths).size !== paths.length) {
+    throw new CiPostgresSuiteError("CI_SUITE_BUILD_INPUT_INVALID", "canonical build output declaration is invalid");
+  }
+  return Object.freeze({ buildSourceSha256: sha256(source), paths: Object.freeze(paths.sort()) });
+}
+
+export async function postgresExecutionInputs({ workerRoot = WORKER_ROOT, builderNode } = {}) {
+  if (![TOOLCHAIN_NODE_VERSION, EDGE_E2E_NODE_VERSION].includes(builderNode)) {
+    throw new CiPostgresSuiteError("CI_SUITE_BUILD_INPUT_INVALID", "unknown builder runtime");
+  }
+  const ownership = await postgresBuildOwnership({ workerRoot });
+  const directory = join(workerRoot, "cloud-run", "dist");
+  const names = (await readdir(directory)).map((name) => `dist/${name}`).sort();
+  if (JSON.stringify(names) !== JSON.stringify(ownership.paths)) {
+    throw new CiPostgresSuiteError("CI_SUITE_BUILD_INPUT_INVALID", "generated output inventory differs from the canonical build");
+  }
+  const bundles = [];
+  for (const path of ownership.paths) {
+    const file = join(workerRoot, "cloud-run", path);
+    const stat = await lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 32 * 1024 * 1024 || stat.size === 0) {
+      throw new CiPostgresSuiteError("CI_SUITE_BUILD_INPUT_INVALID", "generated bundle is unsafe or empty");
+    }
+    const bytes = await readFile(file);
+    if (bytes.length !== stat.size) throw new CiPostgresSuiteError("CI_SUITE_BUILD_INPUT_INVALID", "generated bundle changed during binding");
+    bundles.push({ path, sha256: sha256(bytes), bytes: bytes.length });
+  }
+  return Object.freeze({ buildSourceSha256: ownership.buildSourceSha256, builderNode, bundles });
+}
+
+function validExecutionInputs(inputs, { partition, ownership }) {
+  return exactKeys(inputs, ["buildSourceSha256", "builderNode", "bundles"])
+    && inputs.buildSourceSha256 === ownership.buildSourceSha256
+    && inputs.builderNode === (partition === "CORE" ? TOOLCHAIN_NODE_VERSION : EDGE_E2E_NODE_VERSION)
+    && Array.isArray(inputs.bundles)
+    && JSON.stringify(inputs.bundles.map((entry) => entry?.path)) === JSON.stringify(ownership.paths)
+    && inputs.bundles.every((entry) => exactKeys(entry, ["path", "sha256", "bytes"])
+      && SHA256.test(entry.sha256) && Number.isSafeInteger(entry.bytes) && entry.bytes > 0 && entry.bytes <= 32 * 1024 * 1024);
+}
+
+export function assertCleanPostgresCheckout({ workerRoot = WORKER_ROOT, git = execFileSync, environment = process.env } = {}) {
+  const root = git("git", ["--no-optional-locks", "rev-parse", "--show-toplevel"],
+    { cwd: workerRoot, encoding: "utf8", env: { ...environment, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" } }).trim();
+  const options = { cwd: root, stdio: "ignore", env: { ...environment, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" } };
+  try {
+    git("git", ["--no-optional-locks", "diff", "--quiet", "HEAD", "--"], options);
+    git("git", ["--no-optional-locks", "diff", "--cached", "--quiet", "--"], options);
+  } catch {
+    throw new CiPostgresSuiteError("CI_SUITE_RECEIPT_CONTEXT_INVALID", "tracked source or index differs from the selected revision");
+  }
+}
+
+export async function receiptContext({ plan, workerRoot = WORKER_ROOT, environment = process.env, probeImage = false, probe = spawnProcess }) {
+  assertCleanPostgresCheckout({ workerRoot, environment });
+  const sourceHead = execFileSync("git", ["--no-optional-locks", "rev-parse", "HEAD"],
+    { cwd: workerRoot, encoding: "utf8", env: { ...environment, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" } }).trim();
+  const expected = environment.CI_POSTGRES_EXPECTED_HEAD;
+  const context = { sourceHead, planDigest: await postgresPlanDigest(plan, { workerRoot }),
+    runId: environment.GITHUB_RUN_ID, runAttempt: environment.GITHUB_RUN_ATTEMPT,
+    toolchainNode: process.version, imageNode: EDGE_E2E_NODE_VERSION };
+  if (!validContext(context) || !GIT_HEAD.test(expected ?? "") || expected !== sourceHead) {
+    throw new CiPostgresSuiteError("CI_SUITE_RECEIPT_CONTEXT_INVALID", "checkout, expected revision, provider run or toolchain binding is invalid");
+  }
+  if (probeImage) {
+    const node = environment[EDGE_E2E_NODE_VARIABLE];
+    if (typeof node !== "string" || !node.startsWith("/")) {
+      throw new CiPostgresSuiteError("CI_SUITE_RECEIPT_CONTEXT_INVALID", "image runtime is unnamed");
+    }
+    const result = await probe(node, ["--version"], { cwd: workerRoot, env: {}, captureStdout: true });
+    if (result.exitCode !== 0 || result.stdout.trim() !== EDGE_E2E_NODE_VERSION) {
+      throw new CiPostgresSuiteError("CI_SUITE_RECEIPT_CONTEXT_INVALID", "image runtime version differs");
+    }
+  }
+  return Object.freeze(context);
+}
+
+/** Content-free records preserve every evaluator input that can refuse a pass. */
+export function createPostgresReceipt({ plan, context, partition, execution, executionInputs }) {
+  if (!validContext(context) || execution === null) throw new CiPostgresSuiteError("CI_SUITE_RECEIPT_INVALID", "missing execution binding");
+  const selected = partitionPostgresPlan(plan, partition);
+  const records = execution.records.map((record) => ({
+    profile: record.pass, runner: record.runner, file: record.file,
+    exitCode: record.exitCode, cancelled: record.cancelled ?? 0,
+    parseFailures: [...record.parseFailures],
+    files: [...record.files].map(([file, result]) => ({ file,
+      fileFailed: result.fileFailure !== null && result.fileFailure !== undefined,
+      fileEnvironmentFailure: result.fileFailure != null && classifyFailureDetail(result.fileFailure) === "ENV_PROFILE_CONFLICT",
+      passed: result.tests.filter(({ status }) => status === "passed").length,
+      failed: result.tests.filter(({ status }) => !["passed", "skipped", "todo"].includes(status)).length,
+      environmentFailed: result.tests.filter(({ status, detail }) => !["passed", "skipped", "todo"].includes(status)
+        && classifyFailureDetail(detail) === "ENV_PROFILE_CONFLICT").length,
+      skipped: result.tests.filter(({ status }) => status === "skipped").length,
+      todo: result.tests.filter(({ status }) => status === "todo").length,
+    })),
+  }));
+  return Object.freeze({ version: RECEIPT_VERSION, scope: "partition", partition, ...context,
+    executionInputs,
+    inventory: selected.files.map(({ file, profile, runner }) => ({ file, profile, runner })), records,
+    environmentGaps: execution.environmentGaps.map(({ code, file, profile }) => ({ code, file, profile })),
+    planFailureCodes: plan.failures.map(({ code }) => code),
+  });
+}
+
+/** Recompute the full plan, refuse incomplete producers, then reuse the canonical evaluator. */
+export function aggregatePostgresReceipts({ plan, context, receipts, jobResults, ownership }) {
+  const refuse = (code) => Object.freeze({ status: "failed", scope: "complete", files: plan.files.length,
+    tests: 0, passedByPass: { SOCKET: 0, HOST: 0, EDGE_E2E: 0 }, skipped: [], environmentGaps: [],
+    failures: [{ code, file: null }] });
+  if (!validContext(context) || plan.failures.length > 0) return refuse("AGGREGATE_CONTEXT_INVALID");
+  if (!exactKeys(jobResults, PARTITIONS) || PARTITIONS.some((name) => jobResults[name] !== "success")) return refuse("PARTITION_JOB_FAILED");
+  if (!Array.isArray(receipts) || receipts.length !== PARTITIONS.length) return refuse("PARTITION_SET_INVALID");
+  const records = [];
+  const seenPartitions = new Set();
+  const planned = new Map(plan.files.map((entry) => [entry.file, entry]));
+  const seenFiles = new Set();
+  const seenGroups = new Set();
+  for (const receipt of receipts) {
+    if (!exactKeys(receipt, ["version", "scope", "partition", ...Object.keys(context), "inventory", "records", "environmentGaps", "planFailureCodes", "executionInputs"])
+        || receipt.version !== RECEIPT_VERSION || receipt.scope !== "partition" || !PARTITIONS.includes(receipt.partition)
+        || seenPartitions.has(receipt.partition) || Object.keys(context).some((key) => receipt[key] !== context[key])) {
+      return refuse("PARTITION_PROVENANCE_INVALID");
+    }
+    if (!validExecutionInputs(receipt.executionInputs, { partition: receipt.partition, ownership })) return refuse("PARTITION_BUILD_INPUT_INVALID");
+    seenPartitions.add(receipt.partition);
+    const selected = partitionPostgresPlan(plan, receipt.partition).files.map(({ file, profile, runner }) => ({ file, profile, runner }));
+    if (JSON.stringify(receipt.inventory) !== JSON.stringify(selected)
+        || !Array.isArray(receipt.records) || receipt.records.length > selected.length + VITEST_REGISTRATION_CONFIGS.length
+        || !Array.isArray(receipt.environmentGaps) || receipt.environmentGaps.length !== 0
+        || !Array.isArray(receipt.planFailureCodes) || receipt.planFailureCodes.length !== 0) return refuse("PARTITION_COVERAGE_INVALID");
+    const owned = new Set(selected.map(({ file }) => file));
+    for (const record of receipt.records) {
+      if (!exactKeys(record, ["profile", "runner", "file", "exitCode", "cancelled", "parseFailures", "files"])
+          || !Number.isInteger(record.exitCode) || record.exitCode < 0 || record.exitCode > 255
+          || !Number.isSafeInteger(record.cancelled) || record.cancelled !== 0
+          || !Array.isArray(record.parseFailures) || record.parseFailures.some((code) => !RECEIPT_PARSE_FAILURES.has(code))
+          || typeof record.profile !== "string" || typeof record.runner !== "string"
+          || record.file !== null && typeof record.file !== "string"
+          || (record.file === null) !== record.runner.startsWith("vitest:")
+          || !Array.isArray(record.files) || record.files.length > selected.length
+          || record.file !== null && !owned.has(record.file)) return refuse("PARTITION_RECORD_INVALID");
+      const group = `${record.profile}\0${record.runner}\0${record.file ?? ""}`;
+      const expectedFiles = selected.filter((entry) => entry.profile === record.profile && entry.runner === record.runner
+        && (record.file === null ? record.runner.startsWith("vitest:") : entry.file === record.file))
+        .map(({ file }) => file).sort();
+      if (seenGroups.has(group) || expectedFiles.length === 0
+          || JSON.stringify(record.files.map(({ file }) => file).sort()) !== JSON.stringify(expectedFiles)) {
+        return refuse("PARTITION_RECORD_INVALID");
+      }
+      seenGroups.add(group);
+      const files = new Map();
+      for (const result of record.files) {
+        const entry = planned.get(result?.file);
+        if (!exactKeys(result, ["file", "fileFailed", "fileEnvironmentFailure", "passed", "failed", "environmentFailed", "skipped", "todo"])
+            || !owned.has(result.file) || seenFiles.has(result.file) || entry.profile !== record.profile || entry.runner !== record.runner
+            || typeof result.fileFailed !== "boolean" || typeof result.fileEnvironmentFailure !== "boolean"
+            || result.fileEnvironmentFailure && !result.fileFailed
+            || ["passed", "failed", "environmentFailed", "skipped", "todo"].some((key) => !Number.isSafeInteger(result[key]) || result[key] < 0 || result[key] > MAX_TESTS_PER_FILE)
+            || result.environmentFailed > result.failed
+            || result.passed + result.failed + result.skipped + result.todo > MAX_TESTS_PER_FILE) return refuse("PARTITION_RECORD_INVALID");
+        seenFiles.add(result.file);
+        const tests = [];
+        for (const status of ["passed", "failed", "skipped", "todo"]) {
+          for (let index = 0; index < result[status]; index += 1) tests.push({ name: `${status}-${index + 1}`, status,
+            detail: status === "failed" && index < result.environmentFailed ? "PG_TEST_SOCKET" : "" });
+        }
+        files.set(result.file, { tests, fileFailure: result.fileFailed ? result.fileEnvironmentFailure ? "PG_TEST_SOCKET" : "failed" : null });
+      }
+      records.push({ pass: record.profile, runner: record.runner, file: record.file,
+        exitCode: record.exitCode, parseFailures: record.parseFailures, files });
+    }
+  }
+  if (seenPartitions.size !== PARTITIONS.length || seenFiles.size !== planned.size) return refuse("PARTITION_COVERAGE_INVALID");
+  return Object.freeze({ ...evaluatePostgresSuite({ plan, records }), scope: "complete", sourceHead: context.sourceHead,
+    planDigest: context.planDigest, runId: context.runId, runAttempt: context.runAttempt });
 }
 
 function printFailures(failures) {
@@ -1234,35 +1517,71 @@ function printFailures(failures) {
   }
 }
 
-async function main(argv) {
-  const known = new Set(["--plan"]);
-  const unknown = argv.filter((argument) => !known.has(argument));
-  if (unknown.length > 0) {
-    throw new CiPostgresSuiteError("CI_SUITE_USAGE", `unknown argument ${unknown[0]}`);
+export async function main(argv, {
+  loadPlan = planPostgresSuite, readContext = receiptContext, execute = runPostgresSuite,
+  loadOwnership = postgresBuildOwnership, bindInputs = postgresExecutionInputs,
+  writeSummary = (summary) => process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`),
+  setExitCode = (code) => { process.exitCode = code; }, environment = process.env,
+} = {}) {
+  const options = parseSuiteArguments(argv);
+  if (options.aggregate !== null) {
+    const plan = await loadPlan();
+    const context = await readContext({ plan, environment });
+    const receipts = await Promise.all(options.aggregate.map(async (path) => {
+      const stat = await lstat(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8 * 1024 * 1024) {
+        throw new CiPostgresSuiteError("CI_SUITE_RECEIPT_INVALID", "receipt must be a bounded regular file");
+      }
+      return JSON.parse(await readFile(path, "utf8"));
+    }));
+    const summary = aggregatePostgresReceipts({ plan, context, receipts,
+      jobResults: { CORE: environment.CI_POSTGRES_CORE_RESULT, EDGE_E2E: environment.CI_POSTGRES_EDGE_E2E_RESULT },
+      ownership: await loadOwnership() });
+    writeSummary(summary);
+    if (summary.status !== "passed") setExitCode(1);
+    return;
   }
-  if (argv.includes("--plan")) {
-    const plan = await planPostgresSuite();
-    process.stdout.write(`${JSON.stringify({
+  if (options.plan) {
+    const canonical = await loadPlan();
+    const plan = options.partition === null ? canonical : partitionPostgresPlan(canonical, options.partition);
+    writeSummary({
       status: plan.failures.length === 0 ? "planned" : "failed",
+      ...(options.partition === null ? {} : { scope: "partition", partition: options.partition }),
       files: plan.files.map(({ file, runner, profile }) => ({ file, runner, profile })),
       hostProfileFiles: plan.hostProfileFiles,
       explicitProfileFiles: plan.files.filter(({ profile }) => profile === PROFILE_EDGE_E2E)
         .map(({ file, runner, profile }) => ({ file, runner, profile })),
       unregisteredAllowlist: UNREGISTERED_ALLOWLIST,
       failures: plan.failures,
-    }, null, 2)}\n`);
-    if (plan.failures.length > 0) {
-      printFailures(plan.failures);
-      process.exitCode = 1;
-    }
+    });
+    if (plan.failures.length > 0) { printFailures(plan.failures); setExitCode(1); }
     return;
   }
-  const summary = await runPostgresSuite();
-  process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+  const plan = await loadPlan();
+  const context = options.receipt === null ? null : await readContext({ plan, environment, probeImage: true });
+  let execution = null;
+  let executionInputs = null;
+  const builderNode = options.partition === "CORE" ? TOOLCHAIN_NODE_VERSION : EDGE_E2E_NODE_VERSION;
+  const summary = await execute({ plan, partition: options.partition, environment,
+    onRecords: (value) => { execution = value; },
+    onExecutionInputs: async () => {
+      if (options.receipt !== null && executionInputs === null) executionInputs = await bindInputs({ builderNode });
+    } });
+  if (options.receipt !== null) {
+    const finalPlan = await loadPlan();
+    const finalContext = await readContext({ plan: finalPlan, environment, probeImage: true });
+    if (JSON.stringify(finalContext) !== JSON.stringify(context)) {
+      throw new CiPostgresSuiteError("CI_SUITE_RECEIPT_CONTEXT_INVALID", "source or runtime changed during execution");
+    }
+    if (executionInputs === null || JSON.stringify(await bindInputs({ builderNode })) !== JSON.stringify(executionInputs)) {
+      throw new CiPostgresSuiteError("CI_SUITE_BUILD_INPUT_INVALID", "generated execution inputs are absent or changed");
+    }
+    const receipt = createPostgresReceipt({ plan, context, partition: options.partition, execution, executionInputs });
+    await writeFile(options.receipt, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  }
+  writeSummary(options.partition === null ? summary : { ...summary, scope: "partition", partition: options.partition });
   if (summary.status !== "passed") {
-    printFailures(summary.failures);
-    printFailures(summary.environmentGaps);
-    process.exitCode = 1;
+    printFailures(summary.failures); printFailures(summary.environmentGaps); setExitCode(1);
   }
 }
 

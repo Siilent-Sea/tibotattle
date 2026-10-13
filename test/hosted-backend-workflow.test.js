@@ -15,6 +15,8 @@ const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW_PATH = ".github/workflows/hosted-backend.yml";
 const CONTAINER_SCRIPT = "apps/worker/scripts/ci-postgres-container.mjs";
 const CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+const UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const DOWNLOAD_ARTIFACT = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
 const SETUP_NODE = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
 const EXPECTED_PATHS = Object.freeze([
   "apps/worker/**",
@@ -36,23 +38,26 @@ const STOP_POSTGRES = "node apps/worker/scripts/ci-postgres-container.mjs --stop
 const SUITE_SCRIPT = "apps/worker/scripts/ci-postgres-suite.mjs";
 const EDGE_SPEC = "apps/worker/postgres-test/edge-origin-e2e.spec.mjs";
 const TRANSFER_SPEC = "apps/worker/postgres-test/postgres-v12-transfer.spec.mjs";
+const SELECTED_SOURCE_EXPRESSION = "${{ github.event.pull_request.head.sha || github.sha }}";
 const TOOLCHAIN_NODE = "26.2.0";
 const IMAGE_NODE = "22.16.0";
-// Every job runs the repository toolchain. Only the PostgreSQL 17 suite also
+// Every job runs the repository toolchain. Both PostgreSQL partitions also
 // installs the Cloud Run image runtime, first, so the toolchain stays first on
 // PATH. The Cloud Run image runtime is allowed in this workflow only; see
 // scripts/check-release-workflow-policy.mjs.
 const NODE_PLAN = Object.freeze({
   "worker-gate": Object.freeze([TOOLCHAIN_NODE]),
   "cloud-run-check": Object.freeze([TOOLCHAIN_NODE]),
-  "postgres-17-suite": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
+  "postgres-17-core": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
+  "postgres-17-edge-e2e": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
+  "postgres-17-suite": Object.freeze([TOOLCHAIN_NODE]),
 });
 // The Worker gate runs vendored-kernel identity and transition checks against
 // pinned production commits and the reviewed historical facade. The Cloud Run
 // check runs the cutover seal check against pinned restore-base and production
 // commits. The PostgreSQL 17 suite archives its pinned READ-EXPANSION base.
 // Every job needs these immutable Git objects and fails without full history.
-const FETCH_DEPTH = Object.freeze({ "worker-gate": 0, "cloud-run-check": 0, "postgres-17-suite": 0 });
+const FETCH_DEPTH = Object.freeze(Object.fromEntries(Object.keys(NODE_PLAN).map((id) => [id, 0])));
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
@@ -221,14 +226,14 @@ test("hosted-backend is read-only: contents read, no secrets, no environments, p
   assert.ok(uses.length > 0);
   for (const action of uses) {
     assert.match(action, /^[^@\s]+@[0-9a-f]{40}$/u, `${action} is pinned to a full commit SHA`);
-    assert.ok([CHECKOUT, SETUP_NODE].includes(action), `${action} is a reviewed pin`);
+    assert.ok([CHECKOUT, SETUP_NODE, UPLOAD_ARTIFACT, DOWNLOAD_ARTIFACT].includes(action), `${action} is a reviewed pin`);
   }
   for (const [id, job] of Object.entries(workflow.jobs)) {
     assert.equal(job.permissions, undefined, `${id} inherits contents: read`);
     assert.equal(job.environment, undefined, `${id} has no environment`);
     for (const step of job.steps) {
       if (step.uses === CHECKOUT) {
-        assert.deepEqual(step.with, { "fetch-depth": FETCH_DEPTH[id], "persist-credentials": false },
+        assert.deepEqual(step.with, { ref: SELECTED_SOURCE_EXPRESSION, "fetch-depth": FETCH_DEPTH[id], "persist-credentials": false },
           `${id} checks out its reviewed history depth without persisted credentials`);
       }
       if (step.uses === SETUP_NODE) {
@@ -276,12 +281,14 @@ test("every job that runs the cutover seal check checks out full history", async
 
 test("no run block interpolates GitHub expressions into a shell", async () => {
   const { text, workflow } = await loadWorkflow();
-  assert.doesNotMatch(text, /\$\{\{\s*github\.event/u);
+  assert.doesNotMatch(text.replaceAll(SELECTED_SOURCE_EXPRESSION, "reviewed-source"), /\$\{\{\s*github\.event/u, "the reviewed SHA selection is the only event expression");
   for (const [id, job] of Object.entries(workflow.jobs)) {
     for (const command of runs(job)) {
       assert.doesNotMatch(command, /\$\{\{/u, `${id} run blocks use environment variables, not expressions`);
     }
-    for (const step of job.steps) assert.equal(step.env, undefined, `${id} steps take no expression env`);
+    for (const step of job.steps) {
+      if (step.env !== undefined) assert.deepEqual(step.env, reviewedReceiptEnvironment(id), `${id} uses only immutable source and job-result env`);
+    }
     for (const [name, value] of Object.entries(job.env ?? {})) {
       assert.equal(typeof value, "string", `${id} env ${name} is a quoted literal`);
       assert.doesNotMatch(value, /\$\{\{/u, `${id} env ${name} is static`);
@@ -289,14 +296,16 @@ test("no run block interpolates GitHub expressions into a shell", async () => {
   }
 });
 
-test("three jobs run the Worker gate, the Cloud Run check and the routed PostgreSQL 17 suite", async () => {
+test("five jobs preserve the Worker and Cloud Run gates, split PostgreSQL execution and require the aggregate", async () => {
   const { workflow } = await loadWorkflow();
-  assert.deepEqual(Object.keys(workflow.jobs), ["worker-gate", "cloud-run-check", "postgres-17-suite"]);
-  const timeouts = { "worker-gate": 60, "cloud-run-check": 30, "postgres-17-suite": 45 };
+  assert.deepEqual(Object.keys(workflow.jobs), Object.keys(NODE_PLAN));
+  const timeouts = { "worker-gate": 60, "cloud-run-check": 30, "postgres-17-core": 45, "postgres-17-edge-e2e": 45, "postgres-17-suite": 45 };
   const gates = {
     "worker-gate": "npm --prefix apps/worker run check",
     "cloud-run-check": "npm --prefix apps/worker/cloud-run run check",
-    "postgres-17-suite": "node apps/worker/scripts/ci-postgres-suite.mjs",
+    "postgres-17-core": partitionCommand("CORE", "core"),
+    "postgres-17-edge-e2e": partitionCommand("EDGE_E2E", "edge-e2e"),
+    "postgres-17-suite": aggregateCommand(),
   };
   for (const [id, job] of Object.entries(workflow.jobs)) {
     assert.equal(job["runs-on"], "ubuntu-24.04", id);
@@ -313,14 +322,21 @@ test("three jobs run the Worker gate, the Cloud Run check and the routed Postgre
     const socketRoot = commands.findIndex((command) => command.includes("sudo mkdir -p /private/tmp"));
     const start = commands.indexOf(START_POSTGRES);
     const gate = commands.indexOf(gates[id]);
+    if (id === "postgres-17-suite") {
+      assert.equal(socketRoot, -1);
+      assert.equal(start, -1);
+      assert.equal(commands.filter((command) => command === gates[id]).length, 1);
+      assert.equal(job.steps.filter((step) => step.if !== undefined).length, 0);
+      continue;
+    }
     assert.ok(socketRoot >= 0 && start > socketRoot, `${id} prepares /private/tmp before PostgreSQL`);
     assert.match(commands[socketRoot], /sudo chmod 1777 \/private\/tmp/u);
     assert.ok(gate > start, `${id} runs its gate with the SOCKET profile exported`);
     assert.equal(commands.filter((command) => command === gates[id]).length, 1);
 
-    const last = job.steps.at(-1);
+    const last = job.steps.find((step) => step.run?.trim() === STOP_POSTGRES);
     assert.deepEqual([last.if, last.run?.trim()], ["always()", STOP_POSTGRES], `${id} always stops PostgreSQL`);
-    assert.equal(job.steps.filter((step) => step.if !== undefined).length, 1, `${id} has one conditional step`);
+    assert.equal(job.steps.filter((step) => step.if !== undefined).length, id.startsWith("postgres-17-") ? 2 : 1, `${id} conditionals are only stop and receipt preservation`);
   }
   const worker = runs(workflow.jobs["worker-gate"]);
   // This contract test runs in CI too, so a change that only a local root
@@ -385,18 +401,17 @@ test("the measurement prerequisite contract rejects missing, weakened, duplicate
   }
 });
 
-test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only that job does", async () => {
+test("only the two PostgreSQL partition jobs get the container's loopback TCP pair", async () => {
   // Without the pair the journal-transfer spec's TCP tests skip, which the
   // suite reports as SILENTLY_SKIPPED; with a wrong port they fail to connect.
   const { workflow } = await loadWorkflow();
   const container = await readFile(join(REPOSITORY_ROOT, CONTAINER_SCRIPT), "utf8");
   const publish = [...container.matchAll(/^export const LOOPBACK_PUBLISH = "127\.0\.0\.1:(\d+):5432";$/gmu)];
   assert.equal(publish.length, 1, "the container publishes exactly one loopback TCP port");
-  assert.deepEqual(workflow.jobs["postgres-17-suite"].env, {
-    PG_TEST_TCP_HOST: "127.0.0.1",
-    PG_TEST_TCP_PORT: publish[0][1],
-  });
-  for (const id of ["worker-gate", "cloud-run-check"]) {
+  for (const id of ["postgres-17-core", "postgres-17-edge-e2e"]) {
+    assert.deepEqual(workflow.jobs[id].env, { PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: publish[0][1] });
+  }
+  for (const id of ["worker-gate", "cloud-run-check", "postgres-17-suite"]) {
     assert.equal(Object.keys(workflow.jobs[id].env ?? {}).some((name) => name.startsWith("PG_TEST_")), false,
       `${id} never dials the TCP pair`);
   }
@@ -691,9 +706,10 @@ function edgeRuntimeFailures(workflow, { suite, spec, transferSpec, goldenFiles 
     if (file.exists !== true) failures.push(`the golden lacks ${file.path}, which the edge spec's S9 stage reads`);
   }
   for (const [id, job] of Object.entries(workflow.jobs)) {
-    if (id !== "postgres-17-suite") {
-      if (job.steps.some((step) => /EDGE_E2E_|POSTGRES_V12_TRANSFER_Q1_DUMP|22\.16/u.test(`${step.run ?? ""}${step.with?.["node-version"] ?? ""}`))) {
-        failures.push(`${id} names the edge runtime; only postgres-17-suite runs the edge spec`);
+    if (id === "postgres-17-core") continue;
+    if (id !== "postgres-17-edge-e2e") {
+      if (job.steps.some((step) => /\bEDGE_E2E_(?:NODE|GOLDEN|REHEARSAL_NODE)\b|POSTGRES_V12_TRANSFER_Q1_DUMP|22\.16/u.test(`${step.run ?? ""}${step.with?.["node-version"] ?? ""}`))) {
+        failures.push(`${id} names the edge runtime; only postgres-17-edge-e2e runs the edge spec`);
       }
       continue;
     }
@@ -701,7 +717,7 @@ function edgeRuntimeFailures(workflow, { suite, spec, transferSpec, goldenFiles 
     const name = stepAt(job, runMatches(/EDGE_E2E_NODE=/u));
     const toolchain = stepAt(job, isSetupNode(TOOLCHAIN_NODE));
     const rehearsal = stepAt(job, runMatches(/EDGE_E2E_REHEARSAL_NODE=/u));
-    const gate = stepAt(job, (step) => step.run?.trim() === `node ${SUITE_SCRIPT}`);
+    const gate = stepAt(job, (step) => step.run?.trim() === partitionCommand("EDGE_E2E", "edge-e2e"));
     if (!(image >= 0 && image < name && name < toolchain && toolchain < rehearsal && rehearsal < gate)) {
       failures.push("the image runtime, its naming step, the toolchain, the rehearsal runtime and the suite are out of order");
     }
@@ -826,12 +842,12 @@ test("the Cloud Run job runs the offline parts of gcp:production-tooling:local-c
 test("the PostgreSQL 17 suite runs the edge end-to-end spec under Node.js 22.16.0 and the Q-1 dump case, both from the committed golden", async () => {
   const { workflow } = await loadWorkflow();
   assert.deepEqual(edgeRuntimeFailures(workflow, await loadContractInputs()), []);
-  const job = workflow.jobs["postgres-17-suite"];
+  const job = workflow.jobs["postgres-17-edge-e2e"];
   assert.deepEqual(job.steps.filter(({ uses }) => uses === SETUP_NODE).map((step) => step.with["node-version"]),
     [IMAGE_NODE, TOOLCHAIN_NODE]);
   // Still the suite's single gate, still no skips: the suite is not given an
   // opt-out for the edge spec.
-  assert.equal(runs(job).filter((command) => command === `node ${SUITE_SCRIPT}`).length, 1);
+  assert.equal(runs(job).filter((command) => command === partitionCommand("EDGE_E2E", "edge-e2e")).length, 1);
   assert.equal(job.env.EDGE_E2E_NODE, undefined);
 });
 
@@ -852,11 +868,11 @@ test("hosted CI contract: a job that drops the Cloud Run lockfile or the toolcha
 
   const second = structuredClone(workflow);
   second.jobs["worker-gate"].steps.splice(1, 0, structuredClone(
-    second.jobs["postgres-17-suite"].steps[stepAt(second.jobs["postgres-17-suite"], isSetupNode(IMAGE_NODE))]));
+    second.jobs["postgres-17-edge-e2e"].steps[stepAt(second.jobs["postgres-17-edge-e2e"], isSetupNode(IMAGE_NODE))]));
   assert.match(toolchainFailures(second).join("\n"), /worker-gate installs Node\.js \["22\.16\.0","26\.2\.0"\]/u);
 
   const imageLast = structuredClone(workflow);
-  const suite = imageLast.jobs["postgres-17-suite"];
+  const suite = imageLast.jobs["postgres-17-edge-e2e"];
   const [imageSetup] = suite.steps.splice(stepAt(suite, isSetupNode(IMAGE_NODE)), 1);
   suite.steps.splice(stepAt(suite, runMatches(/pnpm install/u)), 0, imageSetup);
   assert.ok(toolchainFailures(imageLast).length > 0, "the image runtime may not follow the toolchain");
@@ -920,7 +936,7 @@ test("hosted CI contract: an edge runtime that is unnamed, misplaced, drifted or
   const inputs = await loadContractInputs();
   const mutate = (change) => {
     const copy = structuredClone(workflow);
-    change(copy.jobs["postgres-17-suite"], copy);
+    change(copy.jobs["postgres-17-edge-e2e"], copy);
     return edgeRuntimeFailures(copy, inputs);
   };
 
@@ -958,7 +974,7 @@ test("hosted CI contract: an edge runtime that is unnamed, misplaced, drifted or
     job.steps.splice(stepAt(job, isSetupNode(IMAGE_NODE)), 0, tool);
   }).some((failure) => failure.includes("out of order")));
   assert.ok(mutate((job) => {
-    const [gate] = job.steps.splice(stepAt(job, (step) => step.run?.trim() === `node ${SUITE_SCRIPT}`), 1);
+    const [gate] = job.steps.splice(stepAt(job, (step) => step.run?.trim() === partitionCommand("EDGE_E2E", "edge-e2e")), 1);
     job.steps.splice(stepAt(job, isSetupNode(IMAGE_NODE)), 0, gate);
   }).some((failure) => failure.includes("out of order")), "suite before runtimes");
 
@@ -976,7 +992,7 @@ test("hosted CI contract: an edge runtime that is unnamed, misplaced, drifted or
   for (const id of ["worker-gate", "cloud-run-check"]) {
     const leaked = structuredClone(workflow);
     leaked.jobs[id].steps.splice(1, 0, { name: "leak", run: "printf 'EDGE_E2E_NODE=x\\n' >> \"$GITHUB_ENV\"" });
-    assert.deepEqual(edgeRuntimeFailures(leaked, inputs), [`${id} names the edge runtime; only postgres-17-suite runs the edge spec`]);
+    assert.deepEqual(edgeRuntimeFailures(leaked, inputs), [`${id} names the edge runtime; only postgres-17-edge-e2e runs the edge spec`]);
   }
 
   // The names and the version are pinned to the suite and the spec.
@@ -1034,7 +1050,7 @@ test("the workflow policy allows the reviewed Node.js versions only, and 22.16.0
   const mutated = inspectWorkflowSource(text.replace(`node-version: ${IMAGE_NODE}`, "node-version: 22"), { path: WORKFLOW_PATH });
   assert.equal(mutated.length, 1, "the checked-in workflow, with its image runtime loosened to a major alias");
   const widened = inspectWorkflowSource(text, { path: ".github/workflows/electron-linux-production-package.yml" });
-  assert.equal(widened.length, 1, "the checked-in image runtime step is refused in any other workflow");
+  assert.equal(widened.length, 2, "both checked-in image runtime steps are refused in any other workflow");
 });
 
 test("the workflow policy refuses a setup-node step without one exact version or with a floating one", () => {
@@ -1151,4 +1167,178 @@ test("the workflow policy closes the setup-node inputs to the reviewed list and 
   // Text that mentions an unreviewed input outside a setup-node step is not a step.
   assert.deepEqual(inspectWorkflowSource(
     `jobs:\n  job:\n    steps:\n      - uses: ${CHECKOUT}\n        with:\n          persist-credentials: false\n          mirror: not-a-setup-node-input\n`, { path }), []);
+});
+
+
+const PARTITION_PLAN = Object.freeze([
+  Object.freeze({ id: "postgres-17-core", partition: "CORE", stem: "core" }),
+  Object.freeze({ id: "postgres-17-edge-e2e", partition: "EDGE_E2E", stem: "edge-e2e" }),
+]);
+function reviewedReceiptEnvironment(id) {
+  const source = { CI_POSTGRES_EXPECTED_HEAD: SELECTED_SOURCE_EXPRESSION };
+  if (id === "postgres-17-suite") return { ...source,
+    CI_POSTGRES_CORE_RESULT: "${{ needs.postgres-17-core.result }}",
+    CI_POSTGRES_EDGE_E2E_RESULT: "${{ needs.postgres-17-edge-e2e.result }}" };
+  assert.ok(PARTITION_PLAN.some((entry) => entry.id === id), `${id} has no reviewed expression env`);
+  return source;
+}
+function receiptArtifactName(stem) {
+  return `postgres-17-${stem}-receipt-${"${{ github.run_id }}"}-${"${{ github.run_attempt }}"}`;
+}
+function partitionCommand(partition, stem) {
+  return ["set -euo pipefail", 'test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"',
+    `node ${SUITE_SCRIPT} --partition ${partition} --receipt "$RUNNER_TEMP/postgres-17-${stem}.json"`].join("\n");
+}
+function aggregateCommand() {
+  return ["set -euo pipefail", 'test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"',
+    'test "$CI_POSTGRES_CORE_RESULT" = "success"', 'test "$CI_POSTGRES_EDGE_E2E_RESULT" = "success"',
+    `node ${SUITE_SCRIPT} --aggregate "$RUNNER_TEMP/postgres-17-core/postgres-17-core.json" "$RUNNER_TEMP/postgres-17-edge-e2e/postgres-17-edge-e2e.json"`].join("\n");
+}
+function partitionWorkflowFailures(workflow) {
+  const failures = [];
+  if (JSON.stringify(Object.keys(workflow.jobs)) !== JSON.stringify(Object.keys(NODE_PLAN))) failures.push("the five reviewed jobs are not present exactly once");
+  for (const [id, job] of Object.entries(workflow.jobs)) {
+    const checkouts = job.steps.filter(step => step.uses === CHECKOUT);
+    if (checkouts.length !== 1 || checkouts[0]?.with?.ref !== SELECTED_SOURCE_EXPRESSION) failures.push(`${id} does not select the exact provider PR head or non-PR revision`);
+  }
+  for (const { id, partition, stem } of PARTITION_PLAN) {
+    const job = workflow.jobs[id];
+    if (!job) { failures.push(`${id} is missing`); continue; }
+    if (job.if !== undefined || job["continue-on-error"] !== undefined) failures.push(`${id} is conditional or permits failure`);
+    if (job["timeout-minutes"] !== 45) failures.push(`${id} changes the 45 minute deadline`);
+    if (JSON.stringify(job.env) !== JSON.stringify({ PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: "55432" })) failures.push(`${id} changes trusted job environment`);
+    if (job.steps.some(step => step["continue-on-error"] !== undefined
+      || (step.if !== undefined && step.run?.trim() !== STOP_POSTGRES && step.uses !== UPLOAD_ARTIFACT))) failures.push(`${id} makes execution prerequisites conditional or permits failure`);
+    const suiteSteps = job.steps.filter(step => step.run?.includes(`node ${SUITE_SCRIPT}`));
+    if (suiteSteps.length !== 1) failures.push(`${id} must invoke the canonical runner exactly once`);
+    const gate = job.steps.filter(step => step.run?.trim() === partitionCommand(partition, stem));
+    if (gate.length !== 1 || JSON.stringify(gate[0]?.env) !== JSON.stringify(reviewedReceiptEnvironment(id))) failures.push(`${id} does not run its one exact source-bound partition`);
+    if (gate[0]?.if !== undefined || gate[0]?.["continue-on-error"] !== undefined) failures.push(`${id} gate permits conditional or failed execution`);
+    const uploads = job.steps.filter(step => step.uses?.startsWith("actions/upload-artifact@"));
+    const expected = { name: receiptArtifactName(stem), path: `\${{ runner.temp }}/postgres-17-${stem}.json`, "if-no-files-found": "error", "retention-days": 7 };
+    if (uploads.length !== 1 || uploads[0]?.uses !== UPLOAD_ARTIFACT || uploads[0]?.if !== "always()"
+      || uploads[0]?.["continue-on-error"] !== undefined || JSON.stringify(uploads[0]?.with) !== JSON.stringify(expected)) failures.push(`${id} does not always retain its one exact seven-day receipt`);
+    if (job.steps.at(-1) !== uploads[0]) failures.push(`${id} receipt upload must follow database cleanup`);
+    const start = stepAt(job, step => step.run?.trim() === START_POSTGRES);
+    const build = stepAt(job, step => step.run?.trim() === "node apps/worker/cloud-run/build.mjs");
+    const gateIndex = job.steps.indexOf(gate[0]);
+    const stopIndex = stepAt(job, step => step.run?.trim() === STOP_POSTGRES);
+    const uploadIndex = job.steps.indexOf(uploads[0]);
+    if (!(start >= 0 && start < build && build < gateIndex && gateIndex < stopIndex && stopIndex < uploadIndex)) failures.push(`${id} must start PostgreSQL, build Cloud Run, run the partition, stop PostgreSQL, then upload its receipt`);
+    if (job.steps.filter(step => step.run?.trim() === "node apps/worker/cloud-run/build.mjs").length !== 1) failures.push(`${id} must build Cloud Run exactly once`);
+    const stop = job.steps.filter(step => step.run?.trim() === STOP_POSTGRES);
+    if (stop.length !== 1 || stop[0]?.if !== "always()" || stop[0]?.["continue-on-error"] !== undefined) failures.push(`${id} does not always stop its own PostgreSQL`);
+  }
+  const aggregate = workflow.jobs["postgres-17-suite"];
+  if (!aggregate) { failures.push("the required aggregate is missing"); return failures; }
+  if (JSON.stringify(aggregate.needs) !== JSON.stringify(PARTITION_PLAN.map(entry => entry.id))) failures.push("the aggregate needs both exact child jobs");
+  if (aggregate.if !== "always()" || aggregate["continue-on-error"] !== undefined || aggregate["timeout-minutes"] !== 45) failures.push("the aggregate must always run and fail closed within 45 minutes");
+  if (aggregate.env !== undefined || aggregate.steps.some(step => step.if !== undefined || step["continue-on-error"] !== undefined)) failures.push("aggregate provenance and prerequisites must not be overridden or conditional");
+  if (aggregate.services !== undefined || runs(aggregate).some(command => command === START_POSTGRES || command === STOP_POSTGRES)) failures.push("the aggregate must not execute PostgreSQL tests or a database");
+  const downloads = aggregate.steps.filter(step => step.uses?.startsWith("actions/download-artifact@"));
+  if (downloads.length !== 2) failures.push("the aggregate must download exactly two receipts");
+  for (const { stem } of PARTITION_PLAN) {
+    const item = downloads.find(step => step.with?.name === receiptArtifactName(stem));
+    const expected = { name: receiptArtifactName(stem), path: `\${{ runner.temp }}/postgres-17-${stem}` };
+    if (!item || item.uses !== DOWNLOAD_ARTIFACT || JSON.stringify(item.with) !== JSON.stringify(expected)
+      || item.if !== undefined || item["continue-on-error"] !== undefined) failures.push(`the aggregate does not download the exact same-run ${stem} receipt`);
+  }
+  const gates = aggregate.steps.filter(step => step.run?.trim() === aggregateCommand());
+  if (gates.length !== 1 || JSON.stringify(gates[0]?.env) !== JSON.stringify(reviewedReceiptEnvironment("postgres-17-suite"))
+    || gates[0]?.if !== undefined || gates[0]?.["continue-on-error"] !== undefined) failures.push("the aggregate does not require both successful child results and immutable source metadata");
+  if (aggregate.steps.at(-1) !== gates[0]) failures.push("the exact aggregate gate must be last");
+  return failures;
+}
+function coreRuntimeFailures(workflow) {
+  const failures = [], job = workflow.jobs["postgres-17-core"];
+  if (!job) return ["CORE is missing"];
+  const image = stepAt(job, isSetupNode(IMAGE_NODE));
+  const name = stepAt(job, runMatches(/EDGE_E2E_NODE=/u));
+  const toolchain = stepAt(job, isSetupNode(TOOLCHAIN_NODE));
+  const gate = stepAt(job, step => step.run?.trim() === partitionCommand("CORE", "core"));
+  if (!(image >= 0 && image < name && name < toolchain && toolchain < gate)) failures.push("CORE runtime naming order changed");
+  const command = job.steps[name]?.run ?? "";
+  for (const line of [`test "$(node --version)" = "v${IMAGE_NODE}"`,
+    'dump="$GITHUB_WORKSPACE/apps/worker/analytics-v2-test/golden/dump/usage-monitor-db.json"',
+    'test -f "$dump"', `            printf 'EDGE_E2E_NODE=%s\\n' "$(command -v node)"`.trim(),
+    `            printf 'POSTGRES_V12_TRANSFER_Q1_DUMP=%s\\n' "$dump"`.trim()]) {
+    if (!command.split("\n").map(line => line.trim()).includes(line)) failures.push(`CORE lacks ${line}`);
+  }
+  if (!command.includes('>> "$GITHUB_ENV"')) failures.push("CORE runtime and Q-1 dump must be exported through GITHUB_ENV");
+  if (job.steps.some(step => /EDGE_E2E_GOLDEN|EDGE_E2E_REHEARSAL_NODE/u.test(step.run ?? ""))) failures.push("CORE must not execute edge prerequisites");
+  return failures;
+}
+
+test("both PostgreSQL partitions retain full history, private independent PostgreSQL, locked dependencies, exact runtime and a required same-run aggregate", async () => {
+  const { text, workflow } = await loadWorkflow();
+  assert.match(text, /When retrying this gate, re-run all jobs; re-run failed jobs alone cannot/u, "same-attempt receipts require retrying both producers");
+  assert.deepEqual(partitionWorkflowFailures(workflow), []);
+  assert.deepEqual(coreRuntimeFailures(workflow), []);
+});
+
+test("partition contract rejects omitted or overlapping partitions, failed child masking, wrong artifact, retention, source, runtime and conditional aggregation", async () => {
+  const { workflow } = await loadWorkflow();
+  for (const mutate of [
+    copy => { delete copy.jobs["postgres-17-core"]; },
+    copy => { copy.jobs["postgres-17-edge-e2e"].steps.find(step => step.run?.includes(" --partition ")).run = partitionCommand("CORE", "core"); },
+    copy => { copy.jobs["postgres-17-suite"].needs.pop(); },
+    copy => { delete copy.jobs["postgres-17-suite"].if; },
+    copy => { copy.jobs["postgres-17-suite"]["continue-on-error"] = true; },
+    copy => { copy.jobs["postgres-17-suite"].steps.at(-1).run = aggregateCommand().replace('test "$CI_POSTGRES_CORE_RESULT" = "success"', 'true'); },
+    copy => { copy.jobs["postgres-17-suite"].steps.at(-1).env.CI_POSTGRES_CORE_RESULT = "success"; },
+    copy => { copy.jobs["postgres-17-suite"].steps.at(-1).env.CI_POSTGRES_EXPECTED_HEAD = "${{ github.event.pull_request.head.sha }}"; },
+    copy => { copy.jobs["postgres-17-suite"].steps.find(step => step.uses === DOWNLOAD_ARTIFACT).with.name = "postgres-17-edge-e2e-receipt"; },
+    copy => { copy.jobs["postgres-17-suite"].steps.find(step => step.uses === DOWNLOAD_ARTIFACT).with["run-id"] = "old-run"; },
+    copy => { copy.jobs["postgres-17-suite"].steps.find(step => step.uses === DOWNLOAD_ARTIFACT).with.path = "shared"; },
+    copy => { copy.jobs["postgres-17-core"].steps.at(-1).with["retention-days"] = 1; },
+    copy => { copy.jobs["postgres-17-core"].steps.at(-1).with["if-no-files-found"] = "warn"; },
+    copy => { delete copy.jobs["postgres-17-core"].steps.at(-1).if; },
+    copy => { copy.jobs["postgres-17-core"].steps.at(-1).uses = "actions/upload-artifact@v7"; },
+    copy => { copy.jobs["postgres-17-core"]["timeout-minutes"] = 90; },
+    copy => { copy.jobs["postgres-17-core"].steps.find(step => step.uses === CHECKOUT).with.ref = "${{ github.sha }}"; },
+    copy => { copy.jobs["postgres-17-suite"].steps.at(-1).run = aggregateCommand().replace("$CI_POSTGRES_EXPECTED_HEAD", "$GITHUB_SHA"); },
+    copy => { copy.jobs["postgres-17-core"].steps.find(step => step.run?.includes(" --partition ")).env.CI_POSTGRES_EXPECTED_HEAD = "${{ github.sha }}"; },
+    copy => { copy.jobs["postgres-17-core"].steps.find(step => step.run?.includes("pnpm install"))["continue-on-error"] = true; },
+    copy => { copy.jobs["postgres-17-core"].env.GITHUB_RUN_ID = "old-run"; },
+    copy => { copy.jobs["postgres-17-suite"].env = { GITHUB_SHA: "other" }; },
+    copy => { copy.jobs["postgres-17-core"].steps.push({ run: partitionCommand("EDGE_E2E", "edge-e2e") }); },
+    copy => { const job = copy.jobs["postgres-17-core"]; job.steps.splice(stepAt(job, step => step.run?.trim() === "node apps/worker/cloud-run/build.mjs"), 1); },
+    copy => { const job = copy.jobs["postgres-17-core"], index = stepAt(job, step => step.run?.trim() === "node apps/worker/cloud-run/build.mjs"); job.steps.push(...job.steps.splice(index, 1)); },
+    copy => { const job = copy.jobs["postgres-17-core"], index = stepAt(job, step => step.run?.trim() === STOP_POSTGRES); job.steps.splice(stepAt(job, step => step.run?.trim() === START_POSTGRES), 0, ...job.steps.splice(index, 1)); },
+    copy => { copy.jobs["postgres-17-core"].steps.at(-1).with.name = "postgres-17-core-receipt"; },
+    copy => { copy.jobs["postgres-17-suite"].steps.find(step => step.uses === DOWNLOAD_ARTIFACT).with.name = "postgres-17-core-receipt-${{ github.run_id }}-old-attempt"; },
+  ]) {
+    const changed = structuredClone(workflow); mutate(changed);
+    assert.ok(partitionWorkflowFailures(changed).length > 0);
+  }
+  for (const mutate of [
+    job => job.steps.splice(stepAt(job, isSetupNode(IMAGE_NODE)), 1),
+    job => { job.steps[stepAt(job, runMatches(/EDGE_E2E_NODE=/u))].run = "echo no runtime"; },
+    job => { job.steps[stepAt(job, runMatches(/EDGE_E2E_NODE=/u))].run = job.steps[stepAt(job, runMatches(/EDGE_E2E_NODE=/u))].run.replace("POSTGRES_V12_TRANSFER_Q1_DUMP", "OTHER"); },
+    job => job.steps.push({ run: "export EDGE_E2E_GOLDEN=somewhere" }),
+  ]) {
+    const changed = structuredClone(workflow); mutate(changed.jobs["postgres-17-core"]);
+    assert.ok(coreRuntimeFailures(changed).length > 0);
+  }
+});
+
+
+test("PR source selection binds the actual PR head while preserving the distinct provider synthetic merge SHA", async () => {
+  const { workflow } = await loadWorkflow();
+  const providerMergeSha = "a".repeat(40), actualPrHead = "b".repeat(40);
+  assert.notEqual(actualPrHead, providerMergeSha);
+  const sourceFor = ({ pullRequestHead, providerSha }) => pullRequestHead || providerSha;
+  assert.equal(sourceFor({ pullRequestHead: actualPrHead, providerSha: providerMergeSha }), actualPrHead);
+  assert.equal(sourceFor({ providerSha: providerMergeSha }), providerMergeSha);
+  assert.equal(providerMergeSha, "a".repeat(40), "provider GITHUB_SHA is not repurposed");
+  for (const job of Object.values(workflow.jobs)) assert.equal(job.steps.find(step => step.uses === CHECKOUT).with.ref, SELECTED_SOURCE_EXPRESSION);
+  for (const { id } of PARTITION_PLAN) {
+    const gate = workflow.jobs[id].steps.find(step => step.run?.includes(" --partition "));
+    assert.equal(gate.env.CI_POSTGRES_EXPECTED_HEAD, SELECTED_SOURCE_EXPRESSION);
+    assert.match(gate.run, /test "\$\(git rev-parse HEAD\)" = "\$CI_POSTGRES_EXPECTED_HEAD"/u);
+    assert.doesNotMatch(gate.run, /\$GITHUB_SHA\b/u);
+  }
+  const aggregate = workflow.jobs["postgres-17-suite"].steps.at(-1);
+  assert.equal(aggregate.env.CI_POSTGRES_EXPECTED_HEAD, SELECTED_SOURCE_EXPRESSION);
+  assert.doesNotMatch(aggregate.run, /\$GITHUB_SHA\b/u);
 });

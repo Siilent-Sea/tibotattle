@@ -11,20 +11,19 @@ name: Hosted backend
 # in use.
 #
 # Node.js: every job runs the repository toolchain, 26.2.0. The
-# postgres-17-suite job also installs Node.js 22.16.0, the Cloud Run image
-# runtime, and names it to the suite as EDGE_E2E_NODE, because the edge
-# end-to-end spec runs the Cloud Run origin under the image runtime. It installs
-# 22.16.0 first and 26.2.0 last, so `node` on PATH, the suite itself and the
-# spec's seeding rehearsal (its importers need the newer node:sqlite) stay on
-# 26.2.0. scripts/check-release-workflow-policy.mjs allows 22.16.0 in this
+# PostgreSQL partition jobs also install Node.js 22.16.0, the Cloud Run image
+# runtime, and name it to the receipt producer as EDGE_E2E_NODE. EDGE_E2E
+# runs the Cloud Run origin under that image runtime. Both partitions install
+# 22.16.0 first and 26.2.0 last, so `node` on PATH and the suite stay on
+# 26.2.0. EDGE_E2E's seeding rehearsal needs that newer node:sqlite. scripts/check-release-workflow-policy.mjs allows 22.16.0 in this
 # workflow only.
 #
-# Dependencies: all three jobs install the root, Worker and Cloud Run lockfiles.
+# Dependencies: all five jobs install the root, Worker and Cloud Run lockfiles.
 # The Worker gate's gcp:fastpath:scripts-check imports apps/worker/cloud-run
 # modules, which need @google-cloud/cloud-sql-connector.
 #
 # Skip enforcement is machine-checked only for apps/worker/postgres-test: the
-# postgres-17-suite job fails on any skipped or todo test there, and on an
+# partition jobs fail on any skipped or todo test there, and on an
 # environment gap such as a missing EDGE_E2E_NODE or EDGE_E2E_GOLDEN. The Worker
 # gate and the Cloud Run check run their own PostgreSQL-gated checks (for example
 # apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
@@ -36,13 +35,17 @@ name: Hosted backend
 # capture, the infrastructure manifest and the cutover seal), which need no
 # PostgreSQL, network or credential. It checks out full history, because the
 # cutover seal check reads pinned commits as git objects; it fails, and never
-# skips, when they are absent. The postgres-17-suite job checks out full history
-# too, because the READ-EXPANSION specs archive their pinned base commit. The
+# skips, when they are absent. Both PostgreSQL partitions check out full history
+# because READ-EXPANSION specs archive their pinned base commit. The
 # Worker gate also checks out full history for immutable vendored-kernel
 # source, facade and transition verification. The PostgreSQL-backed part of
 # gcp:production-tooling:local-check, postgres-production-migrations.spec.mjs and
 # github-distribution-manifest-visibility.spec.mjs, runs in the
-# postgres-17-suite job.
+# CORE partition. The required postgres-17-suite aggregate verifies both exact
+# same-run receipts, source/runtime provenance and complete disjoint coverage.
+# PR jobs explicitly select the actual pull-request head, not the provider
+# synthetic merge revision. Push and dispatch jobs select github.sha. Receipt
+# expectations bind that same selected source; GITHUB_SHA remains unchanged.
 #
 # Read-only by construction: no secrets, no environments, no deployment, no
 # remote database or Cloudflare writes. A green run proves these source gates on
@@ -107,6 +110,7 @@ jobs:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -215,6 +219,7 @@ jobs:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -269,8 +274,8 @@ jobs:
         if: always()
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
 
-  postgres-17-suite:
-    name: PostgreSQL 17 suite
+  postgres-17-core:
+    name: PostgreSQL 17 CORE
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     # The fast-path cloud-target specs also dial the server over loopback TCP:
@@ -284,6 +289,102 @@ jobs:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # CORE binds the image runtime to its receipt. It goes first so that the
+      # repository toolchain installed afterward stays first on PATH.
+      - name: Install the Cloud Run image runtime Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.16.0
+          check-latest: false
+          package-manager-cache: false
+
+      # CORE still binds the image runtime and runs the transfer Q-1 dump case.
+      - name: Name the image runtime and the committed Q-1 dump
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.16.0"
+          dump="$GITHUB_WORKSPACE/apps/worker/analytics-v2-test/golden/dump/usage-monitor-db.json"
+          test -f "$dump"
+          {
+            printf 'EDGE_E2E_NODE=%s\n' "$(command -v node)"
+            printf 'POSTGRES_V12_TRANSFER_Q1_DUMP=%s\n' "$dump"
+          } >> "$GITHUB_ENV"
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      # Two specs import Cloud Run host modules, so this job needs its lockfile too.
+      - name: Install locked root, Worker and Cloud Run dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm --prefix apps/worker ci
+          npm --prefix apps/worker/cloud-run ci
+
+      - name: Create the private PostgreSQL socket root
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /private/tmp
+          sudo chmod 1777 /private/tmp
+
+      - name: Start PostgreSQL 17 and export the SOCKET profile
+        run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
+
+      # analytics-v2-refresh's K-PAR spec runs the built analytics-refresh
+      # worker bundle, so build the Cloud Run bundles before the suite.
+      - name: Build the Cloud Run bundles the suite runs
+        run: node apps/worker/cloud-run/build.mjs
+
+      - name: Run the CORE partition in its routed profiles with zero skips
+        env:
+          CI_POSTGRES_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"
+          node apps/worker/scripts/ci-postgres-suite.mjs --partition CORE --receipt "$RUNNER_TEMP/postgres-17-core.json"
+
+      - name: Stop PostgreSQL 17
+        if: always()
+        run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+      - name: Upload the CORE partition receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-17-core-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/postgres-17-core.json
+          if-no-files-found: error
+          retention-days: 7
+
+  postgres-17-edge-e2e:
+    name: PostgreSQL 17 EDGE_E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # The fast-path cloud-target specs also dial the server over loopback TCP:
+    # the container's published 127.0.0.1 port (ciPostgresTcpProfile), which
+    # differs from the socket's PG_TEST_PORT. The suite passes this pair to its
+    # SOCKET pass only; without it those tests would report as skipped.
+    env:
+      PG_TEST_TCP_HOST: "127.0.0.1"
+      PG_TEST_TCP_PORT: "55432"
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -358,9 +459,86 @@ jobs:
       - name: Build the Cloud Run bundles the suite runs
         run: node apps/worker/cloud-run/build.mjs
 
-      - name: Run every PostgreSQL spec in its routed profile with zero skips
-        run: node apps/worker/scripts/ci-postgres-suite.mjs
+      - name: Run the EDGE_E2E partition in its routed profiles with zero skips
+        env:
+          CI_POSTGRES_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"
+          node apps/worker/scripts/ci-postgres-suite.mjs --partition EDGE_E2E --receipt "$RUNNER_TEMP/postgres-17-edge-e2e.json"
 
       - name: Stop PostgreSQL 17
         if: always()
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+      - name: Upload the EDGE_E2E partition receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-17-edge-e2e-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/postgres-17-edge-e2e.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # When retrying this gate, re-run all jobs; re-run failed jobs alone cannot
+  # combine sibling receipts from an earlier attempt. Exact run and attempt
+  # binding deliberately prevents an earlier receipt from qualifying this gate.
+  postgres-17-suite:
+    name: PostgreSQL 17 suite
+    needs:
+      - postgres-17-core
+      - postgres-17-edge-e2e
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install locked root, Worker and Cloud Run dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm --prefix apps/worker ci
+          npm --prefix apps/worker/cloud-run ci
+
+      # Exact artifacts from this workflow run only, downloaded separately.
+      - name: Download the CORE partition receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: postgres-17-core-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/postgres-17-core
+
+      - name: Download the EDGE_E2E partition receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: postgres-17-edge-e2e-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/postgres-17-edge-e2e
+
+      - name: Require both partitions and exact coverage at this revision
+        env:
+          CI_POSTGRES_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_POSTGRES_CORE_RESULT: ${{ needs.postgres-17-core.result }}
+          CI_POSTGRES_EDGE_E2E_RESULT: ${{ needs.postgres-17-edge-e2e.result }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"
+          test "$CI_POSTGRES_CORE_RESULT" = "success"
+          test "$CI_POSTGRES_EDGE_E2E_RESULT" = "success"
+          node apps/worker/scripts/ci-postgres-suite.mjs --aggregate "$RUNNER_TEMP/postgres-17-core/postgres-17-core.json" "$RUNNER_TEMP/postgres-17-edge-e2e/postgres-17-edge-e2e.json"
