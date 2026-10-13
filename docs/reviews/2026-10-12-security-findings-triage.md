@@ -1,17 +1,24 @@
 ---
-title: Security findings triage and implementation handoffs
+title: Security findings triage, remediation and handoffs
 date: 2026-10-12
 type: review
-status: in-progress
+status: implemented
 ---
 
-# Security findings triage and implementation handoffs
+# Security findings triage, remediation and handoffs
 
-All nine findings in the [October 11 security scan][scan] are supported by the
-reviewed source. None establishes an observed compromise. Prioritize local
-caller authorization and the Windows signing and Linux update trust boundaries.
-Keep the two local authorization fixes under one owner, and coordinate the two
-Worker admission fixes under another owner.
+All nine findings in the [October 11 security scan][scan] were confirmed at
+triage and now have source fixes, regression coverage and independent review.
+Seven implementation owners delivered the work, with the two local authorization
+findings kept together and the two Worker admission findings kept together.
+Integrated testing also exposed and corrected a pre-existing collector file
+creation race. None of the reviewed evidence establishes an observed compromise.
+
+Implementation is complete at source scope. Protected R7 receipt regeneration
+awaits the owner's specific authorization, and native qualification, production
+trust provisioning, deployment and publication remain separate gates. The
+numbered handoff drafts below preserve the original dispatched briefs; they are
+not instructions to repeat the completed implementation.
 
 The scan examined `94ba7c8b502af4b16f3939ae46e1b57684d64e6e`. This review examined
 the initially clean checkout at `d6df06572aafbeea0258e96c58ca488e2025567c` on
@@ -35,14 +42,16 @@ this implementation record.
 | 1 | Windows signing trust | Implemented; independent review passed | Independent Windows checks: 81 passed; final changed suites: 43 passed, including bounded-download regression independently rechecked; release trust: 87 passed; workflow policy: 24 files; production signing-tool trust unprovisioned |
 | 2 | Linux update authenticity | Implemented; independent review passed | Independent runtime/signing/publication: 38 passed; publication renewal: 33 passed including 6 independently rechecked renewal regressions; production trust unprovisioned |
 | 3, 4 | Local authorization and relay | Implemented; independent review and caller integration passed | Local suite: 420 passed; UI suite: 1,016 passed; independent boundary checks: 53 passed; qualification callers: 100 passed; native GUI gate remains |
-| 5, 7 | Worker admission protections | Implemented; independent review passed; broad Worker suite running | Independent guard/body/admission/probe/configuration/monitoring: 94 passed; type/configuration gates passed; clean-commit dry builds pending |
+| 5, 7 | Worker admission protections | Implemented; independent review and retained dry gates passed | Independent checks: 94 passed; full Worker suite: 2,042 passed, one default-timeout failure; complete unchanged 47-test file retry passed; type/configuration/deploy:dry/staging:check passed |
 | 6 | Provider error privacy | Implemented; independent review passed | Provider, CLI and collector: 92 passed; final independent provider/CLI/lane contracts: 24 passed; architecture check passed |
 | 8 | Linux artifact extraction isolation | Implemented; independent review passed | 6 extraction tests; 134 owning tests; release trust 87 tests; native Docker confinement remains a hosted qualification gate |
 | 9 | Documentation path privacy | Implemented; independent review passed | Independent documentation/public-site/release checks: 72 passed; 9 boundary probes; documentation and preflight passed |
 
 The final independent completeness review found no remaining source blockers or
-unhandled first-party companion HTTP callers. The local review branch is
-`codex/security-findings-2026-10-12`; final combined validation is in progress.
+unhandled first-party companion HTTP callers. The nine-finding implementation is
+retained in local commit `9037353a164455477cfeeaca435ca7d9eba63ec0` on
+`codex/security-findings-2026-10-12`. Integrated testing subsequently identified
+the additional collector-creation race corrected in the follow-up below.
 
 The coordinator owns this record and integration validation. Implementers own
 their scoped code, tests and maintained documentation. Shared runtime staging
@@ -70,6 +79,16 @@ lanes. Tool inventory has 186 records, 185 discovered executable paths and
 59 aliases; its exact-count and caller checks pass. Documentation preflight,
 architecture and generated i18n checks pass.
 
+On the clean implementation commit, both retained Worker `deploy:dry` and
+`staging:check` passed after canonical local social-preview and public-site
+generation. The generated site had no installer release evidence
+(`installer: null`). These were local builds and dry bundles, not publication
+or deployment. The full Worker run executed 2,043 tests: 2,042 passed and one
+unchanged projection test exceeded its default five-second timeout. The entire
+47-test projection file then passed with the same defaults, without source,
+assertion or timeout changes. Final architecture inspection covered 663
+production files and 2,721 imports with zero approved debt edges.
+
 The first broad root run executed 6,152 tests: 6,090 passed, 14 failed and
 48 platform-gated tests skipped. Four source/integration failures were repaired
 and their owning focused tests passed (Linux container helper admission,
@@ -86,6 +105,42 @@ The required Node 24.14.0 and 26.2.0 runtime identities were checked read-only.
 Authorization has been requested; no private-history regeneration has run.
 This evidence gate remains open and must not be represented as a green root
 suite or release qualification.
+
+The final permitted root run on `9037353a164455477cfeeaca435ca7d9eba63ec0`
+executed 6,181 tests: 6,131 passed, three failed and 47 skipped, with no
+cancellations (752.45 seconds). All eight previously environment-blocked cases
+passed in this full run. Two failures were the expected R7 freshness checks.
+The remaining failure occurred while a foreground test polled the collector's
+initial state, before notification coalescing assertions. The unchanged full
+collector test file passed 76/76 on retry, but a deterministic synthetic probe
+confirmed an underlying first-creation permission race.
+
+### Integration-discovered collector creation race
+
+The baseline `src/local-collector-state.js` created the SQLite file at its final
+path before asynchronously applying mode `0600`. With the normal `022` umask,
+the synthetic boundary probe observed mode `0644`, and the existing strict
+reader correctly returned `local_collector_state_unavailable`; after the chmod,
+the reader succeeded. This is a file-permission invariant and startup-availability
+defect. The probe does not establish access by another user through the private
+parent directory or an observed privacy compromise.
+
+The correction exclusively reserves an owner-only file before SQLite opens it
+and initializes the schema without yielding. Valid concurrent creators reuse an
+initialized winner; unsafe, empty and incompatible winners are preserved and
+rejected. Failure cleanup removes only the caller's unchanged empty reservation;
+nonempty partial state remains private for diagnosis. Reader assertions, schema
+versions and recovery contracts are unchanged.
+
+The five owning state suites passed 58/58. The complete foreground/passive
+collector file also passed 76/76 after the fix, including the originally failing
+startup scenario, with no timing or assertion changes. Independent review passed
+nine checks (eight new regressions and existing hot-rollback recovery), plus adversarial
+link, replacement, shared-mode and future-schema probes. Actual first-write
+inspection confirmed both the main database and live `DELETE` rollback journal
+were `0600`, with no WAL/SHM. Syntax, architecture and whitespace checks passed.
+These checks validate the bounded follow-up to the full-root run above; they do
+not establish new Windows ACL, packaged-platform or release qualification.
 
 ## Decisions and implementation order
 
