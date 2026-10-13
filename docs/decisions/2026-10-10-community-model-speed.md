@@ -410,6 +410,45 @@ as written, except where this section says otherwise.
 This amendment is source documentation. It records no release, deployment,
 migration or activation.
 
+## Unified release line port amendment (2026-10-12)
+
+The Google Cloud origin source above was ported onto the unified release line
+(`codex/gcp-release-main-integration-20261011` at `72b15f13a`). That line
+contains the live production origin (`7a4bc73eb`, analytics kernels through 16)
+and later commits that are not yet qualified or deployed (kernels 17 and 18).
+This amendment narrows the implementation notes above; the decisions stand.
+
+- **One kernel bump for speed and the v1.2 future-day bound, so one reprice.**
+  The performance stage and the
+  [v1.2 future-day bound](./2026-10-12-v12-future-day-bound.md) both change
+  analytics compute-closure inputs. On the unified line they share one new
+  registry entry, kernel 19 (`computeClosureSha256` `98712935…590a`, 229
+  closure inputs, `REGISTRY_PINS` line `1fc1e676…bcc9`). It replaces the GCP
+  line's provisional kernel 16 and the future-day fix's provisional kernel 18,
+  so a single reprice after the roll covers both changes. The vendored kernels,
+  prices and pricer are unchanged.
+- **Legacy Worker dictionary.** The unified line's D1 schema carries
+  ingestion-isolation `0013_performance_ultrafast.sql`, so the legacy
+  Cloudflare Worker's performance path is pinned to `…2026-09-29.1`, as on the
+  client line, instead of `…2026-09-21.1`. It still accepts only v1 buckets
+  and the v1 grant.
+- **Migration number.** The unified line's primary chain ends at 0078, so
+  `0079_performance_telemetry.sql` keeps its number, and the primary
+  chain-count pins move from 78 to 79.
+- **Reprice carrier.** The post-roll reprice runs through the reprice Cloud
+  Run Job and the `gcp:analytics:reprice` verb
+  ([rollout sequence](../runbooks/gcp-rollout.md#sequence), step 10). An
+  owner infrastructure apply must create that Job before the roll.
+- **Monitoring.** The public model-performance read and the admin intake view
+  join the paths never excluded from the origin 5xx ratio.
+- **Client.** Unchanged. The port carries the shared contract pieces only, and
+  the client keeps emitting `…2026-09-29.1` with v1 buckets (the
+  [no new client amendment](#no-new-client-amendment-2026-10-12)).
+
+This amendment is source documentation. Deploying it requires the unified line
+itself to be qualified and landed first. It records no release, deployment,
+migration or activation.
+
 ## Not covered
 
 This record does not authorize remote migrations, route deployment, runtime

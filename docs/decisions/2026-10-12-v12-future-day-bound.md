@@ -160,6 +160,21 @@ The pricer is unchanged. The deployment needs the kernel 18 registry entry and
 its `REGISTRY_PINS` line, and the analytics reprice immediately after the roll,
 as every kernel change does.
 
+## Combined kernel amendment (2026-10-12)
+
+When this change was ported onto the unified release line with the community
+model speed work, that line had already registered kernel 18 for an unrelated
+change (statement attribution of the shared classification proof reads). The
+future-day bound therefore ships in one combined registry entry, kernel 19,
+together with the community model speed closure change: one kernel bump for
+speed and the v1.2 future-day bound, so one reprice. The entry's
+`computeClosureSha256` is `98712935…590a` (229 closure inputs) and its
+`REGISTRY_PINS` line is `1fc1e676…bcc9`. Where this record says kernel 18,
+read kernel 19. The reasoning in [Analytics kernel](#analytics-kernel) is
+unchanged, and the
+[community model speed decision](./2026-10-10-community-model-speed.md#unified-release-line-port-amendment-2026-10-12)
+records the same entry.
+
 ## Gates not covered here
 
 - Origin roll, kernel 18 activation and the post-roll reprice (owner-run).
