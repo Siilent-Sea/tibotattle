@@ -11,7 +11,7 @@
  *
  *   - Every field dictionary the contract registry lists as `accepted` is
  *     admitted, each with the bucket scheme it pairs with (owner decision 3 of
- *     2026-10-10). The legacy Worker stays pinned to 2026-09-21.1.
+ *     2026-10-10). The legacy Worker stays pinned to 2026-09-29.1.
  *   - A report whose dictionary differs from the device's server-side
  *     capability is 403 TELEMETRY_TRANSPORT_BLOCKED (gate answer 6). The
  *     client re-grants on restart; a 409 would be counted as delivered and
