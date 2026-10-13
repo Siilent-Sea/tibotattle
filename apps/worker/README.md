@@ -433,6 +433,29 @@ Local validation (synthetic fixtures and mocked fetch only): rebuild
 The [candidate handoff](../../docs/plans/2026-10-11-gcp-github-distribution-sync.md)
 records owner rollout steps and remaining production checks.
 
+## GCP v1.2 future-day bound
+
+The origin refuses a v1.2 day manifest, and a v1.2 chunk, whose UTC day is later
+than the server's UTC day plus one (`src/telemetry-v12-day-bound.ts`). The
+answer is `429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` with `retry-after` set to the
+seconds until the day is admissible, at most seven days, and no detail. Past
+days stay unbounded. A manifest is checked after the device's write authority;
+a chunk is checked before its object is written, so nothing is stored and the
+claim is abandoned. The released client treats the answer as a retryable
+`service_unavailable`, waits for `retry-after` without pausing and keeps its
+journal. The analytics refresh never plans or publishes a day after its UTC day:
+later queued days are carried as blocked and counted in the receipt's
+`deferredFutureDays` until they are past. The released client cannot activate
+past a refused day, because its day vector always ends at its latest local day.
+A one-off future day holds the device until that day is admissible. A device in
+use whose clock stays two or more days ahead of UTC is refused on every pass and
+never activates, so none of its usage is published, including earlier days it
+has already staged. It stays in a transient `retry_wait`, not a pause, and
+retries at each `retry-after` (at most weekly) until its clock is corrected. A
+clock one to two days ahead delays activation intermittently.
+The [decision](../../docs/decisions/2026-10-12-v12-future-day-bound.md) records
+the status choice and this residual activation hold.
+
 ## GCP analytics read bounds
 
 Analytics A-1 readers use read-only repeatable-read transactions with a fixed
