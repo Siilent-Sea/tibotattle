@@ -94,7 +94,9 @@
 // the accepted D1 producer receipt, before any PG read; it is never inferred
 // from the supplied file by this comparator. It hashes UTF-8 JSON.stringify
 // bytes in producer key order, not a key-sorted encoding. A partial reference
-// cannot pass.
+// cannot pass. Its v2 evidence describes corpus-specific convergence, actual
+// strict export refusal, and actual current recomputation separately. Expected
+// conflict queues never become a quiescent whole-export claim.
 // This saved-file CLI checks preservation and equality against caller-supplied
 // accepted evidence; it cannot establish that a native D1 execution occurred.
 // The qualification controller separately enforces its preserved producer receipt.
@@ -110,7 +112,7 @@ import {
 } from "../postgres-test/fixtures/current-q1-d1-reference.mjs";
 
 export const ANALYTICS_V2_PARITY_REPORT_VERSION = "analytics-v2-parity-report-v4";
-export const ANALYTICS_V2_CURRENT_CONTRACT_REPORT_VERSION = "analytics-v2-current-contract-report-v1";
+export const ANALYTICS_V2_CURRENT_CONTRACT_REPORT_VERSION = "analytics-v2-current-contract-report-v2";
 export const ANALYTICS_V2_PARITY_FAMILIES = Object.freeze([
   "envelope", "daily-days", "daily-totals", "daily-cells", "spend", "daily-other",
   "allowance-breakdowns", "breakdowns-v13-metadata", "model-days", "model-days-per-date", "preview",
@@ -540,6 +542,12 @@ export function compareAnalyticsV2CurrentContract({ reference, referenceBinding,
     referenceQualification: "complete",
     referenceBound: true,
     referenceComplete: true,
+    recomputationComplete: true,
+    corpusConvergenceComplete: true,
+    strictExportRefusalVerified: true,
+    recomputationSha256: createHash("sha256").update(JSON.stringify(reference.recomputation)).digest("hex"),
+    corpusConvergenceSha256: createHash("sha256").update(JSON.stringify(reference.corpusConvergence)).digest("hex"),
+    strictExportRefusalSha256: createHash("sha256").update(JSON.stringify(reference.strictExportRefusal)).digest("hex"),
     referenceSha256,
     reference: {
       schemaVersion: reference.schemaVersion,

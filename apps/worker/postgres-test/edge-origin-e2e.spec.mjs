@@ -72,6 +72,7 @@ import {
 } from "../scripts/gcp-fastpath-rehearsal.mjs";
 import {
   assertCurrentQ1TrustedRuntime,
+  assessCurrentQ1ReferenceCompleteness,
   validateCurrentQ1ReferenceBinding,
 } from "./fixtures/current-q1-d1-reference.mjs";
 import { buildEdgeBundle, readCompatibility } from "../scripts/edge-e2e/edge-bundle.mjs";
@@ -2363,10 +2364,23 @@ async function verifyCurrentS9Evidence({ report, evidence, runtime, imageRuntime
   assert.equal(jsonSha256(binding), original.bindingSha256, "the binding equals its original pre-PG digest");
   assert.equal(jsonSha256(acceptance), original.acceptanceSha256, "the accepted receipt is preserved");
   validateCurrentQ1ReferenceBinding({ reference, expected: binding });
+  assert.equal(reference.schemaVersion, "current-q1-d1-reference-v2");
+  assert.equal(binding.schemaVersion, "current-q1-d1-reference-binding-v3");
+  assert.deepEqual(assessCurrentQ1ReferenceCompleteness({ reference, corpus: binding.corpusStructure,
+    snapshotReadiness: { afterForcedRecompute: reference.afterForcedRecompute?.readiness,
+      afterNativeProbes: reference.afterNativeProbes?.readiness } }), { state: "complete", reasons: [] },
+  "the preserved current reference passes all recomputation, convergence, refusal, DTO and native gates");
+  for (const field of ["recomputation", "corpusConvergence", "strictExportRefusal"]) {
+    const digestField = `${field}Sha256`;
+    assert.match(original[digestField], SHA256);
+    assert.equal(jsonSha256(reference[field]), original[digestField], `the actual ${field} evidence is preserved`);
+    assert.equal(acceptance[digestField], original[digestField], `the controller accepted this ${field} evidence`);
+  }
   assert.deepEqual(Object.keys(acceptance).sort(), ["schemaVersion", "evidenceScope", "cryptographicExecutionAttestation",
     "actualHelperInvocation", "resultReturnedAfterOwnedCleanup", "accepted", "referenceSha256", "bindingSha256",
-    "sourceHead", "sourceSha256", "migrationSha256", "corpusSha256", "helper", "controller", "runtime"].sort());
-  assert.equal(acceptance.schemaVersion, "current-q1-d1-producer-acceptance-v1");
+    "sourceHead", "sourceSha256", "migrationSha256", "corpusSha256", "helper", "controller", "runtime",
+    "recomputationSha256", "corpusConvergenceSha256", "strictExportRefusalSha256"].sort());
+  assert.equal(acceptance.schemaVersion, "current-q1-d1-producer-acceptance-v2");
   assert.equal(acceptance.evidenceScope, "direct-source-pinned-producer-controller");
   assert.equal(acceptance.cryptographicExecutionAttestation, false);
   for (const field of ["actualHelperInvocation", "resultReturnedAfterOwnedCleanup", "accepted"]) {
@@ -2630,6 +2644,12 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
         actual, actualPreview });
       assert.deepEqual(familyTable(currentContractParity), familyTable(rehearsal.currentContractParity),
         "the edge read reproduces the current Worker/D1 rehearsal table");
+      for (const field of ["recomputationComplete", "corpusConvergenceComplete", "strictExportRefusalVerified"]) {
+        assert.equal(currentContractParity[field], true, `the current reference preserves ${field}`);
+      }
+      for (const field of ["recomputationSha256", "corpusConvergenceSha256", "strictExportRefusalSha256"]) {
+        assert.equal(currentContractParity[field], rehearsal.currentReference[field], `the comparison binds ${field}`);
+      }
       assert.equal(currentContractParity.equal, true, "the full current response and preview equal fresh D1");
       assert.equal(currentContractParity.unexpectedDiffs, 0);
     } else if (perDateExpected !== null) {

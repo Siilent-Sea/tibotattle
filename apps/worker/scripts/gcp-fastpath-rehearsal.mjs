@@ -347,10 +347,16 @@ export function rehearsalComparisonGates({ comparisonMode, parity, currentContra
   if (comparisonMode !== "current-worker-d1") fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--comparison-mode" });
   const bound = currentContractParity?.schemaVersion === ANALYTICS_V2_CURRENT_CONTRACT_REPORT_VERSION
     && currentContractParity.comparisonMode === "current-worker-d1"
-    && currentContractParity.referenceBound === true && currentContractParity.referenceComplete === true;
-  const producerAccepted = producerAcceptance?.schemaVersion === "current-q1-d1-producer-acceptance-v1"
+    && currentContractParity.referenceBound === true && currentContractParity.referenceComplete === true
+    && currentContractParity.recomputationComplete === true && currentContractParity.corpusConvergenceComplete === true
+    && currentContractParity.strictExportRefusalVerified === true;
+  const evidenceFields = ["referenceSha256", "recomputationSha256", "corpusConvergenceSha256", "strictExportRefusalSha256"];
+  const evidenceBound = evidenceFields.every((field) => typeof currentContractParity?.[field] === "string"
+    && /^[a-f0-9]{64}$/u.test(currentContractParity[field]) && producerAcceptance?.[field] === currentContractParity[field]);
+  const producerAccepted = producerAcceptance?.schemaVersion === "current-q1-d1-producer-acceptance-v2"
     && producerAcceptance.accepted === true && producerAcceptance.actualHelperInvocation === true
-    && producerAcceptance.resultReturnedAfterOwnedCleanup === true && producerAcceptance.cryptographicExecutionAttestation === false;
+    && producerAcceptance.resultReturnedAfterOwnedCleanup === true && producerAcceptance.cryptographicExecutionAttestation === false
+    && evidenceBound;
   // These immutable daily families predate the evolving allowance/catalog
   // contracts. Equality between two current runtimes alone cannot conserve
   // their corpus amounts. Missing families or incomplete comparisons fail.
@@ -1046,7 +1052,8 @@ export async function runRehearsal(options) {
     if (options.comparisonMode === "current-worker-d1") {
       // Capture the candidate's input closure before D1 execution, and before
       // any PG read. The expected DTOs come solely from current Worker/D1.
-      const { captureCurrentQ1ReferenceBinding, runCurrentQ1D1Reference, validateCurrentQ1ReferenceBinding } =
+      const { captureCurrentQ1ReferenceBinding, runCurrentQ1D1Reference, validateCurrentQ1ReferenceBinding,
+        assessCurrentQ1ReferenceCompleteness } =
         await import("../postgres-test/fixtures/current-q1-d1-reference.mjs");
       currentReferenceCapture = captureCurrentQ1ReferenceBinding;
       currentPostgresInputs = await currentPostgresInputBinding({ node22: options.node22, node22Version,
@@ -1062,22 +1069,32 @@ export async function runRehearsal(options) {
       currentReference = await timed(timings, "current-d1:replay", runCurrentQ1D1Reference);
       progress.phase("current_d1_acceptance");
       validateCurrentQ1ReferenceBinding({ reference: currentReference, expected: currentReferenceBinding });
+      const complete = assessCurrentQ1ReferenceCompleteness({ reference: currentReference,
+        corpus: currentReferenceBinding.corpusStructure, snapshotReadiness: {
+          afterForcedRecompute: currentReference.afterForcedRecompute?.readiness,
+          afterNativeProbes: currentReference.afterNativeProbes?.readiness,
+        } });
+      if (currentReference.qualification !== "complete" || complete.state !== "complete") {
+        fail("REHEARSAL_CURRENT_REFERENCE_INCOMPLETE");
+      }
+      const currentEvidenceSha256 = Object.fromEntries(["recomputation", "corpusConvergence", "strictExportRefusal"]
+        .map((field) => [`${field}Sha256`, createHash("sha256").update(JSON.stringify(currentReference[field])).digest("hex")]));
       currentReferenceSha256 = createHash("sha256").update(JSON.stringify(currentReference)).digest("hex");
       const bindingSha256 = createHash("sha256").update(JSON.stringify(currentReferenceBinding)).digest("hex");
       // This wx receipt preserves what this controller actually invoked and
       // accepted before PG. It is an audit trail, not cryptographic execution
       // attestation, and arbitrary saved receipts cannot enter this CLI path.
-      currentProducerAcceptance = Object.freeze({ schemaVersion: "current-q1-d1-producer-acceptance-v1",
+      currentProducerAcceptance = Object.freeze({ schemaVersion: "current-q1-d1-producer-acceptance-v2",
         evidenceScope: "direct-source-pinned-producer-controller", cryptographicExecutionAttestation: false,
         actualHelperInvocation: true, resultReturnedAfterOwnedCleanup: true,
-        accepted: currentReference.qualification === "complete", referenceSha256: currentReferenceSha256, bindingSha256,
+        accepted: true, referenceSha256: currentReferenceSha256, bindingSha256, ...currentEvidenceSha256,
         sourceHead: currentReferenceBinding.source.head, sourceSha256: currentReferenceBinding.source.sha256,
         migrationSha256: currentReferenceBinding.migrationSha256, corpusSha256: currentReferenceBinding.corpus.canonicalSha256,
         helper: currentReferenceBinding.source.files.find((entry) => entry.path === "apps/worker/postgres-test/fixtures/current-q1-d1-reference.mjs"),
         controller: currentPostgresInputs.controller, runtime: currentReferenceBinding.runtime });
       const acceptanceSha256 = createHash("sha256").update(JSON.stringify(currentProducerAcceptance)).digest("hex");
       report.currentReference = { schemaVersion: currentReference.schemaVersion, qualification: currentReference.qualification,
-        sha256: currentReferenceSha256, bindingSha256, acceptanceSha256, source: { head: currentReferenceBinding.source.head,
+        sha256: currentReferenceSha256, bindingSha256, acceptanceSha256, ...currentEvidenceSha256, source: { head: currentReferenceBinding.source.head,
           sha256: currentReferenceBinding.source.sha256 }, migrationSha256: currentReferenceBinding.migrationSha256,
         corpusSha256: currentReferenceBinding.corpus.canonicalSha256, runtime: currentReferenceBinding.runtime };
       if (options.out !== null) {

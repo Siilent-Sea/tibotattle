@@ -250,8 +250,10 @@ test("wrong, relative and symlink current image paths refuse before executable o
 
 test("current gates cannot promote saved comparison-only evidence without the actual controller receipt", () => {
   // This tests the pure gate selector, not execution or receipt authenticity.
-  const comparison = { schemaVersion: "analytics-v2-current-contract-report-v1", comparisonMode: "current-worker-d1",
-    referenceBound: true, referenceComplete: true, equal: true, unexpectedDiffs: 0,
+  const comparison = { schemaVersion: "analytics-v2-current-contract-report-v2", comparisonMode: "current-worker-d1",
+    referenceBound: true, referenceComplete: true, recomputationComplete: true, corpusConvergenceComplete: true,
+    strictExportRefusalVerified: true, referenceSha256: "d".repeat(64), recomputationSha256: "a".repeat(64), corpusConvergenceSha256: "b".repeat(64),
+    strictExportRefusalSha256: "c".repeat(64), equal: true, unexpectedDiffs: 0,
     evidenceScope: "reference-comparison-only", establishesNativeExecution: false };
   const arguments_ = { comparisonMode: "current-worker-d1", currentContractParity: comparison,
     parity: { schemaVersion: "analytics-v2-parity-report-v4", unexpectedDiffs: 9, breakdownsV13: { accepted: false },
@@ -262,12 +264,17 @@ test("current gates cannot promote saved comparison-only evidence without the ac
     perDate: { equal: false } };
   assert.deepEqual(rehearsalComparisonGates(arguments_), { currentWorkerD1ProducerAccepted: false,
     currentWorkerD1ReferenceComplete: false, currentWorkerD1Equality: false, immutableCorpusDailyConserved: true });
-  const producerAcceptance = { schemaVersion: "current-q1-d1-producer-acceptance-v1", accepted: true,
-    actualHelperInvocation: true, resultReturnedAfterOwnedCleanup: true, cryptographicExecutionAttestation: false };
+  const producerAcceptance = { schemaVersion: "current-q1-d1-producer-acceptance-v2", accepted: true,
+    actualHelperInvocation: true, resultReturnedAfterOwnedCleanup: true, cryptographicExecutionAttestation: false,
+    referenceSha256: "d".repeat(64), recomputationSha256: "a".repeat(64), corpusConvergenceSha256: "b".repeat(64), strictExportRefusalSha256: "c".repeat(64) };
   assert.deepEqual(rehearsalComparisonGates({ ...arguments_, producerAcceptance }), { currentWorkerD1ProducerAccepted: true,
     currentWorkerD1ReferenceComplete: true, currentWorkerD1Equality: true, immutableCorpusDailyConserved: true });
   for (const [field, value] of [["schemaVersion", "unknown"], ["accepted", false], ["actualHelperInvocation", false],
-    ["resultReturnedAfterOwnedCleanup", false], ["cryptographicExecutionAttestation", true]]) {
+    ["resultReturnedAfterOwnedCleanup", false], ["cryptographicExecutionAttestation", true],
+    ["referenceSha256", undefined], ["referenceSha256", "a".repeat(64)],
+    ["recomputationSha256", undefined], ["recomputationSha256", "d".repeat(64)],
+    ["corpusConvergenceSha256", undefined], ["corpusConvergenceSha256", "d".repeat(64)],
+    ["strictExportRefusalSha256", undefined], ["strictExportRefusalSha256", "d".repeat(64)]]) {
     const gates = rehearsalComparisonGates({ ...arguments_, producerAcceptance: { ...producerAcceptance, [field]: value } });
     for (const name of ["currentWorkerD1ProducerAccepted", "currentWorkerD1ReferenceComplete", "currentWorkerD1Equality"]) {
       assert.equal(gates[name], false);
@@ -275,7 +282,10 @@ test("current gates cannot promote saved comparison-only evidence without the ac
     assert.equal(gates.immutableCorpusDailyConserved, true, "corpus conservation is independent of producer acceptance");
   }
   for (const [field, value] of [["schemaVersion", "analytics-v2-parity-report-v4"], ["comparisonMode", "historical"],
-    ["referenceBound", false], ["referenceComplete", false], ["equal", false], ["unexpectedDiffs", 1]]) {
+    ["referenceBound", false], ["referenceComplete", false], ["recomputationComplete", false],
+    ["corpusConvergenceComplete", false], ["strictExportRefusalVerified", false], ["referenceSha256", "a".repeat(64)],
+    ["recomputationSha256", "a"], ["corpusConvergenceSha256", null], ["strictExportRefusalSha256", "d".repeat(64)],
+    ["equal", false], ["unexpectedDiffs", 1]]) {
     const gates = rehearsalComparisonGates({ ...arguments_, producerAcceptance,
       currentContractParity: { ...comparison, [field]: value } });
     assert.equal(gates.currentWorkerD1Equality, false);
@@ -308,6 +318,9 @@ test("qualifying driver invokes the fixed actual D1 producer and preserves origi
     'currentReferenceBinding = await timed(timings, "current-d1:input-binding", captureCurrentQ1ReferenceBinding)',
     'currentReference = await timed(timings, "current-d1:replay", runCurrentQ1D1Reference)',
     'validateCurrentQ1ReferenceBinding({ reference: currentReference, expected: currentReferenceBinding })',
+    'const complete = assessCurrentQ1ReferenceCompleteness({ reference: currentReference',
+    'if (currentReference.qualification !== "complete" || complete.state !== "complete")',
+    'const currentEvidenceSha256 = Object.fromEntries(["recomputation", "corpusConvergence", "strictExportRefusal"]',
     'currentReferenceSha256 = createHash("sha256").update(JSON.stringify(currentReference))',
     'writeFile(`${options.out}.current-reference-acceptance.json`',
     'const version = await pool.query("SELECT current_setting',

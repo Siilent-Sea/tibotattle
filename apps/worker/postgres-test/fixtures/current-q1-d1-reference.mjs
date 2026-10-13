@@ -21,6 +21,11 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import {
+  advanceCurrentQ1CachePass, assertCurrentQ1ControlTransition, assertCurrentQ1SourceUnchanged, captureCurrentQ1SourceInvariant,
+  proveCurrentQ1StrictExportRefusal, runCurrentQ1DailyConvergence, runCurrentQ1Recomputation,
+  validateCurrentQ1CorpusConvergence, validateCurrentQ1Recomputation, validateCurrentQ1StrictExportRefusal,
+} from "./current-q1-d1-recompute.mjs";
 import { createS9Progress } from "../../scripts/s9-rehearsal-diagnostics.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -33,11 +38,19 @@ const CORPUS_SOURCE = "d43c8f92a059d9c577776f7eca8a331eb305b8a6";
 const CORPUS_SHA = "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e";
 const DAY_MS = 86_400_000;
 const STREAMS = Object.freeze(["quota", "session", "usage"]);
+const V11_PARSER_VERSION = "synthetic-gcp-oracle-v11";
+const V12_PARSER_VERSION = "synthetic-gcp-oracle-v12";
+const V1_PARSER_VERSION = "synthetic-gcp-oracle-v1";
+const ADMISSION_CHUNK_RECORDS = 200;
+const V1_CONSENT = Object.freeze({ telemetrySchemaVersion: "telemetry-contribution-v1.0",
+  fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
+  privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0" });
 const INGESTION_MIGRATIONS = Object.freeze(["migrations", "typed-ingestion-migrations",
   "ingestion-bridge-migrations", "typed-v11-admission-migrations", "typed-v1-admission-migrations",
   "ingestion-isolation-migrations"]);
 const BOUNDS = Object.freeze({ bootstrap: 64, settleRounds: 8, delivery: 512,
-  daily: 256, dailyRetirement: 16, cachePasses: 4_096, nativeInvocations: 128, nativeStall: 8 });
+  daily: 256, dailyConvergence: 4_096, forcedDailyPerHead: 64, dailyRetirement: 16, cachePasses: 4_096,
+  nativeInvocations: 128, nativeStall: 8 });
 const ERRORS = Object.freeze(["CURRENT_Q1_BUSY", "CURRENT_Q1_INPUT_INVALID", "CURRENT_Q1_CORPUS_INVALID",
   "CURRENT_Q1_SOURCE_CHANGED", "CURRENT_Q1_RUNTIME_UNSUPPORTED", "CURRENT_Q1_MIGRATION_FAILED",
   "CURRENT_Q1_ADMISSION_FAILED", "CURRENT_Q1_NOT_SETTLED", "CURRENT_Q1_ORACLE_FAILED",
@@ -56,7 +69,11 @@ const READINESS_CODES = Object.freeze(["public_envelope_invalid", "public_daily_
   "public_daily_contract_invalid", "public_daily_reference_mismatch", "current_admin_preview_incomplete",
   "current_admin_catalog_invalid", "current_public_projection_invalid", "current_cache_missing_or_mismatched"]);
 const REQUIRED_FUNCTIONS = Object.freeze([
-  "ApiError", "StorageGraphOperationError", "activateTelemetryV11Domain", "activateTelemetryV12Domain",
+  "ApiError", "D1AnalyticsExportOracleError", "StorageGraphOperationError", "advanceStorageCommunityGraphWork",
+  "analyticsHistoryGraphWindow", "canonicalD1TableDigest", "captureStorageCommunityAuthority", "normalizedDailyPayloadSha256",
+  "readCollectionControls", "setCollectionControls", "readD1AnalyticsLiveCohort", "readD1AnalyticsImportSelection",
+  "readEffectiveTelemetryOwnerDayPage", "readStorageCommunitySourceTerminalEpoch", "readStorageCommunityDeliveredTerminalEpoch",
+  "publishStorageCommunityModelDay", "publishStorageCommunityGraphPreview", "retireStorageCommunityGraphPublications", "activateTelemetryV11Domain", "activateTelemetryV12Domain",
   "advanceCacheRetentionDayLane", "advanceNextStorageCommunityDaily", "advanceStorageAnalytics", "authenticateDevice",
   "buildCommunityDailyPayload", "buildCurrentPublicModelMetadata", "canonicalJson", "canonicalTelemetryV12Json",
   "captureStorageGraphScope", "claimDeviceUploadAuthorization", "computeStorageGraphResult", "createAccountlessUploadOwner",
@@ -163,7 +180,7 @@ async function sourceSnapshot() {
   };
   for (const path of ["src", "node_modules/@app-usagemonitor", "test/helpers/telemetry-v11.ts",
     "package.json", "package-lock.json", "wrangler.jsonc", "cloud-run/sealed-sqlite-d1-adapter.mjs",
-    "postgres-test/fixtures/current-q1-d1-reference.mjs", "scripts/s9-rehearsal-diagnostics.mjs", ...INGESTION_MIGRATIONS,
+    "postgres-test/fixtures/current-q1-d1-reference.mjs", "postgres-test/fixtures/current-q1-d1-recompute.mjs", "scripts/s9-rehearsal-diagnostics.mjs", ...INGESTION_MIGRATIONS,
     "analytics-migrations", "deletion-ledger-migrations"]) await collect(join(WORKER_ROOT, path));
   const files = [];
   for (const path of paths.sort()) files.push({ path: relative(REPOSITORY_ROOT, path), sha256: sha(await boundedFile(path)) });
@@ -197,12 +214,20 @@ async function corpusInput(P) {
       for (const stream of STREAMS) {
         requireFact(Array.isArray(day.records[stream]), "CURRENT_Q1_CORPUS_INVALID");
         for (const row of day.records[stream]) {
-          if (P !== null) (owner.key === "c" ? P.parseTelemetryV12Record : P.parseTelemetryV11Record)(stream, row);
+          if (P !== null) validateCorpusRecord(owner.key === "c" ? P.parseTelemetryV12Record : P.parseTelemetryV11Record,
+            stream, row);
           counts[stream]++; recordCount++;
         }
-        for (const row of day.v1Extra?.[stream] ?? []) { if (P !== null) P.parseTelemetryV11Record(stream, row); recordCount++; }
+        for (const row of day.v1Extra?.[stream] ?? []) {
+          if (P !== null) validateCorpusRecord(P.parseTelemetryV11Record, stream, row);
+          recordCount++;
+        }
       }
-      if (P !== null && owner.key === "c") P.validateTelemetryV12DayUsageOrder(day.day, day.records.usage);
+      if (P !== null && owner.key === "c") {
+        const usage = structuredClone(day.records.usage), before = jsonSha(usage);
+        P.validateTelemetryV12DayUsageOrder(day.day, usage);
+        requireFact(jsonSha(usage) === before, "CURRENT_Q1_CORPUS_INVALID");
+      }
     }
     requireFact(JSON.stringify(counts) === JSON.stringify(index.recordCounts[owner.key]), "CURRENT_Q1_CORPUS_INVALID");
     return { ...owner, days: shard.days };
@@ -212,16 +237,124 @@ async function corpusInput(P) {
     new Date(Date.parse(index.window.fromDay) + n * DAY_MS).toISOString().slice(0, 10));
   requireFact(index.conflict.owner === "a" && index.conflict.v1AdmittedAfterV11Domain === true
     && index.conflict.days.length === 2 && index.conflict.days.every((day) => days.includes(day)), "CURRENT_Q1_CORPUS_INVALID");
-  return { owners, window: index.window, expectedDailyDays: days.filter((day) => !index.conflict.days.includes(day)),
+  return { owners, window: index.window, expectedDailyDays: days.filter((day) => !index.conflict.days.includes(day)), conflictDays: [...index.conflict.days].sort(),
     provenance: { synthetic: true, sourceCommit: CORPUS_SOURCE,
     canonicalSha256: CORPUS_SHA, recordCount, primaryRecordCount: 14_830, owners: 4, daysPerOwner: 170,
     files: names.map((name, n) => ({ path: `apps/worker/analytics-v2-test/golden/corpus/${name}`,
       sha256: sha(bytes[n]) })) } };
 }
 
+async function prepareCurrentQ1V11Day(P, day, records) {
+  return P.makeV11Day(day, records, V11_PARSER_VERSION);
+}
+
+async function prepareCurrentQ1V12Day(P, day, records) {
+  const consent = P.telemetryV12RequiredConsent(), chunks = [];
+  for (const stream of STREAMS) {
+    for (let offset = 0; offset < records[stream].length; offset += ADMISSION_CHUNK_RECORDS) {
+      const rows = records[stream].slice(offset, offset + ADMISSION_CHUNK_RECORDS);
+      chunks.push({ schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64),
+        chunkId: `${stream}:${day}:${offset / ADMISSION_CHUNK_RECORDS}`, chunkRevision: 1,
+        chunkDigest: await P.sha256Hex(P.canonicalTelemetryV12Json(rows)), parserVersion: V12_PARSER_VERSION,
+        consent, records: rows });
+    }
+  }
+  const manifest = { schemaVersion: "telemetry-day-manifest-v1.2", day, parserVersion: V12_PARSER_VERSION,
+    consent, chunks: chunks.map((chunk) => ({ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest,
+      recordCount: chunk.records.length })), excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64) };
+  manifest.manifestDigest = await P.sha256Hex(P.telemetryV12DayManifestDigestInput(manifest));
+  for (const chunk of chunks) chunk.manifestDigest = manifest.manifestDigest;
+  return { manifest, chunks };
+}
+
+async function prepareCurrentQ1V1Chunks(P, participantId, day, recordsByStream) {
+  const prepared = [];
+  for (const stream of STREAMS) {
+    const sourceRecords = recordsByStream[stream] ?? [];
+    const rows = sourceRecords.map((record) => {
+      const projected = P.telemetryV11LegacyProjection(stream, record);
+      requireFact(projected !== null, "CURRENT_Q1_ADMISSION_FAILED");
+      return JSON.parse(projected.canonicalRecord);
+    });
+    for (let offset = 0; offset < rows.length; offset += ADMISSION_CHUNK_RECORDS) {
+      const page = rows.slice(offset, offset + ADMISSION_CHUNK_RECORDS), seq = offset / ADMISSION_CHUNK_RECORDS;
+      const chunk = P.parseTelemetryV1Chunk({ schemaVersion: "telemetry-contribution-v1.0",
+        chunkId: `${stream}:${day}:${seq}`, chunkRevision: 1,
+        chunkDigest: await P.sha256Hex(P.canonicalJson(page)), parserVersion: V1_PARSER_VERSION,
+        consent: { ...V1_CONSENT }, records: page });
+      prepared.push({ stream, seq, chunk, admission: { participantId, format: "v1", day,
+        chunkDigest: chunk.chunkDigest, stream, records: page.length, corpusRowsSha256: jsonSha(sourceRecords) } });
+    }
+  }
+  return prepared;
+}
+
+function currentQ1PrimaryAdmission(participantId, format, day, prepared) {
+  return { participantId, format, day, manifestDigest: prepared.manifest.manifestDigest,
+    chunks: prepared.manifest.chunks.map(({ chunkId, chunkDigest, recordCount }) => ({ chunkId, chunkDigest, recordCount })) };
+}
+
+/** Derive the exact admission identity contract from the pinned corpus through
+ * the current public builders. This is pure in-memory work: no database,
+ * receipt, admission object, or serialized raw row is used as an expectation. */
+export async function buildCurrentQ1AdmissionIdentities(P, corpus) {
+  const code = "CURRENT_Q1_REFERENCE_BINDING_INVALID";
+  const required = ["makeV11Day", "sha256Hex", "canonicalTelemetryV12Json", "telemetryV12DayManifestDigestInput",
+    "telemetryV12RequiredConsent", "parseTelemetryV12Chunk", "telemetryV11LegacyProjection", "canonicalJson",
+    "parseTelemetryV1Chunk"];
+  requireFact(P !== null && typeof P === "object" && required.every((name) => typeof P[name] === "function")
+    && corpus && Array.isArray(corpus.owners) && corpus.owners.length === 4
+    && corpus.owners.every((owner) => object(owner) && ["a", "b", "c", "d"].includes(owner.key)
+      && Array.isArray(owner.days) && owner.days.length === 170), code);
+  let input;
+  try { input = structuredClone(corpus); } catch { requireFact(false, code); }
+  const inputSha256 = jsonSha(input);
+  const entries = [];
+  for (const owner of input.owners) {
+    const format = owner.key === "c" ? "v12" : "v11";
+    for (const day of owner.days) {
+      const prepared = format === "v12"
+        ? await prepareCurrentQ1V12Day(P, day.day, day.records)
+        : await prepareCurrentQ1V11Day(P, day.day, day.records);
+      if (format === "v12") for (const chunk of prepared.chunks) P.parseTelemetryV12Chunk(chunk);
+      entries.push(currentQ1PrimaryAdmission(owner.participantId, format, day.day, prepared));
+      for (const [stream, records] of Object.entries(day.v1Extra ?? {})) {
+        if (records.length === 0) continue;
+        for (const { admission } of await prepareCurrentQ1V1Chunks(P, owner.participantId, day.day, { [stream]: records })) {
+          entries.push(admission);
+        }
+      }
+    }
+  }
+  entries.sort((left, right) => {
+    const a = JSON.stringify([left.participantId, left.format, left.day]);
+    const b = JSON.stringify([right.participantId, right.format, right.day]);
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  requireFact(jsonSha(input) === inputSha256, code);
+  return entries;
+}
+
+function capturedCorpusStructure(corpus, admissionIdentities) {
+  const entries = corpus.owners.flatMap((owner) => owner.days.flatMap((day) =>
+    Object.entries(day.v1Extra ?? {}).filter(([, records]) => records.length > 0).map(([stream, records]) => ({
+      ownerKey: owner.key, participantId: owner.participantId, day: day.day, format: "v1", stream, records: records.length,
+      corpusRowsSha256: jsonSha(records),
+    })))).sort((left, right) => {
+    const a = `${left.ownerKey}\0${left.day}\0${left.stream}`, b = `${right.ownerKey}\0${right.day}\0${right.stream}`;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  const v1ExtraAdmissions = { count: entries.length, sha256: jsonSha(entries), entries };
+  requireFact(v1ExtraAdmissions.count === 2, "CURRENT_Q1_CORPUS_INVALID");
+  return { owners: corpus.owners.map(({ key, participantId, pinnedOwnerDigest, models }) =>
+    ({ key, participantId, pinnedOwnerDigest, models })), window: corpus.window,
+  expectedDailyDays: corpus.expectedDailyDays, conflictDays: corpus.conflictDays, v1ExtraAdmissions, admissionIdentities };
+}
+
 const MIGRATION_APPLY_ORDER = Object.freeze([...INGESTION_MIGRATIONS.slice(0, 4), "analytics-migrations",
   "deletion-ledger-migrations", ...INGESTION_MIGRATIONS.slice(4)]);
 const SHA256 = /^[a-f0-9]{64}$/u;
+const DAY = /^\d{4}-\d{2}-\d{2}$/u;
 const safeSourcePath = (path) => typeof path === "string" && path.startsWith("apps/worker/")
   && !/[\0\r\n\\]/u.test(path) && path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
 
@@ -242,18 +375,71 @@ async function measuredRuntime() {
   return runtime;
 }
 
-/** Independently capture candidate inputs before executing any app code. The
- * fixed corpus SHA admits only the immutable synthetic shards; raw records
- * never enter this returned expectation. SQLite/Vite/PG are not imported. */
+function freezeTree(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const item of Object.values(value)) freezeTree(item);
+  return Object.freeze(value);
+}
+
+export function assertCurrentQ1BindingScratchIdentity(before, after) {
+  requireFact(before?.isDirectory() && !before.isSymbolicLink() && before.uid === process.getuid()
+    && (before.mode & 0o077) === 0 && after?.isDirectory() && !after.isSymbolicLink()
+    && after.uid === process.getuid() && after.dev === before.dev && after.ino === before.ino
+    && (after.mode & 0o077) === 0, "CURRENT_Q1_CLEANUP_FAILED");
+}
+
+export async function closeCurrentQ1BindingScratch({ vite, cacheRoot, cacheIdentity }) {
+  try { await vite?.close(); } finally {
+    if (cacheRoot && cacheIdentity) {
+      const after = await lstat(cacheRoot);
+      assertCurrentQ1BindingScratchIdentity(cacheIdentity, after);
+      await rm(cacheRoot, { recursive: true });
+    }
+  }
+}
+
+export function finishCurrentQ1ReferenceBindingCapture({ before, after, binding }) {
+  requireFact(isDeepStrictEqual(before, after) && object(binding), "CURRENT_Q1_SOURCE_CHANGED");
+  return freezeTree(binding);
+}
+
+/** Independently capture source, runtime, corpus, and canonical admission
+ * identities before any database execution. A temporary Vite facade exposes
+ * only the current public builders; its module graph is closed before return.
+ * Raw synthetic rows remain in memory and never enter the binding object. */
 export async function captureCurrentQ1ReferenceBinding() {
-  const runtime = await measuredRuntime(), source = await sourceSnapshot(), corpus = await corpusInput(null);
+  const runtime = await measuredRuntime(), source = await sourceSnapshot(), corpusBefore = await corpusInput(null);
   const migrations = orderedMigrationInputs(source.files);
-  return { schemaVersion: "current-q1-d1-reference-binding-v1", sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID,
-    sourceNamespace: NAMESPACE, source, migrations, migrationSha256: jsonSha(migrations), runtime,
-    corpus: corpus.provenance, corpusStructure: {
-      owners: corpus.owners.map(({ key, participantId, pinnedOwnerDigest, models }) => ({ key, participantId, pinnedOwnerDigest, models })),
-      window: corpus.window, expectedDailyDays: corpus.expectedDailyDays,
-    } };
+  const captureBoundaryBefore = { runtime, source, corpus: corpusBefore.provenance, migrations, bounds: BOUNDS };
+  let vite, cacheRoot, cacheIdentity;
+  let corpusStructure;
+  try {
+    cacheRoot = await mkdtemp(join(tmpdir(), "tibotattle-current-q1-binding-vite-"));
+    cacheIdentity = await lstat(cacheRoot);
+    requireFact(cacheIdentity.isDirectory() && !cacheIdentity.isSymbolicLink() && cacheIdentity.uid === process.getuid()
+      && (cacheIdentity.mode & 0o077) === 0, "CURRENT_Q1_SCRATCH_INVALID");
+    await chmod(cacheRoot, 0o700);
+    const { createServer } = await import("vite");
+    vite = await createServer({ root: WORKER_ROOT, cacheDir: cacheRoot, configFile: false, appType: "custom", logLevel: "silent",
+      server: { middlewareMode: true, hmr: false, ws: false, watch: null } });
+    const P = await loadCurrent(vite), corpus = await corpusInput(P);
+    requireFact(isDeepStrictEqual(corpusBefore.provenance, corpus.provenance), "CURRENT_Q1_CORPUS_INVALID");
+    const admissionIdentities = await buildCurrentQ1AdmissionIdentities(P, corpus);
+    corpusStructure = capturedCorpusStructure(corpus, admissionIdentities);
+    requireFact(validCorpusStructure(corpusStructure), "CURRENT_Q1_CORPUS_INVALID");
+  } finally {
+    await closeCurrentQ1BindingScratch({ vite, cacheRoot, cacheIdentity });
+  }
+  const [runtimeAfter, sourceAfter, corpusAfter] = await Promise.all([
+    measuredRuntime(), sourceSnapshot(), corpusInput(null),
+  ]);
+  const migrationsAfter = orderedMigrationInputs(sourceAfter.files);
+  const binding = { schemaVersion: "current-q1-d1-reference-binding-v3", sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID,
+    sourceNamespace: NAMESPACE, source, migrations, migrationSha256: jsonSha(migrations), runtime, bounds: BOUNDS,
+    runtimeContracts: { v1: 1, v11: 1 }, corpus: corpusBefore.provenance, corpusStructure };
+  const captureBoundaryAfter = { runtime: runtimeAfter, source: sourceAfter, corpus: corpusAfter.provenance,
+    migrations: migrationsAfter, bounds: BOUNDS };
+  return finishCurrentQ1ReferenceBindingCapture({ before: captureBoundaryBefore, after: captureBoundaryAfter, binding });
 }
 
 function validFilePins(value, ordered = false) {
@@ -272,15 +458,60 @@ function validSourcePin(value) {
     && validFilePins(value.files, true) && value.sha256 === jsonSha(value.files);
 }
 
+function validBounds(value) {
+  return exactKeys(value, Object.keys(BOUNDS)) && isDeepStrictEqual(value, BOUNDS);
+}
+
+function admissionCoordinate(participantId, format, day) {
+  return JSON.stringify([participantId, format, day]);
+}
+
+function expectedAdmissionCoordinates(corpus) {
+  const entries = [];
+  const allDays = Array.from({ length: corpus.window.days }, (_, n) =>
+    new Date(Date.parse(corpus.window.fromDay) + n * DAY_MS).toISOString().slice(0, 10));
+  for (const owner of corpus.owners) {
+    const format = owner.key === "c" ? "v12" : "v11";
+    for (const day of allDays) entries.push(admissionCoordinate(owner.participantId, format, day));
+  }
+  for (const extra of corpus.v1ExtraAdmissions.entries) {
+    entries.push(admissionCoordinate(extra.participantId, "v1", extra.day));
+  }
+  return entries.sort();
+}
+
+const ADMISSION_STREAMS = new Set(STREAMS);
+
+/** Require every admission to match the complete canonical identity independently
+ * derived before any admission code ran, not only its corpus coordinate or self-hash. */
+export function validateCurrentQ1Admissions(admissions, corpus) {
+  const code = "CURRENT_Q1_REFERENCE_BINDING_INVALID";
+  try {
+    requireFact(validCorpusStructure(corpus) && Array.isArray(admissions) && admissions.length === 682, code);
+    const expected = new Map(corpus.admissionIdentities.map((entry) =>
+      [admissionCoordinate(entry.participantId, entry.format, entry.day), entry]));
+    const seen = new Set();
+    for (const entry of admissions) {
+      requireFact(object(entry) && typeof entry.participantId === "string" && DAY.test(entry.day), code);
+      const coordinate = admissionCoordinate(entry.participantId, entry.format, entry.day);
+      requireFact(expected.has(coordinate) && isDeepStrictEqual(entry, expected.get(coordinate)) && !seen.has(coordinate), code);
+      seen.add(coordinate);
+    }
+    requireFact(isDeepStrictEqual([...seen].sort(), expectedAdmissionCoordinates(corpus)), code);
+    return { count: admissions.length, sha256: jsonSha(admissions) };
+  } catch { throw Object.assign(new Error(code), { code }); }
+}
+
 /** No fallback from reference output to an expectation. The owner supplies an
  * independently frozen capture, and every required provenance field is exact. */
 export function validateCurrentQ1ReferenceBinding({ reference, expected }) {
   const code = "CURRENT_Q1_REFERENCE_BINDING_INVALID";
   try {
     requireFact(exactKeys(expected, ["schemaVersion", "sourceId", "sourceNamespace", "source", "migrations",
-      "migrationSha256", "runtime", "corpus", "corpusStructure"])
-      && expected.schemaVersion === "current-q1-d1-reference-binding-v1"
-      && reference?.schemaVersion === "current-q1-d1-reference-v1" && reference.synthetic === true
+      "migrationSha256", "runtime", "bounds", "runtimeContracts", "corpus", "corpusStructure"])
+      && expected.schemaVersion === "current-q1-d1-reference-binding-v3"
+      && reference?.schemaVersion === "current-q1-d1-reference-v2" && reference.synthetic === true
+      && validBounds(expected.bounds) && validBounds(reference.bounds)
       && reference.sourceId === CURRENT_Q1_REFERENCE_SOURCE_ID && reference.sourceNamespace === NAMESPACE
       && expected.sourceId === reference.sourceId && expected.sourceNamespace === reference.sourceNamespace, code);
     const actual = reference.provenance;
@@ -288,6 +519,9 @@ export function validateCurrentQ1ReferenceBinding({ reference, expected }) {
       "runtimeContracts", "admissions", "admissionSha256", "cohort"])
       && validSourcePin(expected.source) && validSourcePin(actual.source)
       && isDeepStrictEqual(actual.source, expected.source), code);
+    requireFact(exactKeys(expected.runtimeContracts, ["v1", "v11"]) && expected.runtimeContracts.v1 === 1
+      && expected.runtimeContracts.v11 === 1 && exactKeys(actual.runtimeContracts, ["v1", "v11"])
+      && isDeepStrictEqual(actual.runtimeContracts, expected.runtimeContracts), code);
     for (const candidate of [expected, actual]) {
       requireFact(validFilePins(candidate.migrations) && candidate.migrationSha256 === jsonSha(candidate.migrations)
         && isDeepStrictEqual(candidate.migrations, orderedMigrationInputs(candidate.source.files)), code);
@@ -304,6 +538,15 @@ export function validateCurrentQ1ReferenceBinding({ reference, expected }) {
     requireFact(isDeepStrictEqual(actual.migrations, expected.migrations) && actual.migrationSha256 === expected.migrationSha256
       && isDeepStrictEqual(actual.runtime, expected.runtime) && isDeepStrictEqual(actual.corpus, expected.corpus), code);
     requireFact(validCorpusStructure(expected.corpusStructure), code);
+    validateCurrentQ1Admissions(actual.admissions, expected.corpusStructure);
+    requireFact(SHA256.test(actual.admissionSha256) && actual.admissionSha256 === jsonSha(actual.admissions), code);
+    const expectedCohort = expected.corpusStructure.owners.map((owner) =>
+      ({ participantId: owner.participantId, ownerDigest: owner.pinnedOwnerDigest }))
+      .sort((left, right) => left.participantId < right.participantId ? -1 : left.participantId > right.participantId ? 1 : 0);
+    requireFact(Array.isArray(actual.cohort) && actual.cohort.length === 4 && actual.cohort.every((owner) =>
+      exactKeys(owner, ["participantId", "ownerDigest"]) && SHA256.test(owner.ownerDigest))
+      && isDeepStrictEqual([...actual.cohort].sort((left, right) => left.participantId < right.participantId ? -1
+        : left.participantId > right.participantId ? 1 : 0), expectedCohort), code);
     return { state: "bound", sourceHead: expected.source.head, sourceSha256: expected.source.sha256,
       migrationSha256: expected.migrationSha256, corpusSha256: expected.corpus.canonicalSha256 };
   } catch { throw Object.assign(new Error(code), { code }); }
@@ -364,6 +607,12 @@ function pinRuntime(DatabaseSync) {
   };
 }
 
+function validateCorpusRecord(parser, stream, record) {
+  const candidate = structuredClone(record), before = jsonSha(candidate);
+  parser(stream, candidate);
+  requireFact(jsonSha(candidate) === before, "CURRENT_Q1_CORPUS_INVALID");
+}
+
 async function loadCurrent(vite) {
   const P = {};
   for (const path of ["/test/helpers/telemetry-v11.ts", "/src/index.ts", "/src/canonical-json.ts", "/src/crypto.ts",
@@ -377,7 +626,9 @@ async function loadCurrent(vite) {
     "/src/storage-community-graph-publication.ts", "/src/storage-analytics-failure.ts",
     "/src/admin-community-allowance.ts", "/src/public-allowance-breakdowns.ts", "/src/community-daily-spend.ts",
     "/src/analytics-v2/public-allowance-breakdowns-v15.ts", "/src/analytics-v2/public-model-metadata-current.ts",
-    "/src/errors.ts", "/src/quarantine-reconciliation.ts"]) {
+    "/src/errors.ts", "/src/quarantine-reconciliation.ts", "/src/analytics-history-proof.ts",
+    "/src/collection-controls.ts", "/src/admin-operations.ts", "/src/telemetry-usage-effective-reader.ts",
+    "/src/storage-community-graph-work.ts"]) {
     Object.assign(P, await vite.ssrLoadModule(path));
   }
   Object.assign(P, await vite.ssrLoadModule("/node_modules/@app-usagemonitor/telemetry-contract/index.js"));
@@ -500,7 +751,7 @@ async function seedCorpus(ctx, owners) {
     for (const [dayIndex, { day, records }] of days.entries()) {
       diagnostic.progress.dayOrdinal = dayIndex + 1; diagnostic.progress.chunkOrdinal = 0;
       ctx.progress.counts(diagnostic.progress);
-      const prepared = await P.makeV11Day(day, records, "synthetic-gcp-oracle-v11");
+      const prepared = await prepareCurrentQ1V11Day(P, day, records);
       await P.registerTelemetryV11DayManifest(ingestion, principal, prepared.manifest);
       for (const [chunkIndex, chunk] of prepared.chunks.entries()) {
         diagnostic.progress.chunkOrdinal = chunkIndex + 1; ctx.progress.counts(diagnostic.progress);
@@ -510,8 +761,7 @@ async function seedCorpus(ctx, owners) {
         diagnostic.progress.completedChunks++; ctx.progress.counts(diagnostic.progress);
       }
       ready.push(await P.registerTelemetryV11DayManifest(ingestion, principal, prepared.manifest));
-      admissions.push({ participantId: principal.participantId, format: "v11", day,
-        manifestDigest: prepared.manifest.manifestDigest, chunks: prepared.manifest.chunks });
+      admissions.push(currentQ1PrimaryAdmission(principal.participantId, "v11", day, prepared));
       diagnostic.progress.completedDays++; ctx.progress.counts(diagnostic.progress);
     }
     const predecessor = await P.createTelemetryV11DomainPredecessor(ingestion, principal, CURRENT_Q1_REFERENCE_NOW_MS);
@@ -523,27 +773,14 @@ async function seedCorpus(ctx, owners) {
     await P.activateTelemetryV11Domain(ingestion, principal, domain, CURRENT_Q1_REFERENCE_NOW_MS);
   };
   const stageV12 = async (principal, days) => {
-    const ready = [], consent = P.telemetryV12RequiredConsent();
+    const ready = [];
     for (const [dayIndex, { day, records }] of days.entries()) {
       diagnostic.progress.dayOrdinal = dayIndex + 1; diagnostic.progress.chunkOrdinal = 0;
       ctx.progress.counts(diagnostic.progress);
-      const chunks = [];
-      for (const stream of STREAMS) for (let offset = 0; offset < records[stream].length; offset += 200) {
-        diagnostic.progress.chunkOrdinal = chunks.length + 1; ctx.progress.counts(diagnostic.progress);
-        const rows = records[stream].slice(offset, offset + 200);
-        chunks.push({ schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64),
-          chunkId: `${stream}:${day}:${offset / 200}`, chunkRevision: 1,
-          chunkDigest: await P.sha256Hex(P.canonicalTelemetryV12Json(rows)),
-          parserVersion: "synthetic-gcp-oracle-v12", consent, records: rows });
-      }
-      const manifest = { schemaVersion: "telemetry-day-manifest-v1.2", day, parserVersion: "synthetic-gcp-oracle-v12", consent,
-        chunks: chunks.map((chunk) => ({ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest,
-          recordCount: chunk.records.length })), excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64) };
-      manifest.manifestDigest = await P.sha256Hex(P.telemetryV12DayManifestDigestInput(manifest));
+      const prepared = await prepareCurrentQ1V12Day(P, day, records), { chunks, manifest } = prepared;
       await P.registerTelemetryV12DayManifest(ingestion, principal, manifest);
       for (const [chunkIndex, chunk] of chunks.entries()) {
         diagnostic.progress.chunkOrdinal = chunkIndex + 1; ctx.progress.counts(diagnostic.progress);
-        chunk.manifestDigest = manifest.manifestDigest;
         P.parseTelemetryV12Chunk(chunk);
         const metadata = await coordinates(principal,
           `v12:${principal.participantId}:${day}:${chunk.chunkId}:${manifest.manifestDigest}`);
@@ -554,8 +791,7 @@ async function seedCorpus(ctx, owners) {
         diagnostic.progress.completedChunks++; ctx.progress.counts(diagnostic.progress);
       }
       ready.push(await P.registerTelemetryV12DayManifest(ingestion, principal, manifest));
-      admissions.push({ participantId: principal.participantId, format: "v12", day,
-        manifestDigest: manifest.manifestDigest, chunks: manifest.chunks });
+      admissions.push(currentQ1PrimaryAdmission(principal.participantId, "v12", day, prepared));
       diagnostic.progress.completedDays++; ctx.progress.counts(diagnostic.progress);
     }
     const predecessor = await P.createTelemetryV12DomainPredecessor(ingestion, principal, CURRENT_Q1_REFERENCE_NOW_MS);
@@ -570,27 +806,16 @@ async function seedCorpus(ctx, owners) {
     for (const [dayIndex, { day, records }] of days.entries()) {
       diagnostic.progress.dayOrdinal = dayIndex + 1; diagnostic.progress.chunkOrdinal = 0;
       ctx.progress.counts(diagnostic.progress);
-      for (const stream of STREAMS) {
-        const rows = records[stream].map((record) => {
-          const projected = P.telemetryV11LegacyProjection(stream, record);
-          requireFact(projected !== null, "CURRENT_Q1_ADMISSION_FAILED"); return JSON.parse(projected.canonicalRecord);
-        });
-        for (let offset = 0; offset < rows.length; offset += 200) {
-          diagnostic.progress.chunkOrdinal++; ctx.progress.counts(diagnostic.progress);
-          const page = rows.slice(offset, offset + 200), seq = offset / 200;
-          const chunk = P.parseTelemetryV1Chunk({ schemaVersion: "telemetry-contribution-v1.0", chunkId: `${stream}:${day}:${seq}`,
-            chunkRevision: 1, chunkDigest: await P.sha256Hex(P.canonicalJson(page)), parserVersion: "synthetic-gcp-oracle-v1",
-            consent: { telemetrySchemaVersion: "telemetry-contribution-v1.0", fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
-              privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0" }, records: page });
-          requireFact(await P.currentTelemetryV1Chunk(ingestion, principal.participantId, principal.deviceId, stream, day, seq) === null,
-            "CURRENT_Q1_ADMISSION_FAILED");
-          await P.insertTypedTelemetryV1Chunk(ingestion, { participantId: principal.participantId, deviceId: principal.deviceId, chunk,
-            ...await coordinates(principal, `v1:${principal.participantId}:${day}:${stream}:${seq}`),
-            createdAt: new Date().toISOString(), supersedes: null }, NAMESPACE);
-          admissions.push({ participantId: principal.participantId, format: "v1", day,
-            chunkDigest: chunk.chunkDigest, stream, records: page.length });
-          diagnostic.progress.completedChunks++; ctx.progress.counts(diagnostic.progress);
-        }
+      for (const { stream, seq, chunk, admission } of await prepareCurrentQ1V1Chunks(P,
+        principal.participantId, day, records)) {
+        diagnostic.progress.chunkOrdinal++; ctx.progress.counts(diagnostic.progress);
+        requireFact(await P.currentTelemetryV1Chunk(ingestion, principal.participantId, principal.deviceId, stream, day, seq) === null,
+          "CURRENT_Q1_ADMISSION_FAILED");
+        await P.insertTypedTelemetryV1Chunk(ingestion, { participantId: principal.participantId, deviceId: principal.deviceId, chunk,
+          ...await coordinates(principal, `v1:${principal.participantId}:${day}:${stream}:${seq}`),
+          createdAt: new Date().toISOString(), supersedes: null }, NAMESPACE);
+        admissions.push(admission);
+        diagnostic.progress.completedChunks++; ctx.progress.counts(diagnostic.progress);
       }
       diagnostic.progress.completedDays++; ctx.progress.counts(diagnostic.progress);
     }
@@ -624,49 +849,97 @@ async function seedCorpus(ctx, owners) {
 const bindings = (ctx) => ({ source: ctx.ingestion, target: ctx.analytics,
   sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE });
 
-async function settle(ctx) {
+async function settle(ctx, corpus) {
   ctx.progress.phase("settle_bootstrap");
   let bootstrap = false;
   for (let n = 0; n < BOUNDS.bootstrap; n++) if ((await ctx.P.drainCommunityPublicSourceBootstrap(ctx.ingestion)).completed) {
     bootstrap = true; break;
   }
   requireFact(bootstrap, "CURRENT_Q1_NOT_SETTLED");
-  let settled = false;
-  for (let round = 0; round < BOUNDS.settleRounds; round++) {
-    let delivered = false, published = false;
-    ctx.progress.phase("settle_delivery");
-    ctx.progress.counts({ iteration: round + 1 });
-    for (let n = 0; n < BOUNDS.delivery; n++) {
-      ctx.progress.counts({ iteration: n + 1 });
-      const step = await ctx.P.advanceStorageAnalytics(bindings(ctx));
-      if (step.state === "idle") break;
-      delivered = true;
-    }
-    ctx.progress.phase("settle_daily");
-    ctx.progress.counts({ iteration: round + 1 });
-    for (const preferStaleHead of [false, true]) for (let n = 0; n < BOUNDS.daily; n++) {
-      ctx.progress.counts({ iteration: n + 1 });
-      const step = await ctx.P.advanceNextStorageCommunityDaily({ ...bindings(ctx), preferStaleHead, nowMs: CURRENT_Q1_REFERENCE_NOW_MS });
-      if (step.state === "idle") break;
-      published = true;
-    }
-    ctx.progress.phase("settle_retirement");
-    ctx.progress.counts({ iteration: round + 1 });
-    for (let n = 0; n < BOUNDS.dailyRetirement; n++) if (await ctx.P.retireStorageCommunityDailyPage(bindings(ctx)) === 0) break;
-    if (!delivered && !published) { settled = true; break; }
+  ctx.initialSource = await captureCurrentQ1SourceInvariant(ctx.ingestion);
+  ctx.initialConflict = await conflictEvidence(ctx, corpus);
+  let idle = false;
+  ctx.progress.phase("settle_delivery");
+  for (let n = 0; n < BOUNDS.delivery * BOUNDS.settleRounds; n++) {
+    ctx.progress.counts({ iteration: n + 1 });
+    const step = await ctx.P.advanceStorageAnalytics(bindings(ctx));
+    if (step.state === "idle") { idle = true; break; }
+    requireFact(["applied", "discarded", "building"].includes(step.state), "CURRENT_Q1_NOT_SETTLED");
   }
-  requireFact(settled, "CURRENT_Q1_NOT_SETTLED");
+  requireFact(idle, "CURRENT_Q1_NOT_SETTLED");
+  ctx.progress.phase("settle_daily");
+  const dailyPasses = await runCurrentQ1DailyConvergence(ctx, corpus, BOUNDS.dailyConvergence);
+  ctx.progress.phase("settle_retirement");
+  for (let n = 0; n < BOUNDS.dailyRetirement; n++) if (await ctx.P.retireStorageCommunityDailyPage(bindings(ctx)) === 0) break;
   ctx.progress.phase("settle_cache");
   for (let n = 0; n < BOUNDS.cachePasses; n++) {
     ctx.progress.counts({ iteration: n + 1 });
-    const step = await ctx.P.advanceCacheRetentionDayLane({ target: ctx.analytics, sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID,
-      build: ctx.P.createCacheRetentionDaySourceBuild({ ...bindings(ctx), now: () => CURRENT_Q1_REFERENCE_NOW_MS }),
-      // Matches the maintained export fixture, rather than changing a production budget.
-      deadlineMs: CURRENT_Q1_REFERENCE_NOW_MS + 1, remainingQueries: 5_000, sourceQueries: 5_000,
-      maxDays: 64, maxWrites: 64, now: () => CURRENT_Q1_REFERENCE_NOW_MS, shardIndex: 0, shardCount: 1 });
-    if (step.state === "idle") return;
+    const step = await advanceCurrentQ1CachePass(ctx);
+    if (step.state === "idle") return dailyPasses;
   }
   throw Object.assign(new Error("CURRENT_Q1_NOT_SETTLED"), { code: "CURRENT_Q1_NOT_SETTLED" });
+}
+
+async function conflictEvidence(ctx, corpus) {
+  const expected = corpus.owners.find((owner) => owner.key === "a");
+  const owner = (await ctx.P.readStorageCommunityOwnerPage(ctx.ingestion, { limit: 5 }))
+    .find((candidate) => candidate.ownerDigest === expected.pinnedOwnerDigest);
+  requireFact(owner?.participantId === expected.participantId, "CURRENT_Q1_ADMISSION_FAILED");
+  const evidence = [];
+  for (const day of corpus.conflictDays) {
+    const hash = createHash("sha256"); let rows = 0, conflictRows = 0;
+    for (const stream of STREAMS) {
+      let after;
+      for (let n = 0; n < 256; n++) {
+        const page = await ctx.P.readEffectiveTelemetryOwnerDayPage(ctx.ingestion, {
+          sourceNamespace: NAMESPACE, ownerDigest: owner.ownerDigest, ownerRevision: owner.ownerRevision,
+          authorityEpoch: owner.authorityEpoch, day, stream, limit: 50, ...(after === undefined ? {} : { after }),
+        });
+        requireFact(Array.isArray(page.rows) && page.rows.length <= 50, "CURRENT_Q1_NOT_SETTLED");
+        for (const row of page.rows) {
+          rows++; conflictRows += row.status === "conflict" ? 1 : 0;
+          hash.update(jsonSha(row)).update("\n");
+        }
+        if (page.next === null) break;
+        requireFact(n < 255 && !isDeepStrictEqual(after, page.next), "CURRENT_Q1_NOT_SETTLED"); after = page.next;
+      }
+    }
+    requireFact(conflictRows === 1, "CURRENT_Q1_NOT_SETTLED");
+    evidence.push({ day, rows, conflictRows, sha256: hash.digest("hex") });
+  }
+  return evidence;
+}
+
+async function convergenceSnapshot(ctx, corpus, dailyPasses, admissions) {
+  const authority = await ctx.P.captureStorageCommunityAuthority(ctx.ingestion, bindings(ctx));
+  const journalMax = await ctx.ingestion.prepare("SELECT COALESCE(MAX(sequence),0) AS n FROM storage_ingestion_changes").first("n");
+  const cursorSequence = await ctx.analytics.prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
+    .bind(ctx.sourceId).first("sequence");
+  const delivery = await ctx.P.advanceStorageAnalytics(bindings(ctx));
+  requireFact(delivery.state === "idle" && delivery.sequence === journalMax && cursorSequence === journalMax,
+    "CURRENT_Q1_NOT_SETTLED");
+  const retainedQueue = (await ctx.analytics.prepare("SELECT source_id,day,revision FROM analytics_community_daily_queue ORDER BY source_id,day").all()).results;
+  requireFact(retainedQueue.every((row) => row.source_id === ctx.sourceId), "CURRENT_Q1_NOT_SETTLED");
+  const selection = await ctx.P.readD1AnalyticsImportSelection({ ...bindings(ctx), pinnedNowMs: ctx.nowMs });
+  requireFact(isDeepStrictEqual(selection.heads.map((row) => row.day), corpus.expectedDailyDays)
+    && isDeepStrictEqual(selection.daily.map((row) => row.day), corpus.expectedDailyDays), "CURRENT_Q1_NOT_SETTLED");
+  const filtered = await ctx.P.advanceNextStorageCommunityDaily({ ...bindings(ctx), nowMs: ctx.nowMs, skipDays: corpus.conflictDays });
+  const unfiltered = await ctx.P.advanceNextStorageCommunityDaily({ ...bindings(ctx), nowMs: ctx.nowMs });
+  requireFact(isDeepStrictEqual(filtered, { state: "idle", ownersAdvanced: 0 }), "CURRENT_Q1_NOT_SETTLED");
+  const cache = await advanceCurrentQ1CachePass(ctx);
+  requireFact(cache.state === "idle", "CURRENT_Q1_NOT_SETTLED");
+  const currentSource = await captureCurrentQ1SourceInvariant(ctx.ingestion);
+  assertCurrentQ1SourceUnchanged(ctx.expectedSource, currentSource);
+  const retainedConflict = await conflictEvidence(ctx, corpus);
+  requireFact(isDeepStrictEqual(ctx.initialConflict, retainedConflict), "CURRENT_Q1_NOT_SETTLED");
+  return { publishedDays: selection.daily.map((row) => row.day), retainedQueue: retainedQueue.map(({ day, revision }) => ({ day, revision })),
+    conflictEvidence: retainedConflict, admissionSha256: jsonSha(admissions),
+    sourceInvariantSha256: currentSource.sha256, dailyPasses,
+    fence: { authority, journalMax, cursorSequence, cursorReceipt: true,
+      sourceTerminalEpoch: await ctx.P.readStorageCommunitySourceTerminalEpoch(ctx.ingestion),
+      deliveredTerminalEpoch: await ctx.P.readStorageCommunityDeliveredTerminalEpoch(ctx.analytics, ctx.sourceId),
+      pendingErasureJobs: await ctx.ledger.prepare("SELECT count(*) AS n FROM storage_erasure_jobs WHERE state='pending'").first("n"), cacheIdle: true },
+    selector: { filteredIdle: true, unfiltered } };
 }
 
 const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -686,7 +959,8 @@ function graphWindowDays() {
 }
 
 function validCorpusStructure(corpus) {
-  if (!exactKeys(corpus, ["owners", "window", "expectedDailyDays"]) || !Array.isArray(corpus.owners)
+  if (!exactKeys(corpus, ["owners", "window", "expectedDailyDays", "conflictDays", "v1ExtraAdmissions", "admissionIdentities"])
+    || !Array.isArray(corpus.owners)
     || corpus.owners.length !== 4 || !exactKeys(corpus.window, ["fromDay", "throughDay", "days"])
     || corpus.window.fromDay !== "2026-04-15" || corpus.window.throughDay !== "2026-10-01" || corpus.window.days !== 170
     || !Array.isArray(corpus.expectedDailyDays) || corpus.expectedDailyDays.length !== 168) return false;
@@ -704,7 +978,59 @@ function validCorpusStructure(corpus) {
     if (!/^\d{4}-\d{2}-\d{2}$/u.test(day) || day <= previous || day < corpus.window.fromDay || day > corpus.window.throughDay) return false;
     previous = day;
   }
-  return true;
+  if (!Array.isArray(corpus.conflictDays) || corpus.conflictDays.length !== 2) return false;
+  const all = [...corpus.expectedDailyDays, ...corpus.conflictDays].sort();
+  if (!all.every((day, n) => day === new Date(Date.parse(corpus.window.fromDay) + n * DAY_MS).toISOString().slice(0, 10))) return false;
+  if (!(corpus.conflictDays[0] < corpus.conflictDays[1])) return false;
+  const extras = corpus.v1ExtraAdmissions;
+  if (!exactKeys(extras, ["count", "sha256", "entries"]) || extras.count !== 2 || !Array.isArray(extras.entries)
+    || extras.entries.length !== extras.count || !SHA256.test(extras.sha256) || extras.sha256 !== jsonSha(extras.entries)) return false;
+  const extraKeys = new Set(), extraCoordinates = new Set(); let previousExtra = "";
+  for (const extra of extras.entries) {
+    if (!exactKeys(extra, ["ownerKey", "participantId", "day", "format", "stream", "records", "corpusRowsSha256"])
+      || !DAY.test(extra.day) || new Date(Date.parse(extra.day)).toISOString().slice(0, 10) !== extra.day
+      || extra.day < corpus.window.fromDay || extra.day > corpus.window.throughDay
+      || extra.format !== "v1" || !ADMISSION_STREAMS.has(extra.stream) || !count(extra.records) || extra.records < 1
+      || !SHA256.test(extra.corpusRowsSha256)) return false;
+    const owner = corpus.owners.find((candidate) => candidate.key === extra.ownerKey);
+    const key = `${extra.ownerKey}\0${extra.day}\0${extra.stream}`;
+    const coordinate = admissionCoordinate(extra.participantId, "v1", extra.day);
+    if (!owner || owner.participantId !== extra.participantId || extraKeys.has(key) || extraCoordinates.has(coordinate)
+      || key <= previousExtra) return false;
+    extraKeys.add(key); previousExtra = key;
+    extraCoordinates.add(coordinate);
+  }
+  const expectedCoordinates = expectedAdmissionCoordinates(corpus);
+  if (!Array.isArray(corpus.admissionIdentities) || corpus.admissionIdentities.length !== expectedCoordinates.length) return false;
+  const identityCoordinates = new Set(), actualCoordinates = [];
+  for (const entry of corpus.admissionIdentities) {
+    if (!object(entry) || typeof entry.participantId !== "string" || !DAY.test(entry.day)) return false;
+    const owner = corpus.owners.find((candidate) => candidate.participantId === entry.participantId);
+    if (!owner) return false;
+    const coordinate = admissionCoordinate(entry.participantId, entry.format, entry.day);
+    if (identityCoordinates.has(coordinate)) return false;
+    identityCoordinates.add(coordinate); actualCoordinates.push(coordinate);
+    if (entry.format === "v1") {
+      const expected = extras.entries.find((candidate) =>
+        admissionCoordinate(candidate.participantId, "v1", candidate.day) === coordinate);
+      if (!expected || owner.key !== expected.ownerKey
+        || !exactKeys(entry, ["participantId", "format", "day", "chunkDigest", "stream", "records", "corpusRowsSha256"])
+        || !SHA256.test(entry.chunkDigest) || entry.stream !== expected.stream || entry.records !== expected.records
+        || entry.corpusRowsSha256 !== expected.corpusRowsSha256) return false;
+    } else {
+      if (!exactKeys(entry, ["participantId", "format", "day", "manifestDigest", "chunks"])
+        || entry.format !== (owner.key === "c" ? "v12" : "v11") || !SHA256.test(entry.manifestDigest)
+        || !Array.isArray(entry.chunks) || entry.chunks.length < 1 || entry.chunks.length > 64) return false;
+      const chunkIds = new Set();
+      for (const chunk of entry.chunks) {
+        if (!exactKeys(chunk, ["chunkId", "chunkDigest", "recordCount"])
+          || typeof chunk.chunkId !== "string" || !/^[A-Za-z0-9:._-]{1,128}$/u.test(chunk.chunkId)
+          || chunkIds.has(chunk.chunkId) || !SHA256.test(chunk.chunkDigest) || !count(chunk.recordCount) || chunk.recordCount < 1) return false;
+        chunkIds.add(chunk.chunkId);
+      }
+    }
+  }
+  return isDeepStrictEqual(actualCoordinates, expectedCoordinates);
 }
 
 /** Classification consumes only the result already verified by the production
@@ -731,8 +1057,78 @@ export function classifyCurrentQ1VerifiedNativeOutcome({ metric, outcome, verifi
   return unresolved("verified_result_not_qualifying");
 }
 
-const COMPLETENESS_REASONS = Object.freeze(["corpus_structure_invalid", "cohort_incomplete", "graph_dates_incomplete",
-  "graph_publications_incomplete", "native_scope_set_incomplete", "native_result_unverified", "final_snapshot_incomplete"]);
+const COMPLETENESS_REASONS = Object.freeze(["recomputation_not_converged", "reference_schema_invalid", "corpus_convergence_invalid", "recomputation_invalid", "strict_export_refusal_invalid", "corpus_structure_invalid", "cohort_incomplete", "graph_dates_incomplete",
+  "graph_publications_incomplete", "admission_coverage_invalid", "native_scope_set_incomplete", "native_result_unverified", "final_snapshot_incomplete"]);
+
+const NATIVE_BASE_KEYS = Object.freeze(["owner", "metric", "day", "state", "invocations"]);
+const NATIVE_FAILURE_REASONS = new Set(["d1_cpu_limit", "d1_timeout", "query_too_large", "too_many_bindings", "query_limit",
+  "d1_other", "checkpoint_unavailable", "checkpoint_mismatch", "source_changed", "application"]);
+const NATIVE_OPERATION_STAGES = new Set(["graph_scope", "graph_historical_pin", "graph_checkpoint_load", "graph_history_direct_read",
+  "graph_history_layout", "graph_history_source_precheck", "graph_history_reader", "graph_history_acquisition_page",
+  "graph_history_source_postcheck", "graph_history_finish", "graph_checkpoint_save", "graph_current_fit_compute",
+  "graph_model_compute", "graph_prepared_days", "daily_publish", "graph_work"]);
+const NATIVE_MODEL_REFUSALS = new Set(["supported_quota_track_unavailable", "plan_attribution_limit_exceeded",
+  "multi_plan_window_unsupported", "multi_provider_window_unsupported", "downsampled_quota_limit_exceeded",
+  "windowed_usage_limit_exceeded", "usage_cost_limit_exceeded", "multi_account_window_unsupported",
+  "multi_era_window_unsupported", "continuity_track_limit_exceeded", "usage_day_limit_exceeded",
+  "invalid_attribution_record", "session_interval_scope_limit_exceeded", "reduced_usage_limit_exceeded",
+  "usage_attribution_unresolved"]);
+const NATIVE_UNRESOLVED_REASONS = new Set([...NATIVE_FAILURE_REASONS, "deferred", "execution_failed",
+  "computation_not_complete", "verified_result_unavailable", "verified_result_mismatch", "verified_result_not_qualifying"]);
+const NATIVE_GRAPH_DAYS = new Set(graphWindowDays());
+
+/** Validate the exact owner/metric/day set and the closed result union emitted
+ * by bounded native probes. Unresolved and refused are valid evidence shapes,
+ * but remain non-qualifying states for the outer completeness decision. */
+export function validateCurrentQ1NativeEvidence(native, expectedScopes) {
+  const code = "CURRENT_Q1_REFERENCE_BINDING_INVALID";
+  try {
+    requireFact(Array.isArray(native) && Array.isArray(expectedScopes), code);
+    const scopeKey = ({ owner, metric, day }) => `${owner}\0${metric}\0${day}`;
+    const expected = [], expectedSet = new Set();
+    for (const scope of expectedScopes) {
+      requireFact(exactKeys(scope, ["owner", "metric", "day"]) && ["a", "b", "c", "d"].includes(scope.owner)
+        && ["fits", "model"].includes(scope.metric) && NATIVE_GRAPH_DAYS.has(scope.day), code);
+      const key = scopeKey(scope);
+      requireFact(!expectedSet.has(key), code); expectedSet.add(key); expected.push(key);
+    }
+    const actual = [], seen = new Set();
+    for (const entry of native) {
+      requireFact(object(entry) && ["a", "b", "c", "d"].includes(entry.owner)
+        && ["fits", "model"].includes(entry.metric) && NATIVE_GRAPH_DAYS.has(entry.day)
+        && count(entry.invocations) && entry.invocations <= BOUNDS.nativeInvocations, code);
+      const key = scopeKey(entry);
+      requireFact(!seen.has(key), code); seen.add(key); actual.push(key);
+      if (entry.state === "complete") {
+        requireFact(exactKeys(entry, [...NATIVE_BASE_KEYS, "computeOutcomeMatchesVerified", "payloadSha256", "reused"])
+          && entry.invocations > 0 && entry.computeOutcomeMatchesVerified === true && SHA256.test(entry.payloadSha256)
+          && typeof entry.reused === "boolean", code);
+      } else if (entry.state === "not_testable") {
+        requireFact(exactKeys(entry, [...NATIVE_BASE_KEYS, "reason", "computeOutcomeMatchesVerified", "payloadSha256", "reused"])
+          && entry.metric === "model" && entry.invocations > 0 && NATIVE_MODEL_REFUSALS.has(entry.reason)
+          && entry.computeOutcomeMatchesVerified === true && SHA256.test(entry.payloadSha256)
+          && typeof entry.reused === "boolean", code);
+      } else if (entry.state === "unresolved") {
+        const allowed = new Set([...NATIVE_BASE_KEYS, "reason", "bound", "computeOutcomeMatchesVerified"]);
+        requireFact(NATIVE_BASE_KEYS.every((field) => Object.hasOwn(entry, field))
+          && Object.keys(entry).every((field) => allowed.has(field))
+          && typeof entry.reason === "string" && NATIVE_UNRESOLVED_REASONS.has(entry.reason)
+          && (!Object.hasOwn(entry, "bound") || ["stall", "invocations"].includes(entry.bound))
+          && (!Object.hasOwn(entry, "computeOutcomeMatchesVerified")
+            || entry.computeOutcomeMatchesVerified === false && entry.reason === "verified_result_mismatch")
+          && (entry.reason !== "verified_result_mismatch" || entry.computeOutcomeMatchesVerified === false)
+          && (entry.bound !== "invocations" || entry.invocations === BOUNDS.nativeInvocations), code);
+      } else if (entry.state === "refused") {
+        requireFact(exactKeys(entry, [...NATIVE_BASE_KEYS, "nativeCapacityRefusal", "reason", "phase"])
+          && entry.nativeCapacityRefusal === false
+          && (NATIVE_FAILURE_REASONS.has(entry.reason) || entry.reason === "application")
+          && NATIVE_OPERATION_STAGES.has(entry.phase), code);
+      } else requireFact(false, code);
+    }
+    requireFact(isDeepStrictEqual(actual.sort(), expected.sort()), code);
+    return native;
+  } catch { throw Object.assign(new Error(code), { code }); }
+}
 
 function readySnapshotShape(snapshot, readiness, corpus, graphDays) {
   const nowIso = new Date(CURRENT_Q1_REFERENCE_NOW_MS).toISOString(), publicDays = graphDays.slice(0, -1);
@@ -785,35 +1181,60 @@ function readySnapshotShape(snapshot, readiness, corpus, graphDays) {
 export function assessCurrentQ1ReferenceCompleteness({ reference, corpus, snapshotReadiness }) {
   const reasons = new Set(), fail = (reason) => reasons.add(reason);
   if (!validCorpusStructure(corpus)) return { state: "unresolved", reasons: ["corpus_structure_invalid"] };
+  if (!exactKeys(reference, ["schemaVersion", "synthetic", "qualification", "sourceId", "sourceNamespace", "bounds",
+    "provenance", "beforeForcedRecompute", "afterForcedRecompute", "afterNativeProbes", "recomputation",
+    "corpusConvergence", "strictExportRefusal", "graphPublications", "nativeEvidence"])
+    || reference.schemaVersion !== "current-q1-d1-reference-v2" || reference.synthetic !== true
+    || !["complete", "unresolved"].includes(reference.qualification) || !validBounds(reference.bounds)
+    || !exactKeys(reference.provenance, ["source", "runtime", "corpus", "migrations", "migrationSha256",
+      "runtimeContracts", "admissions", "admissionSha256", "cohort"])
+    || !exactKeys(reference.provenance.runtimeContracts, ["v1", "v11"])
+    || !isDeepStrictEqual(reference.provenance.runtimeContracts, { v1: 1, v11: 1 })) fail("reference_schema_invalid");
+  try {
+    validateCurrentQ1Admissions(reference?.provenance?.admissions, corpus);
+    requireFact(SHA256.test(reference.provenance.admissionSha256)
+      && reference.provenance.admissionSha256 === jsonSha(reference.provenance.admissions), "CURRENT_Q1_NOT_SETTLED");
+  } catch { fail("admission_coverage_invalid"); }
+  try { validateCurrentQ1CorpusConvergence(reference?.corpusConvergence, corpus); } catch { fail("corpus_convergence_invalid"); }
+  try { validateCurrentQ1Recomputation(reference?.recomputation, corpus); } catch { fail("recomputation_invalid"); }
+  try { validateCurrentQ1StrictExportRefusal(reference?.strictExportRefusal); } catch { fail("strict_export_refusal_invalid"); }
+  try {
+    const convergence = reference.corpusConvergence, recomputation = reference.recomputation;
+    requireFact(convergence.beforeRecompute.admissionSha256 === reference.provenance.admissionSha256
+      && convergence.beforeRecompute.sourceInvariantSha256 === recomputation.sourceInvariantSha256.before
+      && convergence.afterRecompute.sourceInvariantSha256 === recomputation.sourceInvariantSha256.after
+      && recomputation.collectionRevision.before === convergence.beforeRecompute.fence.authority.collectionRevision
+      && recomputation.collectionRevision.after === convergence.afterRecompute.fence.authority.collectionRevision
+      && recomputation.invocations.daily === convergence.afterRecompute.dailyPasses.reduce((n, pass) => n + pass.iterations, 0)
+      && convergence.beforeRecompute.fence.authority.sourceId === reference.sourceId
+      && convergence.beforeRecompute.fence.authority.sourceNamespace === reference.sourceNamespace,
+    "CURRENT_Q1_NOT_SETTLED");
+  } catch { fail("recomputation_invalid"); }
+  if (reference?.recomputation?.graphExecution?.state !== "converged") fail("recomputation_not_converged");
   const graphDays = graphWindowDays(), cohort = reference?.provenance?.cohort;
   const owners = [...corpus.owners].sort((left, right) => left.participantId < right.participantId ? -1 : left.participantId > right.participantId ? 1 : 0);
-  if (!Array.isArray(cohort) || cohort.length !== 4 || !isDeepStrictEqual(cohort.map((owner) =>
+  if (!Array.isArray(cohort) || cohort.length !== 4 || cohort.some((owner) => !exactKeys(owner, ["participantId", "ownerDigest"]))
+    || !isDeepStrictEqual(cohort.map((owner) =>
     [owner?.participantId, owner?.ownerDigest]), owners.map((owner) => [owner.participantId, owner.pinnedOwnerDigest]))
-    || reference?.oracle?.liveCohort?.members !== 4) fail("cohort_incomplete");
-  const original = reference?.oracle?.graphForced?.modelDays;
+    || reference?.recomputation?.liveCohort?.members !== 4) fail("cohort_incomplete");
+  const original = reference?.recomputation?.graphForced?.modelDays;
   if (!Array.isArray(original) || !isDeepStrictEqual(original.map((entry) => entry?.day), graphDays)
     || original.some((entry) => !exactKeys(entry, ["day", "recomputedSha256"]) || !SHA256.test(entry.recomputedSha256))
-    || !SHA256.test(reference?.oracle?.graphForced?.previewSha256)) fail("graph_dates_incomplete");
+    || !SHA256.test(reference?.recomputation?.graphForced?.previewSha256)) fail("graph_dates_incomplete");
   const publications = reference?.graphPublications;
   if (!Array.isArray(publications) || !Array.isArray(original) || !isDeepStrictEqual(publications.map((entry) => entry?.day), graphDays)
     || publications.some((entry, index) => !exactKeys(entry, ["day", "state", "sha256"]) || entry.state !== "published"
       || !SHA256.test(entry.sha256) || entry.sha256 !== original[index]?.recomputedSha256)) fail("graph_publications_incomplete");
-  const scopeKey = ({ owner, metric, day }) => `${owner}\0${metric}\0${day}`;
   const missing = Array.isArray(original) ? original.filter((entry) => entry?.recomputedSha256 === null).map((entry) => entry.day) : [];
-  const expectedScopes = corpus.owners.flatMap((owner) => [
-    ...(reference?.oracle?.graphForced?.previewSha256 === null ? [{ owner: owner.key, metric: "fits", day: graphDays.at(-1) }] : []),
+  const expectedScopeObjects = corpus.owners.flatMap((owner) => [
+    ...(reference?.recomputation?.graphForced?.previewSha256 === null ? [{ owner: owner.key, metric: "fits", day: graphDays.at(-1) }] : []),
     ...missing.map((day) => ({ owner: owner.key, metric: "model", day })),
-  ]).map(scopeKey).sort();
+  ]);
   const native = reference?.nativeEvidence;
-  if (!Array.isArray(native) || native.some((entry) => !object(entry) || !["a", "b", "c", "d"].includes(entry.owner)
-    || !["fits", "model"].includes(entry.metric) || !graphDays.includes(entry.day))
-    || !isDeepStrictEqual(native.map(scopeKey).sort(), expectedScopes)) fail("native_scope_set_incomplete");
-  if (Array.isArray(native) && native.some((entry) => !["complete", "not_testable"].includes(entry?.state)
-    || entry.computeOutcomeMatchesVerified !== true || !SHA256.test(entry.payloadSha256) || !count(entry.invocations)
-    || entry.invocations < 1 || typeof entry.reused !== "boolean"
-    || (entry.state === "not_testable" && (typeof entry.reason !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(entry.reason))))) {
-    fail("native_result_unverified");
-  }
+  try {
+    validateCurrentQ1NativeEvidence(native, expectedScopeObjects);
+    if (native.some((entry) => !["complete", "not_testable"].includes(entry.state))) fail("native_result_unverified");
+  } catch { fail("native_scope_set_incomplete"); }
   try {
     if (!exactKeys(snapshotReadiness, ["afterForcedRecompute", "afterNativeProbes"])
       || !readySnapshotShape(reference.afterForcedRecompute, snapshotReadiness.afterForcedRecompute, corpus, graphDays)
@@ -932,13 +1353,13 @@ async function responseDTO(ctx, corpus) {
 /** Probe only graph scopes that ordinary current recomputation did not publish.
  * Default production query/deadline limits are retained. A deferred result is
  * never promoted into a completed or native-refused result. */
-async function missingScopes(ctx, corpus, oracle) {
+async function missingScopes(ctx, corpus, recomputation) {
   const owners = await ctx.P.readStorageCommunityOwnerPage(ctx.ingestion, { limit: 5 });
   requireFact(owners.length === 4, "CURRENT_Q1_ADMISSION_FAILED");
   const ownerKey = new Map(corpus.owners.map((owner) => [owner.pinnedOwnerDigest, owner.key]));
   const evidence = [];
-  const dates = oracle.graphForced.modelDays.filter((entry) => entry.recomputedSha256 === null).map((entry) => entry.day);
-  const scopes = owners.flatMap((owner) => [...(oracle.graphForced.previewSha256 === null ? [{ owner, metric: "fits",
+  const dates = recomputation.graphForced.modelDays.filter((entry) => entry.recomputedSha256 === null).map((entry) => entry.day);
+  const scopes = owners.flatMap((owner) => [...(recomputation.graphForced.previewSha256 === null ? [{ owner, metric: "fits",
     day: "2026-10-01" }] : []), ...dates.map((day) => ({ owner, metric: "model", day }))]);
   const progress = async () => (await ctx.analytics.batch([
     ctx.analytics.prepare(`SELECT COUNT(*) AS n,
@@ -1022,8 +1443,12 @@ export async function runCurrentQ1D1Reference() {
     const P = await loadCurrent(vite);
     enter("corpus_validation");
     const corpus = await corpusInput(P), migrations = [];
+    const admissionIdentities = await buildCurrentQ1AdmissionIdentities(P, corpus);
+    requireFact(isDeepStrictEqual(capturedCorpusStructure(corpus, admissionIdentities), expected.corpusStructure),
+      "CURRENT_Q1_CORPUS_INVALID");
     admissionTrace = admissionDiagnostic(P);
-    const ctx = { P, progress, admissionDiagnostic: admissionTrace, objects: inertObjectStore() };
+    const ctx = { P, progress, admissionDiagnostic: admissionTrace, objects: inertObjectStore(),
+      sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE, nowMs: CURRENT_Q1_REFERENCE_NOW_MS };
     const paths = {};
     for (const role of ["ingestion", "analytics", "ledger"]) {
       paths[role] = join(root, `${role}.sqlite`);
@@ -1049,34 +1474,56 @@ export async function runCurrentQ1D1Reference() {
     requireFact(runtimeContracts?.v1 === 1 && runtimeContracts?.v11 === 1, "CURRENT_Q1_ADMISSION_FAILED");
     enter("admission");
     const admissions = await seedCorpus(ctx, corpus.owners);
-    enter("settle"); await settle(ctx);
-    const cohort = await P.readStorageCommunityOwnerPage(ctx.ingestion, { limit: 5 });
-    requireFact(cohort.length === 4 && cohort.every((owner) => corpus.owners.some((expected) =>
+    enter("settle"); const beforeDailyPasses = await settle(ctx, corpus);
+    ctx.expectedSource = ctx.initialSource;
+    assertCurrentQ1SourceUnchanged(ctx.initialSource, await captureCurrentQ1SourceInvariant(ctx.ingestion));
+    const cohortRows = await P.readStorageCommunityOwnerPage(ctx.ingestion, { limit: 5 });
+    requireFact(cohortRows.length === 4 && cohortRows.every((owner) => corpus.owners.some((expected) =>
       expected.participantId === owner.participantId && expected.pinnedOwnerDigest === owner.ownerDigest)), "CURRENT_Q1_ADMISSION_FAILED");
+    const cohort = cohortRows.map(({ participantId, ownerDigest }) => ({ participantId, ownerDigest }))
+      .sort((left, right) => left.participantId < right.participantId ? -1 : left.participantId > right.participantId ? 1 : 0);
     enter("public_before");
     const beforeForcedRecompute = await responseDTO(ctx, corpus);
-    const steps = [];
+    const beforeConvergence = await convergenceSnapshot(ctx, corpus, beforeDailyPasses, admissions);
     enter("oracle");
-    const oracle = await P.runD1AnalyticsExportOracle({ ingestion: ctx.ingestion, analytics: ctx.analytics, ledger: ctx.ledger,
-      pinnedNowMs: CURRENT_Q1_REFERENCE_NOW_MS, sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE,
-      cacheRetentionFromDay: null, foldHistory: [{ value: "disabled", fromMs: 1_700_000_000_000, untilMs: null }],
-      moduleDigest: source.sha256, onStep: (step, counts) => { steps.push({ step, counts }); progress.counts({ completedSteps: steps.length }); } });
+    const strictExportRefusal = await proveCurrentQ1StrictExportRefusal(ctx, source.sha256);
+    assertCurrentQ1SourceUnchanged(ctx.expectedSource, await captureCurrentQ1SourceInvariant(ctx.ingestion));
+    ctx.sourceInvariant = async () => {
+      const current = await captureCurrentQ1SourceInvariant(ctx.ingestion);
+      assertCurrentQ1SourceUnchanged(ctx.expectedSource, current); return current.sha256;
+    };
+    ctx.assertControlTransition = async (controlsBefore, controlsAfter) => {
+      const afterControl = await captureCurrentQ1SourceInvariant(ctx.ingestion);
+      const transition = assertCurrentQ1ControlTransition({ before: ctx.expectedSource, after: afterControl,
+        controlsBefore, controlsAfter, nowMs: ctx.nowMs,
+        actorDigest: await P.sha256Hex("app-usagemonitor/admin-actor/v1\0current-q1-reference-scratch") });
+      ctx.expectedSource = afterControl; return transition;
+    };
+    const { recomputation, dailyPasses: afterDailyPasses } = await runCurrentQ1Recomputation(ctx, corpus, ctx.initialSource.sha256);
+    const afterConvergence = await convergenceSnapshot(ctx, corpus, afterDailyPasses, admissions);
+    const corpusConvergence = validateCurrentQ1CorpusConvergence({ schemaVersion: "current-q1-d1-corpus-convergence-v1",
+      beforeRecompute: beforeConvergence, afterRecompute: afterConvergence }, corpus);
     enter("public_after");
     const afterForcedRecompute = await responseDTO(ctx, corpus);
     enter("native_probes");
-    const nativeEvidence = await missingScopes(ctx, corpus, oracle);
+    const nativeEvidence = await missingScopes(ctx, corpus, recomputation);
     const afterNativeProbes = await responseDTO(ctx, corpus);
     enter("source_recheck");
+    await ctx.sourceInvariant();
+    requireFact(isDeepStrictEqual(ctx.initialConflict, await conflictEvidence(ctx, corpus)), "CURRENT_Q1_NOT_SETTLED");
+    const finalQueue = (await ctx.analytics.prepare("SELECT source_id,day,revision FROM analytics_community_daily_queue ORDER BY source_id,day").all()).results;
+    requireFact(finalQueue.every((row) => row.source_id === ctx.sourceId)
+      && isDeepStrictEqual(finalQueue.map(({ day, revision }) => ({ day, revision })), afterConvergence.retainedQueue), "CURRENT_Q1_NOT_SETTLED");
     const after = await sourceSnapshot();
     requireFact(after.head === source.head && after.sha256 === source.sha256, "CURRENT_Q1_SOURCE_CHANGED");
     for (const migration of migrations) requireFact(sha(await boundedFile(join(REPOSITORY_ROOT, migration.path))) === migration.sha256,
       "CURRENT_Q1_SOURCE_CHANGED");
-    const reference = { schemaVersion: "current-q1-d1-reference-v1", synthetic: true, qualification: "unresolved",
+    const reference = { schemaVersion: "current-q1-d1-reference-v2", synthetic: true, qualification: "unresolved",
       sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE, bounds: BOUNDS,
       provenance: { source, runtime, corpus: corpus.provenance, migrations, migrationSha256: jsonSha(migrations), runtimeContracts,
         admissions, admissionSha256: jsonSha(admissions), cohort },
-      beforeForcedRecompute, afterForcedRecompute, afterNativeProbes, oracle, steps,
-      graphPublications: oracle.graphForced.modelDays.map((entry) => ({ day: entry.day,
+      beforeForcedRecompute, afterForcedRecompute, afterNativeProbes, recomputation, corpusConvergence, strictExportRefusal,
+      graphPublications: recomputation.graphForced.modelDays.map((entry) => ({ day: entry.day,
         state: entry.recomputedSha256 === null ? "not_published" : "published", sha256: entry.recomputedSha256 })), nativeEvidence };
     validateCurrentQ1ReferenceBinding({ reference, expected });
     reference.qualification = assessCurrentQ1ReferenceCompleteness({ reference, corpus: expected.corpusStructure,
