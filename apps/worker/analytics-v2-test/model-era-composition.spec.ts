@@ -26,6 +26,7 @@ import {
   type V11CompletedQuotaAcquisition,
   type UsageRow,
 } from "../vendor/analytics-d43c8f92/entry";
+import { buildAnalyticsV2ModelCompositionDay } from "../src/analytics-v2/allowance-projection";
 import { evaluateModelBlock, type AnalyticsV2ModelBlockInput } from "../src/analytics-v2/units";
 import { evaluateAnalyticsV2PlanEraComposition } from "../src/analytics-v2/model-era-composition";
 import {
@@ -58,6 +59,7 @@ type Track = {
   readonly planType: PlanType;
   readonly planVariant: string;
   readonly planEraId: string;
+  readonly usageTokenMultiplier: number;
 };
 type Facts = Map<string, AnalyticsV2DayOccurrences>;
 type ModelComposition = {
@@ -65,7 +67,12 @@ type ModelComposition = {
   readonly planType?: string;
   readonly usageEventCount?: number;
   readonly quotaRowCount?: number;
-  readonly fit?: { readonly modelCostShares?: Readonly<Record<string, number | null>>; readonly observationCount?: number };
+  readonly fit?: {
+    readonly status?: string;
+    readonly modelCostShares?: Readonly<Record<string, number | null>>;
+    readonly capacityUsdByModel?: Readonly<Record<string, number | null>> | null;
+    readonly observationCount?: number;
+  };
 };
 type Candidate = {
   readonly candidateId: string;
@@ -94,6 +101,8 @@ function makeTrack(input: {
   planType?: PlanType;
   planVariant?: string;
   provider?: string;
+  models?: readonly string[];
+  usageTokenMultiplier?: number;
 }): Track {
   const provider = input.provider ?? "openai_codex";
   const anthropic = provider === "anthropic_claude_code";
@@ -102,10 +111,11 @@ function makeTrack(input: {
     accountTrackId: accountId(input.account),
     provider,
     billingSurface: anthropic ? "claude_subscription" : "chatgpt_subscription",
-    models: anthropic ? CLAUDE_MODELS : GPT_MODELS,
+    models: input.models ?? (anthropic ? CLAUDE_MODELS : GPT_MODELS),
     planType: input.planType ?? "pro",
     planVariant: input.planVariant ?? "unknown",
     planEraId: eraId(input.era),
+    usageTokenMultiplier: input.usageTokenMultiplier ?? 1,
   };
 }
 
@@ -120,14 +130,24 @@ function attribution(track: Track) {
 }
 
 function makeUsage(owner: ReturnType<typeof syntheticOwner>, index: number, at: number,
-  track: Track, modelId: string, sessionUuid: string): EffectiveTelemetryOccurrence {
+  track: Track, modelId: string, sessionUuid: string, tokenMultiplier = 1): EffectiveTelemetryOccurrence {
   const base = usage(owner, index, at) as EffectiveTelemetryOccurrence;
+  const sourceRecord = JSON.parse(base.recordJson!);
   const record = {
-    ...JSON.parse(base.recordJson!),
+    ...sourceRecord,
     provider: track.provider,
     billingSurface: track.billingSurface,
     modelId,
     sessionUuid,
+    totalInputContextTokens: sourceRecord.totalInputContextTokens * tokenMultiplier,
+    components: {
+      ...sourceRecord.components,
+      inputUncachedTokens: sourceRecord.components.inputUncachedTokens * tokenMultiplier,
+      inputCacheReadTokens: sourceRecord.components.inputCacheReadTokens * tokenMultiplier,
+      inputCacheWriteTokens: sourceRecord.components.inputCacheWriteTokens * tokenMultiplier,
+      outputTextTokens: sourceRecord.components.outputTextTokens * tokenMultiplier,
+      outputReasoningTokens: sourceRecord.components.outputReasoningTokens * tokenMultiplier,
+    },
     accountPlanAttribution: attribution(track),
   };
   return occurrence(owner, "usage", at, base.occurrenceId, record) as EffectiveTelemetryOccurrence;
@@ -165,29 +185,40 @@ function makeQuota(owner: ReturnType<typeof syntheticOwner>, index: number, at: 
   return occurrence(owner, "quota", at, base.occurrenceId, record) as EffectiveTelemetryOccurrence;
 }
 
+type ModelQuotaMovement = (ordinal: number, slot: number, modelId: string) => number;
+
 function addRegularTrackDay(owner: ReturnType<typeof syntheticOwner>, day: string, ordinal: number, track: Track,
-  rows: { usage: EffectiveTelemetryOccurrence[]; quota: EffectiveTelemetryOccurrence[] }, nextIndex: () => number): void {
+  rows: { usage: EffectiveTelemetryOccurrence[]; quota: EffectiveTelemetryOccurrence[] }, nextIndex: () => number,
+  quotaMovement?: ModelQuotaMovement): void {
   const start = dayMs(day);
   const resetsAt = start + 8 * DAY_MS;
+  let usedPercent = 5;
   for (let slot = 0; slot < 9; slot += 1) {
     const observedAt = start + 10 * MINUTE_MS + slot * 2 * HOUR_MS;
-    rows.quota.push(makeQuota(owner, nextIndex(), observedAt, 5 + slot * 11, resetsAt, track));
-    if (slot === 0) continue;
     const modelId = track.models[(ordinal + slot) % track.models.length]!;
+    if (slot > 0) usedPercent = quotaMovement === undefined ? 5 + slot * 11
+      : usedPercent + quotaMovement(ordinal, slot, modelId);
+    rows.quota.push(makeQuota(owner, nextIndex(), observedAt, usedPercent, resetsAt, track));
+    if (slot === 0) continue;
     rows.usage.push(makeUsage(owner, nextIndex(), observedAt + 10 * MINUTE_MS, track, modelId,
-      "synthetic-session-" + owner.n + "-" + track.account + "-" + ordinal + "-" + slot));
+      "synthetic-session-" + owner.n + "-" + track.account + "-" + ordinal + "-" + slot,
+      track.usageTokenMultiplier));
   }
 }
 
 function buildHistory(owner: ReturnType<typeof syntheticOwner>,
-  tracksAt: (ordinal: number) => readonly Track[]): Facts {
+  tracksAt: (ordinal: number) => readonly Track[], targetDay = TARGET_DAY,
+  quotaMovement?: ModelQuotaMovement): Facts {
   const facts: Facts = new Map();
+  const windowStart = modelHistoryWindow(targetDay).fromDay;
   let next = 1;
   const nextIndex = () => next++;
   for (let ordinal = 0; ordinal < WINDOW_LENGTH; ordinal += 1) {
-    const day = addDays(WINDOW_START, ordinal);
+    const day = addDays(windowStart, ordinal);
     const rows = { usage: [] as EffectiveTelemetryOccurrence[], quota: [] as EffectiveTelemetryOccurrence[] };
-    for (const track of tracksAt(ordinal)) addRegularTrackDay(owner, day, ordinal, track, rows, nextIndex);
+    for (const track of tracksAt(ordinal)) {
+      addRegularTrackDay(owner, day, ordinal, track, rows, nextIndex, quotaMovement);
+    }
     rows.usage.sort(ordered);
     rows.quota.sort(ordered);
     facts.set(day, { usage: rows.usage, quota: rows.quota, session: [] });
@@ -195,11 +226,13 @@ function buildHistory(owner: ReturnType<typeof syntheticOwner>,
   return facts;
 }
 
-async function prepareWindow(owner: ReturnType<typeof syntheticOwner>, facts: Facts): Promise<WindowInput> {
+async function prepareWindow(owner: ReturnType<typeof syntheticOwner>, facts: Facts,
+  targetDay = TARGET_DAY): Promise<WindowInput> {
   const dayDigests = new Map<string, string>();
   const days: AnalyticsV2PreparedDay[] = [];
+  const windowStart = modelHistoryWindow(targetDay).fromDay;
   for (let ordinal = 0; ordinal < WINDOW_LENGTH; ordinal += 1) {
-    const day = addDays(WINDOW_START, ordinal);
+    const day = addDays(windowStart, ordinal);
     const rows = facts.get(day) ?? EMPTY_DAY_OCCURRENCES;
     dayDigests.set(day, await analyticsV2DayDigest(day, rows));
     days.push(await prepareAnalyticsV2Day({
@@ -212,12 +245,12 @@ async function prepareWindow(owner: ReturnType<typeof syntheticOwner>, facts: Fa
   }
   const pin = await buildAnalyticsV2Pin({
     owner: { participantId: owner.participant, ownerDigest: owner.digest },
-    day: TARGET_DAY,
+    day: targetDay,
     dayDigests,
   });
   return {
     pin,
-    day: TARGET_DAY,
+    day: targetDay,
     ownerDigest: owner.digest,
     days,
     quotaOccurrences: (day: string) => (facts.get(day) ?? EMPTY_DAY_OCCURRENCES).quota,
@@ -326,6 +359,57 @@ describe("GCP model-era composition fallback", () => {
     expect(modelSets.every((models) => !(models.some((model) => GPT_MODELS.includes(model as typeof GPT_MODELS[number]))
       && models.some((model) => CLAUDE_MODELS.includes(model as typeof CLAUDE_MODELS[number]))))).toBe(true);
     expect(result.candidates.every((candidate) => (candidate.composition.quotaRowCount ?? 0) < 3 * 101 * 9)).toBe(true);
+  });
+
+  it("fits post-price-card era mixtures and projects one owner's positive values for all three models", async () => {
+    const owner = syntheticOwner(7, "pro");
+    const targetDay = "2026-10-20";
+    const windowStart = modelHistoryWindow(targetDay).fromDay;
+    const pricedEraStartOrdinal = Math.round((dayMs("2026-09-29") - dayMs(windowStart)) / DAY_MS);
+    const quotaMovementByModel: Readonly<Record<string, number>> = {
+      "gpt-6-sol": 2,
+      "gpt-6.1-sol": 5,
+      "gpt-6-luna": 8,
+    };
+    const pricedModels = ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-luna", "gpt-6-luna"];
+    const facts = buildHistory(owner, (ordinal) => [
+      ordinal < pricedEraStartOrdinal
+        ? makeTrack({ account: 71, era: 7101, planType: "pro", models: ["gpt-5.6-sol"] })
+        : makeTrack({ account: 71, era: 7102, planType: "plus", models: pricedModels, usageTokenMultiplier: 100 }),
+    ], targetDay, (ordinal, _slot, model) => ordinal < pricedEraStartOrdinal
+      ? 11 : quotaMovementByModel[model] ?? 11);
+    const input = await prepareWindow(owner, facts, targetDay);
+    expect(input.pin.fromDay).toBe(windowStart);
+    expect(input.pin.throughDay).toBe(targetDay);
+
+    const legacy = await evaluateSharedModelDate({ pin: input.pin, day: input.day,
+      ownerDigest: input.ownerDigest, days: input.days as never });
+    expect(legacy).toMatchObject({ status: "not_testable", reason: "multi_plan_window_unsupported" });
+
+    const result = partitioned(await evaluateAnalyticsV2ModelDate(input));
+    expect(result.candidates).toHaveLength(2);
+    const latestEra = result.candidates.find((candidate) => candidate.composition.planType === "plus");
+    expect(latestEra).toBeDefined();
+    if (latestEra === undefined) throw new Error("synthetic priced era candidate missing");
+    expect(latestEra.composition.status).toBe("ready");
+    expect(latestEra.composition.fit?.status).toBe("fitted");
+    expect(latestEra.composition.fit?.observationCount).toBeGreaterThan(100);
+    const capacities = latestEra.composition.fit?.capacityUsdByModel;
+    expect(capacities).not.toBeNull();
+    if (capacities === null || capacities === undefined) throw new Error("synthetic target-model capacities missing");
+    for (const model of GPT_MODELS) {
+      expect(latestEra.composition.fit?.modelCostShares?.[model]).toBeGreaterThan(0);
+      expect(capacities[model]).toBeGreaterThan(0);
+    }
+
+    const publicDay = buildAnalyticsV2ModelCompositionDay([{ ownerDigest: owner.digest, result }], 0, targetDay);
+    expect(publicDay).toMatchObject({ fittedParticipantCount: 1, refusedParticipantCount: 0, v1ParticipantCount: 1 });
+    const values = new Map(publicDay.values.map(([model, capacity, participantCount]) =>
+      [model, { capacity, participantCount }]));
+    for (const model of GPT_MODELS) {
+      expect(values.get(model)?.capacity).toBeGreaterThan(0);
+      expect(values.get(model)?.participantCount).toBe(1);
+    }
   });
 
   it("pads unknown-scope attribution hazards through delayed quota crossings and excludes whole bins", async () => {
