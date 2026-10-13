@@ -498,7 +498,7 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
 
 const DIRECT_SOURCE_SQL_TEMPLATE = `
   WITH requested(occurrence_id) AS MATERIALIZED (SELECT value FROM json_each(?)),
-  direct AS (
+  v1_direct AS (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
       FROM typed_telemetry_compatibility_records r
@@ -521,9 +521,9 @@ const DIRECT_SOURCE_SQL_TEMPLATE = `
         AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
         AND r.format_code=10 AND r.stream='usage'
         AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=chunk.id)
-    UNION
+  ), v11_direct AS MATERIALIZED (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
-           r.observed_at_ms,r.canonical_sha256,r.format_code
+           r.observed_at_ms,r.canonical_sha256,r.format_code,chunk.id AS chunk_id
       FROM typed_telemetry_compatibility_records r
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
@@ -554,7 +554,23 @@ const DIRECT_SOURCE_SQL_TEMPLATE = `
       WHERE v11.source_namespace=? AND r.participant_id=? AND r.source_namespace=v11.source_namespace
         AND r.namespace_id=v11.namespace_id AND r.owner_id=typed_owner.id
         AND r.format_code=11 AND r.stream='usage'
-        AND chunk.record_count=__V11_CHUNK_COUNT__
+  ), v11_candidate_chunks AS MATERIALIZED (
+    SELECT DISTINCT candidate.chunk_id
+      FROM v11_direct candidate
+  ), complete_v11_chunks AS MATERIALIZED (
+    SELECT chunk.id
+      FROM v11_candidate_chunks candidate
+      JOIN telemetry_v11_chunks chunk ON chunk.id=candidate.chunk_id
+     WHERE chunk.record_count=__V11_CHUNK_COUNT__
+  ), direct AS (
+    SELECT v1_direct.storage_row_id,v1_direct.source_namespace,v1_direct.participant_id,v1_direct.device_id,
+           v1_direct.occurrence_id,v1_direct.observed_at_ms,v1_direct.canonical_sha256,v1_direct.format_code
+      FROM v1_direct
+    UNION
+    SELECT candidate.storage_row_id,candidate.source_namespace,candidate.participant_id,candidate.device_id,
+           candidate.occurrence_id,candidate.observed_at_ms,candidate.canonical_sha256,candidate.format_code
+      FROM v11_direct candidate
+      JOIN complete_v11_chunks complete ON complete.id=candidate.chunk_id
   ), grouped AS (
     /* Repeated retained revisions with identical canonical bytes are one
      * semantic source variant. Keep the earliest physical row for audit, but

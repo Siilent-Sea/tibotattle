@@ -23,6 +23,7 @@ import {
   validateCurrentQ1Admissions,
   validateCurrentQ1NativeEvidence,
   validateCurrentQ1ReferenceBinding,
+  probeCurrentQ1MissingScopes,
 } from "../postgres-test/fixtures/current-q1-d1-reference.mjs";
 
 const DAY_MS = 86_400_000;
@@ -828,6 +829,217 @@ test("reference binding pins exact bounds, runtime contracts, source, admissions
         code: "CURRENT_Q1_REFERENCE_BINDING_INVALID",
       });
     });
+  }
+});
+
+function nativeProbeFixture({ mutateTarget, seedTarget, sourceForScope = () => "v1" } = {}) {
+  const db = new DatabaseSync(":memory:");
+  db.exec(`CREATE TABLE analytics_history_checkpoint_heads (
+      key_digest TEXT PRIMARY KEY, generation TEXT, retired INTEGER NOT NULL);
+    CREATE TABLE analytics_history_checkpoint_stages (
+      key_digest TEXT NOT NULL, generation TEXT NOT NULL, expected_head TEXT, owner_revision INTEGER NOT NULL,
+      authority_epoch INTEGER NOT NULL, part_count INTEGER NOT NULL, control_json TEXT NOT NULL, manifest_json TEXT NOT NULL,
+      PRIMARY KEY(key_digest,generation));
+    CREATE TABLE analytics_history_checkpoint_parts (
+      key_digest TEXT NOT NULL, generation TEXT NOT NULL, part_index INTEGER NOT NULL,
+      sha256 TEXT NOT NULL, payload_bytes INTEGER NOT NULL, PRIMARY KEY(key_digest,generation,part_index));`);
+  const queries = [], keys = [], captureCalls = [], computeCalls = [], results = new Map();
+  const analytics = {
+    prepare(sql) {
+      return { bind(...values) {
+        return { all() {
+          queries.push({ sql, values });
+          return { results: db.prepare(sql).all(...values) };
+        } };
+      } };
+    },
+    async batch(statements) { return statements.map((statement) => statement.all()); },
+  };
+  const owners = ["a", "b", "c", "d"].map((key) => ({ key, ownerDigest: key.repeat(64) }));
+  const day = graphDays()[0];
+  const targetKeyDigest = `scope:${owners[0].ownerDigest}:${day}:synthetic-history-method`;
+  seedTarget?.({ db, keyDigest: targetKeyDigest });
+  let targetInvocations = 0;
+  const historyMethod = "synthetic-history-method";
+  const P = {
+    STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD: historyMethod,
+    STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD: "synthetic-current-fit-method",
+    STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD: "synthetic-effective-fits-method",
+    STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD: "synthetic-effective-model-method",
+    STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS: [historyMethod, "synthetic-current-fit-method",
+      "synthetic-effective-fits-method", "synthetic-effective-model-method", "synthetic-v11-fits", "synthetic-v11-model"],
+    STORAGE_GRAPH_FAILURE_REASONS: ["d1_timeout"],
+    STORAGE_GRAPH_OPERATION_STAGES: ["graph_scope"],
+    COMMUNITY_MODEL_REFUSAL_REASONS: new Set(),
+    StorageGraphOperationError: class StorageGraphOperationError extends Error {},
+    storageGraphV11CheckpointMethod: (metric, preparedFold) => {
+      assert.equal(preparedFold, false);
+      return `synthetic-v11-${metric}`;
+    },
+    async storageHistoryKeyDigest(key) {
+      keys.push(key);
+      return `scope:${key.ownerDigest}:${key.day}:${key.method}`;
+    },
+    async readStorageCommunityOwnerPage() { return owners; },
+    async captureStorageGraphScope(_source, input) {
+      captureCalls.push({ preparedFold: input.preparedFold, metric: input.metric });
+      return { source: sourceForScope(input), owner: input.owner, metric: input.metric, day: input.day,
+        dependencyDigest: "d".repeat(64), checkpointDependencyDigest: "c".repeat(64) };
+    },
+    async computeStorageGraphResult(_bindings, scope, options) {
+      computeCalls.push({ optionKeys: Object.keys(options).sort(), preparedFold: options.preparedFold,
+        nowMs: options.now() });
+      if (scope.owner.ownerDigest === owners[0].ownerDigest) {
+        targetInvocations++;
+        mutateTarget?.({ db, keyDigest: targetKeyDigest, invocation: targetInvocations });
+        return { state: "deferred" };
+      }
+      const result = { scope, fits: null, composition: { status: "ready" } };
+      results.set(scope.owner.ownerDigest, result);
+      return { state: "complete", result, reused: false };
+    },
+    async readStorageGraphResult(_bindings, scope) { return results.get(scope.owner.ownerDigest) ?? null; },
+  };
+  const ctx = { P, ingestion: {}, analytics, progress: { counts() {} } };
+  const corpus = { owners: owners.map(({ key, ownerDigest }) => ({ key, pinnedOwnerDigest: ownerDigest })) };
+  const recomputation = { graphForced: { previewSha256: "p".repeat(64), modelDays: [{ day, recomputedSha256: null }] } };
+  return { ctx, corpus, recomputation, db, queries, keys, captureCalls, computeCalls, day, owners,
+    get targetInvocations() { return targetInvocations; } };
+}
+
+function assertNativeProbeForwarding(fixture) {
+  assert.ok(fixture.captureCalls.length > 0);
+  assert.ok(fixture.captureCalls.every(({ preparedFold }) => preparedFold === false));
+  assert.ok(fixture.computeCalls.length > 0);
+  for (const { optionKeys, preparedFold, nowMs } of fixture.computeCalls) {
+    assert.deepEqual(optionKeys, ["now", "preparedFold"]);
+    assert.equal(preparedFold, false);
+    assert.equal(nowMs, CURRENT_Q1_REFERENCE_NOW_MS);
+  }
+}
+
+function addCheckpointStage(db, keyDigest, { generation = "g1", expectedHead = null, partCount = 1 } = {}) {
+  db.prepare(`INSERT INTO analytics_history_checkpoint_stages
+    (key_digest,generation,expected_head,owner_revision,authority_epoch,part_count,control_json,manifest_json)
+    VALUES(?,?,?,?,1,?,?,?)`).run(keyDigest, generation, expectedHead, 1, partCount,
+      JSON.stringify({ phase: "acquisition", generation }), JSON.stringify([{ sha256: sha256(`manifest:${generation}`) }]));
+}
+
+function addCheckpointPart(db, keyDigest, generation, index) {
+  db.prepare(`INSERT INTO analytics_history_checkpoint_parts
+    (key_digest,generation,part_index,sha256,payload_bytes) VALUES(?,?,?,?,?)`)
+    .run(keyDigest, generation, index, sha256(`part:${index}`), 16 + index);
+}
+
+function promoteCheckpointHead(db, keyDigest, generation) {
+  db.prepare(`INSERT INTO analytics_history_checkpoint_heads(key_digest,generation,retired) VALUES(?,?,0)
+    ON CONFLICT(key_digest) DO UPDATE SET generation=excluded.generation,retired=0`).run(keyDigest, generation);
+}
+
+test("native probe stall progress observes scoped partial stages, parts, and promotion only", async (t) => {
+  const cases = [
+    ["new unpromoted stage resets the unchanged counter", ({ db, keyDigest, invocation }) => {
+      if (invocation === 1) addCheckpointStage(db, keyDigest);
+    }, 9],
+    ["new partial part resets the unchanged counter", ({ db, keyDigest, invocation }) => {
+      if (invocation === 1) addCheckpointPart(db, keyDigest, "g1", 0);
+    }, 9, ({ db, keyDigest }) => addCheckpointStage(db, keyDigest)],
+    ["promoted head resets the unchanged counter", ({ db, keyDigest, invocation }) => {
+      if (invocation === 1) promoteCheckpointHead(db, keyDigest, "g1");
+    }, 9, ({ db, keyDigest }) => { addCheckpointStage(db, keyDigest); addCheckpointPart(db, keyDigest, "g1", 0); }],
+    ["partial part in an unpromoted successor resets after promoted head", ({ db, keyDigest, invocation }) => {
+      if (invocation === 1) {
+        addCheckpointStage(db, keyDigest, { generation: "g2", expectedHead: "g1", partCount: 2 });
+        addCheckpointPart(db, keyDigest, "g2", 0);
+      }
+    }, 9, ({ db, keyDigest }) => {
+      addCheckpointStage(db, keyDigest, { generation: "g1" });
+      addCheckpointPart(db, keyDigest, "g1", 0);
+      promoteCheckpointHead(db, keyDigest, "g1");
+    }],
+    ["an unrelated key does not reset the unchanged counter", ({ db, keyDigest, invocation }) => {
+      if (invocation === 1) addCheckpointStage(db, `${keyDigest}:unrelated`);
+    }, 8],
+  ];
+  for (const [name, mutateTarget, expectedInvocations, seedTarget] of cases) await t.test(name, async () => {
+    const fixture = nativeProbeFixture({ mutateTarget, seedTarget });
+    try {
+      const evidence = await probeCurrentQ1MissingScopes(fixture.ctx, fixture.corpus, fixture.recomputation);
+      assert.equal(fixture.targetInvocations, expectedInvocations);
+      assert.equal(evidence[0].state, "unresolved");
+      assert.equal(evidence[0].reason, "deferred");
+      assert.equal(evidence[0].bound, "stall");
+      assert.equal(evidence[0].invocations, expectedInvocations);
+      assert.ok(fixture.keys.every((key) => key.sourceId === CURRENT_Q1_REFERENCE_SOURCE_ID
+        && key.sourceNamespace === CURRENT_Q1_REFERENCE_SOURCE_ID && key.day === fixture.day
+        && key.ownerDigest.length === 64 && key.dependencyDigest === "d".repeat(64)
+        && key.method === "synthetic-history-method"));
+      assert.ok(fixture.queries.length > 0);
+      assertNativeProbeForwarding(fixture);
+      assert.ok(fixture.queries.some(({ sql }) => /SUM\(part_count\).*controlBytes.*manifestBytes/su.test(sql)));
+      assert.ok(fixture.queries.some(({ sql }) => /SUM\(payload_bytes\).*FROM analytics_history_checkpoint_parts/su.test(sql)));
+      const scopedDigests = new Set(fixture.keys.map((key) =>
+        `scope:${key.ownerDigest}:${key.day}:${key.method}`));
+      assert.ok(fixture.queries.every(({ sql, values }) => /WHERE key_digest=\?/u.test(sql)
+        && values.length === 1 && scopedDigests.has(values[0])));
+      for (const { sql, values } of fixture.queries) {
+        const plan = fixture.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...values);
+        assert.ok(plan.some((row) => /SEARCH .*USING (?:PRIMARY KEY|INDEX)/u.test(row.detail)), sql);
+      }
+    } finally {
+      fixture.db.close();
+    }
+  });
+});
+
+test("native probe derives checkpoint keys from public source and method contracts", async () => {
+  const sourceByScope = new Map([
+    ["a:fits", "v1.1"], ["a:model", "effective"], ["b:fits", "effective"], ["b:model", "v1.1"],
+    ["c:fits", "v1"], ["c:model", "v1"], ["d:fits", "mixed"], ["d:model", "mixed"],
+  ]);
+  const fixture = nativeProbeFixture({ sourceForScope: ({ owner, metric }) => sourceByScope.get(`${owner.key}:${metric}`) });
+  try {
+    fixture.recomputation.graphForced.previewSha256 = null;
+    await probeCurrentQ1MissingScopes(fixture.ctx, fixture.corpus, fixture.recomputation);
+    assertNativeProbeForwarding(fixture);
+    const byScope = new Map(fixture.keys.map((key) => [`${key.ownerDigest[0]}:${key.method}`, key]));
+    const expected = [
+      ["a", "synthetic-v11-fits", "c"], ["a", "synthetic-effective-model-method", "c"],
+      ["b", "synthetic-effective-fits-method", "c"], ["b", "synthetic-v11-model", "c"],
+      ["c", "synthetic-current-fit-method", "d"], ["c", "synthetic-history-method", "d"],
+      ["d", "synthetic-history-method", "d"],
+    ];
+    assert.equal(byScope.size, expected.length, "mixed fits uses no resumable checkpoint");
+    for (const [owner, method, dependencyPrefix] of expected) {
+      const key = byScope.get(`${owner}:${method}`);
+      assert.ok(key, `${owner} should use ${method}`);
+      assert.equal(key.dependencyDigest, dependencyPrefix.repeat(64));
+      assert.equal(key.sourceId, CURRENT_Q1_REFERENCE_SOURCE_ID);
+      assert.equal(key.sourceNamespace, CURRENT_Q1_REFERENCE_SOURCE_ID);
+    }
+    assert.ok(fixture.queries.every(({ sql, values }) => /WHERE key_digest=\?/u.test(sql)
+      && values.length === 1 && fixture.keys.some((key) =>
+        values[0] === `scope:${key.ownerDigest}:${key.day}:${key.method}`)));
+  } finally {
+    fixture.db.close();
+  }
+});
+
+test("native probe preserves the 128-invocation cap and unresolved deferred evidence", async () => {
+  const fixture = nativeProbeFixture({
+    seedTarget: ({ db, keyDigest }) => addCheckpointStage(db, keyDigest, { partCount: 128 }),
+    mutateTarget: ({ db, keyDigest, invocation }) => addCheckpointPart(db, keyDigest, "g1", invocation - 1),
+  });
+  try {
+    const evidence = await probeCurrentQ1MissingScopes(fixture.ctx, fixture.corpus, fixture.recomputation);
+    assertNativeProbeForwarding(fixture);
+    assert.equal(fixture.targetInvocations, 128);
+    assert.equal(evidence[0].state, "unresolved");
+    assert.equal(evidence[0].reason, "deferred");
+    assert.equal(evidence[0].bound, "invocations");
+    assert.equal(evidence[0].invocations, 128);
+  } finally {
+    fixture.db.close();
   }
 });
 

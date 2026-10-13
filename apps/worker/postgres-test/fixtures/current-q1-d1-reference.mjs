@@ -73,6 +73,7 @@ const REQUIRED_FUNCTIONS = Object.freeze([
   "analyticsHistoryGraphWindow", "canonicalD1TableDigest", "captureStorageCommunityAuthority", "normalizedDailyPayloadSha256",
   "readCollectionControls", "setCollectionControls", "readD1AnalyticsLiveCohort", "readD1AnalyticsImportSelection",
   "readEffectiveTelemetryOwnerDayPage", "readStorageCommunitySourceTerminalEpoch", "readStorageCommunityDeliveredTerminalEpoch",
+  "storageHistoryKeyDigest", "storageGraphV11CheckpointMethod",
   "publishStorageCommunityModelDay", "publishStorageCommunityGraphPreview", "retireStorageCommunityGraphPublications", "activateTelemetryV11Domain", "activateTelemetryV12Domain",
   "advanceCacheRetentionDayLane", "advanceNextStorageCommunityDaily", "advanceStorageAnalytics", "authenticateDevice",
   "buildCommunityDailyPayload", "buildCurrentPublicModelMetadata", "canonicalJson", "canonicalTelemetryV12Json",
@@ -622,7 +623,7 @@ async function loadCurrent(vite) {
     "/src/telemetry-v11-domain.ts", "/src/telemetry-v11-repository.ts", "/src/telemetry-v12-domain.ts",
     "/src/telemetry-v12-repository.ts", "/src/telemetry-transport-policy.ts", "/src/storage-analytics-runtime.ts",
     "/src/storage-community-daily.ts", "/src/cache-retention-day.ts", "/src/d1-analytics-export-oracle.ts",
-    "/src/storage-community-graph.ts", "/src/storage-community-authority.ts",
+    "/src/storage-community-graph.ts", "/src/storage-community-authority.ts", "/src/storage-history-checkpoint.ts",
     "/src/storage-community-graph-publication.ts", "/src/storage-analytics-failure.ts",
     "/src/admin-community-allowance.ts", "/src/public-allowance-breakdowns.ts", "/src/community-daily-spend.ts",
     "/src/analytics-v2/public-allowance-breakdowns-v15.ts", "/src/analytics-v2/public-model-metadata-current.ts",
@@ -633,7 +634,12 @@ async function loadCurrent(vite) {
   }
   Object.assign(P, await vite.ssrLoadModule("/node_modules/@app-usagemonitor/telemetry-contract/index.js"));
   Object.assign(P, await vite.ssrLoadModule("/src/community-allowance.ts"));
-  requireFact(REQUIRED_FUNCTIONS.every((name) => typeof P[name] === "function"), "CURRENT_Q1_INPUT_INVALID");
+  requireFact(REQUIRED_FUNCTIONS.every((name) => typeof P[name] === "function")
+    && Array.isArray(P.STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS)
+    && [P.STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, P.STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
+      P.STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD, P.STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD]
+      .every((method) => typeof method === "string" && P.STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS.includes(method)),
+  "CURRENT_Q1_INPUT_INVALID");
   return P;
 }
 
@@ -1353,7 +1359,42 @@ async function responseDTO(ctx, corpus) {
 /** Probe only graph scopes that ordinary current recomputation did not publish.
  * Default production query/deadline limits are retained. A deferred result is
  * never promoted into a completed or native-refused result. */
-async function missingScopes(ctx, corpus, recomputation) {
+async function nativeCheckpointProgress(ctx, scope) {
+  const P = ctx.P;
+  let method, dependencyDigest;
+  if (scope.source === "v1.1") {
+    method = P.storageGraphV11CheckpointMethod(scope.metric, false);
+    dependencyDigest = scope.checkpointDependencyDigest;
+  } else if (scope.source === "effective") {
+    method = scope.metric === "fits" ? P.STORAGE_GRAPH_EFFECTIVE_FITS_CHECKPOINT_METHOD
+      : P.STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD;
+    dependencyDigest = scope.checkpointDependencyDigest;
+  } else if (scope.source === "v1" && scope.metric === "fits") {
+    method = P.STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD;
+    dependencyDigest = scope.dependencyDigest;
+  } else if (["v1", "mixed"].includes(scope.source) && scope.metric === "model") {
+    method = P.STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD;
+    dependencyDigest = scope.dependencyDigest;
+  }
+  if (method === undefined) return jsonSha({ keyDigest: null });
+  requireFact(P.STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS.includes(method), "CURRENT_Q1_INPUT_INVALID");
+  const keyDigest = await P.storageHistoryKeyDigest({ sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID,
+    sourceNamespace: NAMESPACE, ownerDigest: scope.owner.ownerDigest, day: scope.day, dependencyDigest, method });
+  const [heads, stages, parts] = await ctx.analytics.batch([
+    ctx.analytics.prepare(`SELECT generation,retired FROM analytics_history_checkpoint_heads WHERE key_digest=?`)
+      .bind(keyDigest),
+    ctx.analytics.prepare(`SELECT COUNT(*) AS n,COALESCE(SUM(part_count),0) AS parts,
+      COALESCE(SUM(length(control_json)),0) AS controlBytes,COALESCE(SUM(length(manifest_json)),0) AS manifestBytes
+      FROM analytics_history_checkpoint_stages WHERE key_digest=?`).bind(keyDigest),
+    ctx.analytics.prepare(`SELECT COUNT(*) AS n,COALESCE(SUM(payload_bytes),0) AS bytes
+      FROM analytics_history_checkpoint_parts WHERE key_digest=?`).bind(keyDigest),
+  ]);
+  // The per-key aggregates include all stage generations, including unpromoted
+  // successors, while keeping checkpoint contents out of the observer.
+  return jsonSha({ keyDigest, heads: heads.results, stages: stages.results, parts: parts.results });
+}
+
+export async function probeCurrentQ1MissingScopes(ctx, corpus, recomputation) {
   const owners = await ctx.P.readStorageCommunityOwnerPage(ctx.ingestion, { limit: 5 });
   requireFact(owners.length === 4, "CURRENT_Q1_ADMISSION_FAILED");
   const ownerKey = new Map(corpus.owners.map((owner) => [owner.pinnedOwnerDigest, owner.key]));
@@ -1361,15 +1402,6 @@ async function missingScopes(ctx, corpus, recomputation) {
   const dates = recomputation.graphForced.modelDays.filter((entry) => entry.recomputedSha256 === null).map((entry) => entry.day);
   const scopes = owners.flatMap((owner) => [...(recomputation.graphForced.previewSha256 === null ? [{ owner, metric: "fits",
     day: "2026-10-01" }] : []), ...dates.map((day) => ({ owner, metric: "model", day }))]);
-  const progress = async () => (await ctx.analytics.batch([
-    ctx.analytics.prepare(`SELECT COUNT(*) AS n,
-      COALESCE(group_concat(key_digest||':'||COALESCE(generation,'-'),','),'') AS v
-      FROM (SELECT key_digest,generation FROM analytics_history_checkpoint_heads ORDER BY key_digest)`),
-    ctx.analytics.prepare(`SELECT COUNT(*) AS n,COALESCE(SUM(part_count),0) AS parts,
-      COALESCE(SUM(length(control_json)),0) AS controlBytes,COALESCE(SUM(length(manifest_json)),0) AS manifestBytes
-      FROM analytics_history_checkpoint_stages`),
-    ctx.analytics.prepare(`SELECT COUNT(*) AS n,COALESCE(SUM(payload_bytes),0) AS bytes FROM analytics_history_checkpoint_parts`),
-  ])).map((result) => result.results);
   for (const [scopeIndex, { owner, metric, day }] of scopes.entries()) {
     const item = { owner: ownerKey.get(owner.ownerDigest), metric, day, state: "unresolved", invocations: 0 };
     requireFact(["a", "b", "c", "d"].includes(item.owner), "CURRENT_Q1_ADMISSION_FAILED");
@@ -1377,7 +1409,7 @@ async function missingScopes(ctx, corpus, recomputation) {
       ctx.progress.counts({ scopeOrdinal: scopeIndex + 1, iteration: 0 });
       const scope = await ctx.P.captureStorageGraphScope(ctx.ingestion, { owner, metric, day,
         sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE, preparedFold: false });
-      let previous = jsonSha(await progress()), stall = 0;
+      let previous = await nativeCheckpointProgress(ctx, scope), stall = 0;
       for (let n = 0; n < BOUNDS.nativeInvocations; n++) {
         ctx.progress.counts({ scopeOrdinal: scopeIndex + 1, iteration: n + 1 });
         const outcome = await ctx.P.computeStorageGraphResult(bindings(ctx), scope,
@@ -1395,7 +1427,7 @@ async function missingScopes(ctx, corpus, recomputation) {
         item.state = "unresolved";
         item.reason = outcome.failure?.reason && ctx.P.STORAGE_GRAPH_FAILURE_REASONS.includes(outcome.failure.reason)
           ? outcome.failure.reason : "deferred";
-        const next = jsonSha(await progress()); stall = next === previous ? stall + 1 : 0; previous = next;
+        const next = await nativeCheckpointProgress(ctx, scope); stall = next === previous ? stall + 1 : 0; previous = next;
         if (stall >= BOUNDS.nativeStall) { item.bound = "stall"; break; }
         if (n + 1 === BOUNDS.nativeInvocations) item.bound = "invocations";
       }
@@ -1506,7 +1538,7 @@ export async function runCurrentQ1D1Reference() {
     enter("public_after");
     const afterForcedRecompute = await responseDTO(ctx, corpus);
     enter("native_probes");
-    const nativeEvidence = await missingScopes(ctx, corpus, recomputation);
+    const nativeEvidence = await probeCurrentQ1MissingScopes(ctx, corpus, recomputation);
     const afterNativeProbes = await responseDTO(ctx, corpus);
     enter("source_recheck");
     await ctx.sourceInvariant();

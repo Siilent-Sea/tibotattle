@@ -1,15 +1,20 @@
 import { applyD1Migrations, env, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { canonicalTelemetryV11Json } from "@app-usagemonitor/telemetry-contract";
-import { createV11DeviceFixture, v11UsageRecord } from "./helpers/telemetry-v11";
+import { canonicalTelemetryV11Json, telemetryV11DomainManifestDigestInput, telemetryV11RequiredConsent, type TelemetryV11DomainManifest,
+  type TelemetryV11QuotaObservation, type TelemetryV11SessionDimension } from "@app-usagemonitor/telemetry-contract";
+import { createV11DeviceFixture, makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
 import { sha256Hex } from "../src/crypto";
 import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/typed-v1-admission";
+import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { currentTelemetryV1Chunk } from "../src/telemetry-v1-repository";
 import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../src/telemetry-v1";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-compatibility";
-import { readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
+import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
+import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
+import { grantTelemetryV11Consent } from "../src/telemetry-transport-policy";
+import { MAX_EFFECTIVE_USAGE_SOURCE_ROWS, readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
 
 interface Bindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -149,6 +154,95 @@ function captureCandidateStatement(database: D1Database): {
   return { database: wrapped, candidate: () => captured };
 }
 
+interface CapturedSourceQuery {
+  sql: string;
+  values: (string | number | null | ArrayBuffer)[];
+}
+
+function captureDirectSourceStatement(database: D1Database): {
+  database: D1Database;
+  direct: () => CapturedSourceQuery | null;
+} {
+  let captured: CapturedSourceQuery | null = null;
+  const wrapped = new Proxy(database, {
+    get(target, property, receiver) {
+      if (property === "prepare") {
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.includes("WITH requested(occurrence_id) AS MATERIALIZED")) return statement;
+          return new Proxy(statement, {
+            get(statementTarget, statementProperty, statementReceiver) {
+              if (statementProperty === "bind") {
+                return (...values: (string | number | null | ArrayBuffer)[]) => {
+                  captured = { sql, values };
+                  return statementTarget.bind(...values);
+                };
+              }
+              const value = Reflect.get(statementTarget, statementProperty, statementReceiver);
+              return typeof value === "function" ? value.bind(statementTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { database: wrapped, direct: () => captured };
+}
+
+async function runCapturedSourceQuery(database: D1Database, query: CapturedSourceQuery) {
+  return (await database.prepare(query.sql).bind(...query.values)
+    .all<{ storage_row_id: number; source_namespace: string; participant_id: string; occurrence_id: string }>()).results;
+}
+
+function readerQuota(day: string): TelemetryV11QuotaObservation {
+  return { schemaVersion: "quota-observation-v1.1", observationId: `quota-occurrence:v1:${"b".repeat(64)}`,
+    observedTime: `${day}T12:05:00.000Z`, provider: "openai_codex", planType: "pro", planVariant: "unknown",
+    limitId: "codex", slot: "seven_day", usedPercent: 12.5, windowDurationMinutes: 10080,
+    resetsAt: `${day}T23:00:00.000Z`, accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null,
+      planBasis: "same_source_occurrence", planType: "pro", planEraId: null } };
+}
+
+function readerSession(day: string): TelemetryV11SessionDimension {
+  return { schemaVersion: "session-dimension-v1.1", sessionUuid: "0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b",
+    firstEventTime: `${day}T12:05:00.000Z`, provider: "openai_codex", toolClassCounts: { browser: 1, shell: 2 } };
+}
+
+async function stageReaderV11Day(fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  prepared: Awaited<ReturnType<typeof makeV11Day>>) {
+  await registerTelemetryV11DayManifest(db(), fixture, prepared.manifest);
+  for (const chunk of prepared.chunks) {
+    const envelopeDigest = await sha256Hex(`synthetic-effective-reader-v11:${chunk.chunkDigest}:${crypto.randomUUID()}`);
+    const principal = await authenticateDevice(db(), fixture.authorization);
+    const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 1000);
+    const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
+      envelopeDigest, bodyBytes: 1000, contentType: "application/json",
+    });
+    await persistTypedV11StagedChunk(db(), principal, chunk, {
+      sourceNamespace, chunkRowId: `chunk:${crypto.randomUUID()}`, r2Key: `synthetic/effective-reader-v11-${crypto.randomUUID()}`,
+      envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId,
+    });
+  }
+  return registerTelemetryV11DayManifest(db(), fixture, prepared.manifest);
+}
+
+async function activateReaderV11Days(fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  preparedDays: readonly Awaited<ReturnType<typeof makeV11Day>>[], nowEpoch?: number) {
+  const stagedDays: Array<Awaited<ReturnType<typeof stageReaderV11Day>>> = [];
+  for (const prepared of preparedDays) stagedDays.push(await stageReaderV11Day(fixture, prepared));
+  const predecessor = await createTelemetryV11DomainPredecessor(db(), fixture, nowEpoch);
+  const manifest: TelemetryV11DomainManifest = { schemaVersion: "telemetry-domain-manifest-v1.1",
+    fromDay: stagedDays[0]!.day, throughDay: stagedDays.at(-1)!.day,
+    predecessor: { token: predecessor.token, previousGenerationId: predecessor.previousGenerationId,
+      legacyFingerprint: predecessor.legacyFingerprint },
+    days: stagedDays.map((staged) => ({ day: staged.day, manifestId: staged.manifestId,
+      manifestDigest: staged.manifestDigest })),
+    manifestDigest: "0".repeat(64) };
+  manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+  return activateTelemetryV11Domain(db(), fixture, manifest, nowEpoch);
+}
+
 describe("effective mixed v1 usage reader", () => {
   it("folds current known totals with archived null totals and retains a late unique occurrence", async () => {
     const fixture = await createV11DeviceFixture(db());
@@ -263,6 +357,205 @@ describe("effective mixed v1 usage reader", () => {
       sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
       authorityEpoch: owner.authority_epoch, stream: "usage", fromDay: day, throughDay: nextDay,
     })).toEqual([day, nextDay]);
+  });
+
+  it("factors direct v11 completeness per chunk and preserves source variants and generic binds", async () => {
+    // Pin the captured clock and contiguous two-day fixture to prior-day and UTC-today bounds.
+    const regressionNowEpoch = Date.now();
+    const regressionDay = new Date(regressionNowEpoch).toISOString().slice(0, 10);
+    const priorDay = new Date(regressionNowEpoch - 86_400_000).toISOString().slice(0, 10);
+    await initializeTypedV11Admission(db(), sourceNamespace);
+    const firstFixture = await createV11DeviceFixture(db(), { nowEpoch: regressionNowEpoch });
+    const secondFixture = await createV11DeviceFixture(db(), {
+      participantId: firstFixture.participantId, nowEpoch: regressionNowEpoch,
+    });
+    // Same-time legacy election breaks ties by device ID; keep the queried cross-day row on the nonwinner.
+    const fixture = firstFixture.deviceId > secondFixture.deviceId ? firstFixture : secondFixture;
+    const nonwinningFixture = fixture === firstFixture ? secondFixture : firstFixture;
+    const baseRecords = Array.from({ length: 63 }, (_, index) => {
+      const eventId = `event:v2:${(index + 1).toString(16).padStart(64, "0")}`;
+      return v11UsageRecord(regressionDay, "a", { eventId });
+    });
+    const sharedId = baseRecords[0]!.eventId;
+    const winnerLegacyId = `event:v2:${"d".repeat(64)}`;
+    const addedId = `event:v2:${"f".repeat(64)}`;
+    const crossDayInsert = await makeInsert(nonwinningFixture, 1, [sharedId], true, null, priorDay);
+    const winnerInsert = await makeInsert(fixture, 1, [winnerLegacyId], true, null, priorDay);
+    const commonV1CreatedAt = new Date().toISOString();
+    crossDayInsert.createdAt = commonV1CreatedAt;
+    winnerInsert.createdAt = commonV1CreatedAt;
+    await insertTypedTelemetryV1Chunk(db(), crossDayInsert, sourceNamespace);
+    await insertTypedTelemetryV1Chunk(db(), winnerInsert, sourceNamespace);
+    await db().prepare("UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = 'telemetry-contribution-v1.1'").run();
+    await grantTelemetryV11Consent(db(), fixture, telemetryV11RequiredConsent(), regressionNowEpoch);
+
+    const winnerLegacyRecord = v11UsageRecord(priorDay, "d", { eventId: winnerLegacyId,
+      totalInputContextTokens: 150, components: { inputUncachedTokens: 100, inputCacheReadTokens: null,
+        inputCacheWriteTokens: null, outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: 75 },
+      modelId: "gpt-5.6-sol" });
+    const quota = readerQuota(regressionDay);
+    const session = readerSession(regressionDay);
+    await activateReaderV11Days(fixture, [
+      await makeV11Day(priorDay, { usage: [winnerLegacyRecord] }, "synthetic-effective-reader-v11-witness-r1"),
+      await makeV11Day(regressionDay,
+        { usage: baseRecords, quota: [quota], session: [session] }, "synthetic-effective-reader-v11-r1"),
+    ], regressionNowEpoch);
+    await activateReaderV11Days(fixture, [
+      await makeV11Day(priorDay, { usage: [winnerLegacyRecord] }, "synthetic-effective-reader-v11-witness-r2"),
+      await makeV11Day(regressionDay,
+        { usage: [...baseRecords, v11UsageRecord(regressionDay, "f", { eventId: addedId })],
+          quota: [quota], session: [session] }, "synthetic-effective-reader-v11-r2"),
+    ], regressionNowEpoch);
+    const owner = await ownerFor(fixture.participantId);
+    const options = { sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+      authorityEpoch: owner.authority_epoch, day: regressionDay, limit: 200 };
+    const captured = captureDirectSourceStatement(db());
+    const page = await readEffectiveUsageOwnerDayPage(captured.database, options);
+    const expectedIds = [...baseRecords.map(record => record.eventId), addedId].sort();
+    expect(page.rows.map(row => row.occurrenceId)).toEqual(expectedIds);
+    expect(page.next).toBeNull();
+    expect(page.rows.find(row => row.occurrenceId === sharedId)).toMatchObject({
+      status: "base_conflict", eventTime: null, eventTimeConflict: true, sourceCount: 2, sourceFormats: ["v1", "v11"],
+    });
+    expect(page.rows.find(row => row.occurrenceId === addedId)).toMatchObject({
+      status: "compatible", sourceCount: 1, sourceFormats: ["v11"],
+    });
+
+    const direct = captured.direct();
+    if (!direct) throw new Error("direct source query was not captured");
+    expect(direct.values).toEqual([JSON.stringify(expectedIds), sourceNamespace, owner.owner_digest, fixture.participantId,
+      owner.owner_digest, fixture.participantId, sourceNamespace, fixture.participantId, MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1]);
+    expect(direct.sql).toContain("v11_direct AS MATERIALIZED");
+    expect(direct.sql).toContain("v11_candidate_chunks AS MATERIALIZED (\n    SELECT DISTINCT candidate.chunk_id\n      FROM v11_direct candidate");
+    const distinctChunkOffset = direct.sql.indexOf("v11_candidate_chunks AS MATERIALIZED");
+    const proofCountOffset = direct.sql.indexOf("WHERE allocation.chunk_id=chunk.id");
+    expect(distinctChunkOffset).toBeGreaterThan(-1);
+    expect(proofCountOffset).toBeGreaterThan(distinctChunkOffset);
+    expect(direct.sql).toContain("complete_v11_chunks AS MATERIALIZED");
+    expect(direct.sql.match(/WHERE allocation.chunk_id=chunk.id/gu)).toHaveLength(1);
+    const completeRows = await runCapturedSourceQuery(db(), direct);
+    expect(completeRows).toHaveLength(expectedIds.length + 1);
+    expect(completeRows.filter(row => row.occurrence_id === sharedId)).toHaveLength(2);
+    expect(completeRows.filter(row => row.occurrence_id === baseRecords[1]!.eventId)).toHaveLength(1);
+    expect(completeRows.filter(row => row.occurrence_id === addedId)).toHaveLength(1);
+    const legacySource = await db().prepare(`SELECT storage_row_id FROM typed_telemetry_compatibility_records
+      WHERE participant_id=? AND format_code=10 AND occurrence_id=?`).bind(fixture.participantId, sharedId)
+      .first<{ storage_row_id: number }>();
+    if (!legacySource) throw new Error("synthetic cross-day v1 source missing");
+    expect(completeRows.some(row => row.storage_row_id === legacySource.storage_row_id)).toBe(true);
+    const sharedMetadata = await db().prepare(`SELECT format_code,observed_day FROM typed_telemetry_compatibility_records
+      WHERE storage_row_id IN (?,?) ORDER BY format_code`).bind(...completeRows
+        .filter(row => row.occurrence_id === sharedId).map(row => row.storage_row_id))
+      .all<{ format_code: number; observed_day: string }>();
+    expect(sharedMetadata.results.map(row => row.format_code)).toEqual([10, 11]);
+    expect(sharedMetadata.results.find(row => row.format_code === 10)?.observed_day).toBe(priorDay);
+    const duplicatePhysicalRows = await db().prepare(`SELECT count(*) AS total FROM typed_telemetry_compatibility_records
+      WHERE participant_id=? AND format_code=11 AND occurrence_id=?`).bind(fixture.participantId, baseRecords[1]!.eventId)
+      .first<{ total: number }>();
+    expect(duplicatePhysicalRows?.total).toBe(2);
+
+    for (const [positions, replacement] of [
+      [[1, 6], "synthetic-foreign-source-namespace"],
+      [[2, 4], owner.owner_digest === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64)],
+      [[3, 5, 7], "participant:synthetic-foreign-owner"],
+    ] as const) {
+      const wrong = [...direct.values];
+      for (const index of positions) wrong[index] = replacement;
+      expect((await db().prepare(direct.sql).bind(...wrong)
+        .all<{ storage_row_id: number }>()).results).toHaveLength(0);
+    }
+
+    const activeEvent = await db().prepare(`SELECT event.event_digest,event.manifest_digest,event.input_revision
+      FROM storage_v11_event_sources event JOIN telemetry_v11_domain_heads head
+        ON head.generation_id=event.generation_id
+      WHERE event.owner_digest=? AND head.participant_id=? LIMIT 1`)
+      .bind(owner.owner_digest, fixture.participantId)
+      .first<{ event_digest: string; manifest_digest: string; input_revision: number }>();
+    const eventGuard = await db().prepare(`SELECT sql FROM sqlite_master
+      WHERE type='trigger' AND name='storage_v11_event_immutable'`).first<{ sql: string }>();
+    if (!activeEvent || !eventGuard) throw new Error("synthetic active generation evidence missing");
+    // Keep this corruption confined to the synthetic D1 fixture and restore the exact trigger and row below.
+    await db().prepare("DROP TRIGGER storage_v11_event_immutable").run();
+    try {
+      const wrongDigest = activeEvent.manifest_digest === "f".repeat(64) ? "e".repeat(64) : "f".repeat(64);
+      await db().prepare("UPDATE storage_v11_event_sources SET manifest_digest=? WHERE event_digest=?")
+        .bind(wrongDigest, activeEvent.event_digest).run();
+      let mismatched = await runCapturedSourceQuery(db(), direct);
+      expect(mismatched.some(row => row.occurrence_id === addedId)).toBe(false);
+      expect(mismatched.some(row => row.occurrence_id === baseRecords[1]!.eventId)).toBe(true);
+      await db().prepare("UPDATE storage_v11_event_sources SET manifest_digest=? WHERE event_digest=?")
+        .bind(activeEvent.manifest_digest, activeEvent.event_digest).run();
+      await db().prepare("UPDATE storage_v11_event_sources SET input_revision=? WHERE event_digest=?")
+        .bind(activeEvent.input_revision + 1, activeEvent.event_digest).run();
+      mismatched = await runCapturedSourceQuery(db(), direct);
+      expect(mismatched.some(row => row.occurrence_id === addedId)).toBe(false);
+      expect(mismatched.some(row => row.occurrence_id === baseRecords[1]!.eventId)).toBe(true);
+    } finally {
+      await db().prepare(`UPDATE storage_v11_event_sources SET manifest_digest=?,input_revision=? WHERE event_digest=?`)
+        .bind(activeEvent.manifest_digest, activeEvent.input_revision, activeEvent.event_digest).run();
+      await db().prepare(eventGuard.sql).run();
+    }
+
+    for (const stream of ["quota", "session"] as const) {
+      const genericCapture = captureDirectSourceStatement(db());
+      const genericPage = await readEffectiveTelemetryOwnerDayPage(genericCapture.database, { ...options, stream });
+      const genericQuery = genericCapture.direct();
+      if (!genericQuery) throw new Error(`${stream} direct source query was not captured`);
+      const occurrenceId = stream === "quota" ? quota.observationId : session.sessionUuid;
+      expect(genericPage.rows.map(row => row.occurrenceId)).toEqual([occurrenceId]);
+      expect(genericQuery.values).toEqual([JSON.stringify([occurrenceId]), sourceNamespace, stream, owner.owner_digest,
+        fixture.participantId, stream, stream, owner.owner_digest, fixture.participantId, sourceNamespace,
+        fixture.participantId, stream, MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1]);
+      expect((await runCapturedSourceQuery(db(), genericQuery)).map(row => row.occurrence_id)).toEqual([occurrenceId]);
+    }
+
+    const currentDomain = await db().prepare("SELECT generation_id FROM telemetry_v11_domain_heads WHERE participant_id=?")
+      .bind(fixture.participantId).first<{ generation_id: string }>();
+    if (!currentDomain) throw new Error("synthetic current domain missing");
+    const chunks = await db().prepare(`SELECT chunk.id,domain.id AS generation_id
+      FROM telemetry_v11_chunks chunk JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=chunk.manifest_id
+      JOIN telemetry_v11_domains domain ON domain.id=domain_day.generation_id
+      WHERE domain.participant_id=? AND chunk.stream='usage' AND chunk.chunk_day=?`)
+      .bind(fixture.participantId, regressionDay).all<{ id: string; generation_id: string }>();
+    expect(chunks.results).toHaveLength(2);
+    const oldChunk = chunks.results.find(row => row.generation_id !== currentDomain.generation_id);
+    const currentChunk = chunks.results.find(row => row.generation_id === currentDomain.generation_id);
+    if (!oldChunk || !currentChunk) throw new Error("synthetic source revision chunks missing");
+    const typedChunks = await db().prepare(`SELECT allocation.chunk_id,physical.id AS typed_chunk_id
+      FROM typed_v11_chunk_allocations allocation JOIN typed_telemetry_chunks physical
+        ON physical.namespace_id=allocation.namespace_id AND physical.original_id=allocation.chunk_original
+      WHERE allocation.chunk_id IN (?,?)`).bind(oldChunk.id, currentChunk.id)
+      .all<{ chunk_id: string; typed_chunk_id: number }>();
+    expect(typedChunks.results).toHaveLength(2);
+    const deleteGuards = await db().prepare(`SELECT name,sql FROM sqlite_master WHERE type='trigger'
+      AND name IN ('typed_v11_active_proof_delete_guard','typed_v11_retained_proof_delete_guard')`)
+      .all<{ name: string; sql: string }>();
+    expect(deleteGuards.results.map(row => row.name).sort()).toEqual([
+      "typed_v11_active_proof_delete_guard", "typed_v11_retained_proof_delete_guard",
+    ]);
+    // Remove retained-proof guards only to construct malformed synthetic proof states; restore both exact trigger bodies below.
+    await db().prepare("DROP TRIGGER typed_v11_active_proof_delete_guard").run();
+    await db().prepare("DROP TRIGGER typed_v11_retained_proof_delete_guard").run();
+    try {
+      const partialProof = await db().prepare(`SELECT proof.typed_record_id FROM typed_v11_record_proofs proof
+        JOIN typed_telemetry_compatibility_records record ON record.storage_row_id=proof.typed_record_id
+        WHERE record.chunk_row_id=? AND record.occurrence_id=? AND record.format_code=11`)
+        .bind(currentChunk.id, addedId).first<{ typed_record_id: number }>();
+      if (!partialProof) throw new Error("synthetic proof for current-generation-only source missing");
+      await db().prepare("DELETE FROM typed_v11_record_proofs WHERE typed_record_id=?")
+        .bind(partialProof.typed_record_id).run();
+      const partialRows = await runCapturedSourceQuery(db(), direct);
+      expect(partialRows.some(row => row.occurrence_id === addedId)).toBe(false);
+      expect(partialRows.filter(row => row.occurrence_id === baseRecords[1]!.eventId)).toHaveLength(1);
+
+      const oldTypedChunk = typedChunks.results.find(row => row.chunk_id === oldChunk.id)!.typed_chunk_id;
+      await db().prepare("DELETE FROM typed_v11_record_proofs WHERE chunk_key=?").bind(oldTypedChunk).run();
+      const absentRows = await runCapturedSourceQuery(db(), direct);
+      expect(absentRows.map(row => row.occurrence_id)).toEqual([sharedId]);
+      expect(absentRows.some(row => row.storage_row_id === legacySource.storage_row_id)).toBe(true);
+    } finally {
+      for (const guard of deleteGuards.results) await db().prepare(guard.sql).run();
+    }
   });
 
   it("preserves pre-compact v11 reader refusal", async () => {
