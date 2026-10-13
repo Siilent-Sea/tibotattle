@@ -106,3 +106,47 @@ test('final authority reads actual ASAR bytes through the pinned builder depende
   assert.throws(() => readLinuxFinalPackagedAuthorityFile(destination, '../outside'), /ASAR_IDENTITY_INVALID/u);
   assert.throws(() => readLinuxFinalPackagedAuthorityFile(destination, 'apps/electron/main.js'), /ASAR_IDENTITY_INVALID/u);
 });
+
+for (const [kind, description] of [
+  ['file_link', 'a final-entry link'],
+  ['directory_link', 'an ancestor directory link'],
+  ['unpacked', 'an unpacked authority entry'],
+  ['oversized', 'an authority entry above the one MiB bound'],
+  ['empty', 'an empty authority entry'],
+]) test(`final authority rejects ${description} in an actual ASAR without exposing its path`, async t => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'linux-final-unsafe-asar-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const require = createRequire(import.meta.url), imported = createRequire(require.resolve('electron-builder'))('@electron/asar');
+  const archive = imported.default ?? imported, source = join(root, 'source'), destination = join(root, 'app.asar');
+  const file = 'config/electron-production-distribution.cjs';
+  const bytes = kind === 'oversized' ? Buffer.alloc(1024 ** 2 + 1, 37)
+    : kind === 'empty' ? Buffer.alloc(0) : Buffer.from('synthetic packaged authority\n');
+  await mkdir(source);
+  if (kind === 'directory_link') {
+    await mkdir(join(source, 'authority-config'));
+    await writeFile(join(source, 'authority-config/electron-production-distribution.cjs'), bytes);
+    await symlink('authority-config', join(source, 'config'));
+  } else {
+    await mkdir(join(source, 'config'));
+    if (kind === 'file_link') {
+      await writeFile(join(source, 'authority.cjs'), bytes);
+      await symlink('../authority.cjs', join(source, file));
+    } else await writeFile(join(source, file), bytes);
+  }
+  await archive.createPackageWithOptions(source, destination, kind === 'unpacked' ? { unpack: '*.cjs' } : {});
+  // Inspect without following links so each fixture proves the intended unsafe
+  // archive shape instead of accidentally testing an absent file.
+  const entry = archive.statFile(destination, kind === 'directory_link' ? 'config' : file, false);
+  if (kind === 'file_link' || kind === 'directory_link') assert.equal(typeof entry.link, 'string');
+  else if (kind === 'unpacked') assert.equal(entry.unpacked, true);
+  else assert.equal(entry.size, bytes.length);
+  assert.throws(() => readLinuxFinalPackagedAuthorityFile(destination, file), error => {
+    assert.equal(error.code, 'LINUX_FINAL_LIFECYCLE_ASAR_IDENTITY_INVALID');
+    assert.equal(error.message, error.code);
+    assert.deepEqual(Object.keys(error), ['code']);
+    assert.equal(Object.hasOwn(error, 'cause'), false);
+    assert.equal(Object.hasOwn(error, 'path'), false);
+    assert.equal(JSON.stringify(error).includes(root), false);
+    return true;
+  });
+});

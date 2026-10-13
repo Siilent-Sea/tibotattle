@@ -62,7 +62,13 @@ export function readLinuxFinalPackagedAuthorityFile(path, file) {
   try {
     const imported = createRequire(require.resolve('electron-builder'))('@electron/asar');
     const archive = imported.default ?? imported;
-    return archive.extractFile(path, file);
+    const segments = file.split('/');
+    for (let index = 1; index <= segments.length; index++) {
+      const entry = archive.statFile(path, segments.slice(0, index).join('/'), false);
+      if (entry.link !== undefined || entry.unpacked) fail('ASAR_IDENTITY_INVALID');
+      if (index === segments.length && (!Number.isSafeInteger(entry.size) || entry.size < 1 || entry.size > 1024 ** 2)) fail('ASAR_IDENTITY_INVALID');
+    }
+    return archive.extractFile(path, file, false);
   } catch { fail('ASAR_IDENTITY_INVALID'); }
 }
 async function admitSignedFeed(intake, image, feedBytes) {
