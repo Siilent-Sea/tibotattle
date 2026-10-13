@@ -2,7 +2,7 @@
 title: Close the stranded v1.1 preview failure
 date: 2026-10-12
 type: plan
-status: locally-qualified-awaiting-rollout
+status: rollout-waiting-for-analytics
 ---
 
 The owner admin preview still fails with `BACKEND_STORAGE_UNAVAILABLE`.
@@ -12,7 +12,7 @@ the incident. Activating recovered uploads and verifying their later publication
 remain distinct operations under the
 [recovery runbook](../runbooks/2026-10-11-stranded-telemetry-recovery.md).
 
-## Verified starting evidence
+## Verified starting evidence (2026-10-12 snapshot)
 
 - This checkout starts clean at `7f521836fe7b6e8df7dbb88b53f04a2511dac6ba`.
 - The public health endpoint on 2026-10-12 reports origin source
@@ -41,7 +41,7 @@ remain distinct operations under the
   source. Its Docker image targets Node 22; local Node 22.16.0 is available.
   The deployed origin and edge source have identical edge-contract blobs.
 
-## Narrow origin candidate assessment
+## Narrow origin candidate assessment (2026-10-12 snapshot)
 
 The existing integration owner assigned this lane the independent narrow
 origin qualification. Branch `codex/stranded-v11-preview-hotfix-20261012` starts
@@ -57,7 +57,7 @@ state, still-owned tokens never reach activation, and the two expired cases
 each append exactly one accepted receipt and journal entry. The runbook now
 describes the existing execution boundary accurately.
 
-## Local qualification
+## Local qualification (2026-10-12 snapshot)
 
 All database fixtures are synthetic, on a separately owned loopback-only
 PostgreSQL 17.10 instance. No production recovery has run.
@@ -74,6 +74,7 @@ PostgreSQL 17.10 instance. No production recovery has run.
 | Worker TypeScript | Passed |
 | Documentation, preflight, architecture | Passed; preflight 21/21 |
 | Canonical origin build, Node 22.16.0 | All 13 bundles built, kernel 16 retained |
+| Production rollout tooling, Node 26.2.0 | 640 passed with PostgreSQL, zero failures or skips |
 
 The kernel closure remains
 `d2e867213fe9656f6edf91d0ac991cb293a323f3b2cd84af7d79c0ac431f39f4`.
@@ -94,6 +95,36 @@ product-blob equivalence, secret and identity exclusion, the frozen-clock
 boundary assertions, real predecessor/activation behavior and scoped changes.
 Review is separate from the runtime results above and does not authorize release.
 
+## Authorized rollout checkpoint (2026-10-13)
+
+The owner approved publishing the isolated branch, the guarded production
+build and rollout, scheduler restoration, and a live read-only Preview check.
+Recovered-upload activation remains a separate decision. The published runtime
+candidate is `eacfad5a18373b62de60b210ca371c8a4b360a31`, tree
+`34cfdad72eacef10e652699c45cc73e0278b8697`.
+
+Cloud Build `3f1ac7f8-e232-4b1b-bf2b-4f576d5b7250` successfully built and
+qualified image SHA-256
+`06fc4bb450066e67dae179672f6b5f1bd2f14fc6a1e2f746cbbdf573c642ffe0`.
+The archive includes the unchanged public assets: its 735-file context digest
+is `4d9b28be1b86e74c1685f1fcf346be449a62838e4edfde21fad128ca7839d729`.
+The backup audit is healthy, the fresh edge capture verifies `gcp` mode, and
+the edge-origin contract blobs match.
+
+Both scheduler triggers were recorded live `ENABLED`, then paused by the
+guarded operator at 06:25 UTC. Preflight subsequently passed with one naturally
+running analytics execution. Migration and traffic movement await its terminal
+state. At this checkpoint the serving source remains `7a4bc73e`.
+
+The separate operations change records the two already-enabled schedules in
+the committed desired state; it changes no cadence, runtime code or image pin.
+Its five-file patch passed 114 focused tests and independent review. Historical
+first-apply fixtures retain `PAUSED`, and creation still pauses before granting
+the executor role. After verified rollout, resume uses the pause receipt alone,
+without `--only`, preserving membership and unchanged-since-pause checks. The
+operator's maintenance pass precedes this resume. Keep the deployed runtime
+source bound to `eacfad5a1`; the operations commit is separate evidence.
+
 ## Ownership and remaining gates
 
 1. The existing integration owner retains PR #292 and main. This branch owns
@@ -104,9 +135,9 @@ Review is separate from the runtime results above and does not authorize release
    external writes. Obtain fresh infrastructure, backup and edge readbacks,
    image provenance and the required migration receipt. An unchanged schema
    does not waive the operator's receipt requirements.
-3. Resolve explicit authorization for the concrete production build and rollout.
-   Coordinate diagnostic-job cleanup and scheduler quiescence before preflight;
-   never interrupt another lane's job or bypass a rollout refusal.
+3. Continue under the recorded approval after the running analytics job drains.
+   The other lane confirmed diagnostic-job cleanup. Refresh time-bounded
+   receipts as needed; never interrupt the job or bypass a rollout refusal.
 4. Read back the serving source and run the real admin preview. Keep opaque
    cursors in memory and retain only aggregate results. A healthy endpoint
    without a successful preview is insufficient.
