@@ -10,7 +10,10 @@ status: implemented
 This continues the [nine-finding implementation record](2026-10-12-security-findings-triage.md).
 The coordinated source fixes are retained in `9037353a164455477cfeeaca435ca7d9eba63ec0`;
 the independently reviewed collector creation correction is retained in
-`80a1145c1e3c00b5e4e12aee56d4930c6f6d10ed`. Both are local commits on
+`80a1145c1e3c00b5e4e12aee56d4930c6f6d10ed`. Linux qualification integration is
+retained in `d78dec05b60c2e24a9e59f47bfc05e0f68dda029`, followed by packaged
+authority admission in `908ae053a9b538355d8bbb0a37b0d44716a9ba72`.
+These are local commits on
 `codex/security-findings-2026-10-12`. This record establishes source and local
 test evidence, not signing, deployment, publication or installed-release proof.
 
@@ -57,9 +60,18 @@ consumer commands. There is no automatic signer, production root override or
 test-key injection. Provisioning alone cannot update the policy inside an older
 packaged candidate.
 
+Final archive review reproduced a further admission gap with actual synthetic
+ASAR archives: the final qualifier followed links, accepted unpacked host-side
+policy files, and allocated oversized entries before checking their length.
+The corrected reader rejects linked ancestors and entries, unpacked entries,
+and sizes outside 1 byte through 1 MiB before extraction, matching the private
+qualifier's boundary. Its complete owning file passed 12 tests, including five
+actual-archive negative cases; independent archive probes and review passed.
+
 Independent successor review passed 126 focused tests and six further actual
 process-reader regressions using synthetic process adapters. Independent
-signed-feed integration review passed 119 targeted tests; the separate packaged
+signed-feed integration review closed with 124 unique targeted tests after the
+archive correction; the separate packaged
 availability correction passed 32 tests and review. The final installed-lifecycle
 owner passed 85 tests. These overlapping focused runs are not an aggregate test
 count or evidence of a native Linux run. The ordered caller audit found no
@@ -119,6 +131,38 @@ outcome.
 ## Integration validation
 
 The prior complete root run and subsequent collector-focused correction are
-recorded in the October 12 review. The final full root run follows this frozen
-Linux qualifier correction. Known stale R7 freshness failures must remain visible;
-focused passes cannot be substituted for a green aggregate suite.
+recorded in the October 12 review. A superseded integration run was stopped
+after the final ASAR correction arrived; it is not completed-suite evidence.
+
+The complete permitted root run at `908ae053a9b538355d8bbb0a37b0d44716a9ba72`
+executed 6,242 tests: 6,189 passed, five failed, one was cancelled and 47 were
+platform-skipped (1,870.27 seconds). Two failures are the expected stale R7
+receipt checks. Two Linux container tests retained the historical unsigned
+qualification route and COPY inventory. The Windows compatibility ledger had
+not recorded three new POSIX-specific collector assertions.
+
+The three contract failures were corrected without changing product behavior.
+Linux tests now check both the ordinary unsigned workflow and the protected
+signed-input runbook command, retaining isolation checks and enforcing the exact
+container input allowlist. The combined owning/package/updater files passed
+31/31; independent review passed the five owning tests and rejected eight
+synthetic command/allowlist regressions without weakening isolation. The Windows
+ledger now records all five branches and their outstanding
+native ACL and crash-recovery equivalents; its owning test passed 1/1.
+
+The materialized-boundary benchmark was cancelled by its unchanged 30-second
+test timeout. Its entire unchanged owning file then passed 2/2 in 8.07 seconds,
+with the main benchmark completing in 7.73 seconds. This is a retained timing
+flake; the exact cause of the slower full-run execution is unproven. Neither
+the timeout nor the benchmark assertions were changed.
+
+The focused checks verify the three inventory corrections and reproduce a
+passing benchmark run; they do not constitute another full root run. The two
+stale R7 freshness failures remain unresolved, and the timing flake is retained
+above. The aggregate root gate is not green, and no release or deployment is
+qualified by these results.
+
+Final documentation governance, architecture, preflight (22 tests) and release
+trust (87 tests) passed. Architecture inspection covered 663 production files
+and 2,721 imports with no approved debt edges. These local checks do not replace
+the operational gates in the ordered handoff table.
