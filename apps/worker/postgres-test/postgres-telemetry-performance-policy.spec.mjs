@@ -555,21 +555,37 @@ test("the capability fence refuses every miss with 403", { skip }, async () => {
 
 test("the capability matches the Worker's response bytes and passes the client's capability check", { skip }, async () => {
   const schema = await active();
+  // The legacy D1 Worker is pinned to 2026-09-29.1 on this line (its D1 schema
+  // carries ingestion-isolation 0013_performance_ultrafast), so byte parity is
+  // checked for a device the origin resolves to that dictionary (parser v19 or
+  // later): the same row yields byte-identical capabilities on both.
+  const pinned = await ownerWithManifest(schema, "unified-rollout-typed-v20");
+  await grant(schema, pinned, V1_BODY);
+  const pinnedCapability = await capability(schema, pinned);
+  assert.equal(pinnedCapability.authorization.issuedAt.length, 24);
+  assert.equal(pinnedCapability.authorization.expiresAt, pinned.expiresAt);
+  assert.equal(pinnedCapability.requiredConsent.fieldDictionaryVersion, PERFORMANCE_DICTIONARY_2026_09_29);
+  const worker = workerPolicy.telemetryPerformanceCapabilityResponse({
+    participant_id: pinned.participantId, device_id: pinned.deviceId,
+    capability_revision: pinnedCapability.authorization.capabilityRevision,
+    authority_epoch: pinnedCapability.authorization.authorityEpoch,
+    schema_version: "model-performance-daily-v1", field_dictionary_version: PERFORMANCE_DICTIONARY_2026_09_29,
+    privacy_contract_version: "privacy-safe-model-performance-v1", scope: "model-performance-daily", state: "accepted",
+    issued_at: pinnedCapability.authorization.issuedAt, expires_at: pinnedCapability.authorization.expiresAt,
+    owner_kind: "accountless", authority_kind: "accountless",
+  });
+  assert.equal(JSON.stringify(pinnedCapability), JSON.stringify(worker),
+    "byte-identical to the Worker's capability for the same row");
+  workerPolicy.parseTelemetryPerformanceCapability(JSON.parse(JSON.stringify(pinnedCapability)));
+
+  // A device the origin resolves to 2026-09-21.1 (parser v18) keeps that
+  // dictionary, which the pinned legacy Worker no longer issues.
   const legacy = await ownerWithManifest(schema, "unified-rollout-typed-v18");
   await grant(schema, legacy, V1_BODY);
   const ours = await capability(schema, legacy);
   assert.equal(ours.authorization.issuedAt.length, 24);
   assert.equal(ours.authorization.expiresAt, legacy.expiresAt);
-  const worker = workerPolicy.telemetryPerformanceCapabilityResponse({
-    participant_id: legacy.participantId, device_id: legacy.deviceId,
-    capability_revision: ours.authorization.capabilityRevision, authority_epoch: ours.authorization.authorityEpoch,
-    schema_version: "model-performance-daily-v1", field_dictionary_version: PERFORMANCE_DICTIONARY_2026_09_21,
-    privacy_contract_version: "privacy-safe-model-performance-v1", scope: "model-performance-daily", state: "accepted",
-    issued_at: ours.authorization.issuedAt, expires_at: ours.authorization.expiresAt,
-    owner_kind: "accountless", authority_kind: "accountless",
-  });
-  assert.equal(JSON.stringify(ours), JSON.stringify(worker), "byte-identical to the Worker's capability for the same row");
-  workerPolicy.parseTelemetryPerformanceCapability(JSON.parse(JSON.stringify(ours)));
+  assert.equal(ours.requiredConsent.fieldDictionaryVersion, PERFORMANCE_DICTIONARY_2026_09_21);
 
   // The client on this line emits PERFORMANCE_FIELD_DICTIONARY_VERSION: its own
   // capability() accepts a capability for that dictionary and refuses another.
