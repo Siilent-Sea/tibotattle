@@ -815,7 +815,7 @@ describe('the cache-retention lane',()=>{
   const poisonDay=cacheRetentionLookbackDays(DAY).at(-1)!;
   const emptyCarry=await readCacheRetentionCarryDays(target(),effective);
   expect(emptyCarry.every(entry=>entry.manifestDigest==='')).toBe(true);
-  await writeCacheRetentionDay({target:target(),key:effective,carry:emptyCarry,aggregate:await build(effective)});
+  await writeCacheRetentionDay({target:target(),key:effective,carry:emptyCarry,aggregate:await build(effective,emptyCarry,{deadlineMs:Date.now()+30_000,remainingQueries:900})});
   expect(await readCacheRetentionCommunityBands({target:target(),sourceId})).not.toEqual([]);
   expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'idle',marks:0});
 
