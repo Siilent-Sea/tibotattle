@@ -97,6 +97,16 @@ const REGISTRY_PINS = Object.freeze([
   // breakdowns v1.5) beside the retained Pro 10x v0.4 contract; pricing
   // identity unchanged.
   "871135e33844da3f2142da76da1429d0cd02a1b0544c1eba264680ce47a8447f",
+  // Kernel 17: main/production source integration, including the quota facade
+  // export and reviewed historical admin catalog compatibility. Vendor, prices
+  // and B' allowance projection remain unchanged; this source is not deployed.
+  "5b24da66e2c07be8f53f4af303eadde84ba5209c3d78bbbdf03c9932cddbff4f",
+  // Kernel 18: classify shared proof reads in the existing correction-source
+  // statement family. Query results, vendor and prices remain unchanged.
+  "5f808f13dccf3aa6eb919bb56d7ca9b57b1ea2e474fc1bb5847102a73c78a5fd",
+  // Kernel 19: era-isolated model composition on the production hotfix line.
+  // Existing single-era math is unchanged; each owner votes once per model.
+  "e27e4b4f0f3d6f24a9ce2e85bc3bb90424465ec06c555830b0236d46fe935bfb",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
