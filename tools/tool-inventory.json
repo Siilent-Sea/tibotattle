@@ -2309,7 +2309,8 @@
         "test/electron-linux-final-appimage.test.js",
         "scripts/lib/linux-final-artifact-intake.mjs",
         "test/electron-linux-installed-lifecycle.test.js",
-        "test/electron-linux-installed-files.test.mjs"
+        "test/electron-linux-installed-files.test.mjs",
+        "test/electron-linux-normal-packaged-smoke.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2473,7 +2474,9 @@
         ".github/workflows/electron-linux-production-package.yml",
         "scripts/qualify-electron-linux-final-appimage.mjs",
         "test/electron-linux-final-appimage.test.js",
-        "scripts/qualify-electron-linux-installed-lifecycle.mjs"
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+        "scripts/prepare-linux-updater-qualification.mjs",
+        "test/electron-linux-updater-qualification.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2491,7 +2494,8 @@
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-real-appimage-updater.test.js",
         "scripts/smoke-electron-linux-final-lifecycle.mjs",
-        "test/authorized-qualification-requests.test.js"
+        "test/authorized-qualification-requests.test.js",
+        "scripts/prepare-linux-updater-qualification.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2992,7 +2996,8 @@
       "additionalAliases": [],
       "callers": [
         "scripts/qualify-electron-linux-installed-lifecycle.mjs",
-        "test/electron-linux-extraction.test.js"
+        "test/electron-linux-extraction.test.js",
+        "scripts/prepare-linux-updater-qualification.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -3141,10 +3146,29 @@
       "callers": [
         "test/electron-linux-update-signing.test.js",
         "docs/decisions/2026-10-12-linux-update-publisher-authentication.md",
-        "test/helpers/linux-update-publication-fixture.js"
+        "test/helpers/linux-update-publication-fixture.js",
+        "test/electron-linux-qualification-feed.test.js"
       ],
       "decision": "retain_as_explicit_linux_update_signing_entrypoint",
       "provenance": "docs/decisions/2026-10-12-linux-update-publisher-authentication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-successor-evidence.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Bounded owner-only startup generation and exact-process debugger socket evidence for the two Linux updater qualification entrypoints; no production capability or native launch.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-successor-evidence.test.js",
+        "test/electron-linux-installed-lifecycle.test.js"
+      ],
+      "decision": "retain_as_linux_successor_qualification_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -3333,6 +3357,46 @@
         "test/electron-windows-signing-workflow.test.js"
       ],
       "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-qualification-feed.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Read-only signed feed and exact packaged source authority admission; transient corruption changes only the explicit negative response stream.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/linux-final-artifact-intake.mjs",
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+        "scripts/prepare-linux-updater-qualification.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "test/electron-linux-final-host.test.mjs",
+        "test/electron-linux-qualification-feed.test.js",
+        "test/electron-linux-updater-qualification.test.js",
+        "test/electron-linux-installed-lifecycle.test.js"
+      ],
+      "decision": "retain_as_presigned_linux_qualification_admission",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/prepare-linux-updater-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Consumes an existing immutable private AppImage pair and separately owner-signed feed; never signs, rebuilds, or publishes.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "test/electron-linux-updater-qualification.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_explicit_postbuild_linux_qualification_preparation",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
       "legacyPaths": []

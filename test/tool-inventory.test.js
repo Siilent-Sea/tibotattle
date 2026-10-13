@@ -342,9 +342,11 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // cleanup; the final host owns the same-profile installed lifecycle handoff.
   // Security remediation adds closed Windows signing stages and egress policy,
   // Linux extraction and signing, private qualification transports, and a shared
-  // redacted-path guard. These are tooling boundaries, never product APIs.
-  assert.equal(result.records, 186);
-  assert.equal(result.candidates.length, 185);
+  // redacted-path guard. The Linux successor helper separates profile-generation
+  // proof from process-owned authenticated health. These are tooling boundaries,
+  // never product APIs.
+  assert.equal(result.records, 189);
+  assert.equal(result.candidates.length, 188);
   assert.ok(result.aliases >= 25);
 });
 

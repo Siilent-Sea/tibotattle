@@ -2046,6 +2046,27 @@ async function defaultSmokeResultWriter(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+/** Check caller-owned process/socket authority around debugger traffic. */
+export async function runLinuxCdpAuthorityOperation({ assertCdpAuthority = null, port, phase, operation }) {
+  if (assertCdpAuthority !== null && typeof assertCdpAuthority !== "function"
+      || !Number.isInteger(port) || port < 1 || port > 65535
+      || !["debugger_http", "debugger_connect", "authenticated_health"].includes(phase)
+      || typeof operation !== "function") {
+    throw Object.assign(new Error("Linux debugger authority unavailable"), { code: "ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE" });
+  }
+  const assertAuthority = async (boundary) => {
+    if (assertCdpAuthority === null) return;
+    try {
+      if (await assertCdpAuthority(Object.freeze({ port, phase: `${phase}_${boundary}` })) === true) return;
+    } catch { /* Keep raw process and filesystem evidence out of errors. */ }
+    throw Object.assign(new Error("Linux debugger authority unavailable"), { code: "ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE" });
+  };
+  await assertAuthority("before");
+  const value = await operation();
+  await assertAuthority("after");
+  return value;
+}
+
 /**
  * Run the established renderer/refresh/clean-quit proof with an injected
  * fixture and ordinary Electron launch shape. The default remains the source
@@ -2054,6 +2075,7 @@ async function defaultSmokeResultWriter(value) {
  */
 export async function runSmoke({
   afterRefresh = null,
+  assertCdpAuthority = null,
   beforeQuit = null,
   binary = null,
   binaryResolver = electronBinary,
@@ -2073,6 +2095,7 @@ export async function runSmoke({
   writeResult = defaultSmokeResultWriter,
 } = {}) {
   if (afterRefresh !== null && typeof afterRefresh !== "function"
+      || assertCdpAuthority !== null && typeof assertCdpAuthority !== "function"
       || beforeQuit !== null && typeof beforeQuit !== "function"
       || binary !== null && (typeof binary !== "string" || binary.length === 0)
       || typeof binaryResolver !== "function" || typeof readContainerContract !== "function"
@@ -2105,7 +2128,7 @@ export async function runSmoke({
   let argumentsForLaunch;
   try {
     environment = environmentFactory({ fixture, port });
-    argumentsForLaunch = launchArguments({ fixture, port });
+    argumentsForLaunch = await launchArguments({ fixture, port });
   } catch {
     await rm(fixture.root, { recursive: true, force: true }).catch(() => {});
     fail("Electron Linux smoke launch configuration is invalid");
@@ -2151,13 +2174,22 @@ export async function runSmoke({
   let failureStage = null;
   let rendererReadinessDiagnostics = null;
   let companionSnapshotObserver = null;
+  let cdpAuthorityFailed = false;
+  const withCdpAuthority = async (phase, operation) => {
+    if (cdpAuthorityFailed) failFixed("ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE");
+    try { return await runLinuxCdpAuthorityOperation({ assertCdpAuthority, port, phase, operation }); }
+    catch (error) {
+      if (error?.code === "ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE") cdpAuthorityFailed = true;
+      throw error;
+    }
+  };
   const resourceDiagnostics = createLinuxResourceDiagnostics();
   try {
     try { await resourceDiagnostics.start(); } catch { /* Diagnostic only. */ }
     failureStage = "startup";
     if (!child.pid) fail("Electron did not provide a process id");
     const version = await waitFor(
-      () => jsonFetch(`http://127.0.0.1:${port}/json/version`),
+      () => withCdpAuthority("debugger_http", () => jsonFetch(`http://127.0.0.1:${port}/json/version`)),
       MAX_STARTUP_MS,
       "Electron remote debugging endpoint",
     ).catch((error) => {
@@ -2177,7 +2209,7 @@ export async function runSmoke({
     // loopback dashboard below may contribute evidence.
     failureStage = "target";
     const dashboardSelection = await waitFor(async () => {
-      const targets = await jsonFetch(`http://127.0.0.1:${port}/json`);
+      const targets = await withCdpAuthority("debugger_http", () => jsonFetch(`http://127.0.0.1:${port}/json`));
       const inspectablePages = reserveLinuxInspectablePageTargets(
         targets,
         port,
@@ -2188,7 +2220,10 @@ export async function runSmoke({
         let pageRefreshObserver;
         let pageRendererReadinessDiagnostics;
         try {
-          pageCdp = await connectCdp(target);
+          await withCdpAuthority("debugger_connect", async () => {
+            pageCdp = await connectCdp(target);
+            return pageCdp;
+          });
           pageRefreshObserver = observeLocalRefreshRequests(pageCdp);
           pageRendererReadinessDiagnostics = createRendererReadinessDiagnostics({ cdp: pageCdp });
           const observedNetworkUrls = [];
@@ -2225,10 +2260,11 @@ export async function runSmoke({
             observedNetworkUrls,
             networkEvidenceInvalid: () => networkEvidenceInvalid,
           }));
-        } catch {
+        } catch (error) {
           pageRendererReadinessDiagnostics?.dispose?.();
           pageRefreshObserver?.dispose?.();
           pageCdp?.close?.();
+          if (error?.code === "ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE") throw error;
         }
       }));
       const target = selectLinuxDashboardTarget(targets, port);
@@ -2247,9 +2283,10 @@ export async function runSmoke({
         !== selectedDashboardUrl.origin) {
       fail("dashboard diagnostics did not bind the selected loopback origin");
     }
+    const authorizedHealthFetch = createAuthorizedRendererFetch(cdp, { timeoutMs: RENDERER_READINESS_COMPANION_HEALTH_REQUEST_MS, maximumBytes: RENDERER_READINESS_COMPANION_HEALTH_MAX_BODY_BYTES });
     companionSnapshotObserver = createRendererReadinessCompanionSnapshotObserver(
       selectedDashboardUrl.origin,
-      { fetchImpl: createAuthorizedRendererFetch(cdp, { timeoutMs: RENDERER_READINESS_COMPANION_HEALTH_REQUEST_MS, maximumBytes: RENDERER_READINESS_COMPANION_HEALTH_MAX_BODY_BYTES }) },
+      { fetchImpl: (...args) => withCdpAuthority("authenticated_health", () => authorizedHealthFetch(...args)) },
     );
     await cdp.request("Runtime.enable");
     selectRequiredRefreshLoader(refreshObserver, await waitFor(
@@ -2290,7 +2327,7 @@ export async function runSmoke({
       fail("dashboard origin was not accepted as the validated loopback origin");
     }
     failureStage = "renderer_health";
-    const health = await fetchRendererJson(cdp, new URL("/api/local/health", dashboardUrl), { timeoutMs: MAX_OPERATION_MS, maximumBytes: MAX_JSON_RESPONSE_BYTES });
+    const health = await withCdpAuthority("authenticated_health", () => fetchRendererJson(cdp, new URL("/api/local/health", dashboardUrl), { timeoutMs: MAX_OPERATION_MS, maximumBytes: MAX_JSON_RESPONSE_BYTES }));
     if (health.status !== "ready") fail("companion health was not ready");
     failureStage = "renderer_resource";
     const remoteResources = ready.resources.filter((resource) => {
@@ -2482,7 +2519,12 @@ export async function runSmoke({
         const companionSnapshot = companionSnapshotObserver?.snapshot?.()
           ?? unobservedRendererCompanionSnapshot();
         const diagnostic = await rendererReadinessDiagnostics?.snapshotWithTimingAndProbe?.({
-          probe: (origin) => probeRendererReadinessPrimaryApis(origin, { fetchImpl: createAuthorizedRendererFetch(cdp, { timeoutMs: RENDERER_READINESS_DIAGNOSTIC_PROBE_MS }) }),
+          probe: (origin) => {
+            const authorizedProbe = createAuthorizedRendererFetch(cdp, { timeoutMs: RENDERER_READINESS_DIAGNOSTIC_PROBE_MS });
+            return probeRendererReadinessPrimaryApis(origin, {
+              fetchImpl: (...args) => withCdpAuthority("authenticated_health", () => authorizedProbe(...args)),
+            });
+          },
           companionSnapshot,
         })
           ?? rendererReadinessDiagnostics?.snapshot?.({ companionSnapshot })

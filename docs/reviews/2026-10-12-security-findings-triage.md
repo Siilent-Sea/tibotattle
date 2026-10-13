@@ -7,6 +7,10 @@ status: implemented
 
 # Security findings triage, remediation and handoffs
 
+The [October 13 continuation](2026-10-13-security-remediation-closeout.md) records
+the later ordered review, Linux qualification follow-up and authorized R7 refresh
+attempt. The evidence below retains its October 12 boundary.
+
 All nine findings in the [October 11 security scan][scan] were confirmed at
 triage and now have source fixes, regression coverage and independent review.
 Seven implementation owners delivered the work, with the two local authorization

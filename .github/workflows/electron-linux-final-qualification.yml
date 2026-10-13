@@ -10,7 +10,7 @@ on:
         default: plan
         required: true
       intake:
-        description: Closed intake v1 (027) or v2 (028), with original sourceCandidate and exact successful package run and byte identities
+        description: Signed-feed intake v3 (027) or v4 (028), with original sourceCandidate, exact package identities and owner-signed feed bytes
         type: string
         required: true
       confirmation:

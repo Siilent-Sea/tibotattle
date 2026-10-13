@@ -110,8 +110,15 @@ test("standalone inspection rejects expired, linked, malformed and unsafe-direct
   await assert.rejects(createOwnerAuthorizedLocalReader(oversized.path));
 });
 
-test("automatic AppImage restart cannot substitute unauthenticated port discovery for renderer readiness", async () => {
+test("controlled AppImage health requires owned CDP before and after a genuinely authorized renderer response", async () => {
   await assert.rejects(processHealth(123), { code: "LINUX_REAL_APPIMAGE_RESTART_AUTHORIZATION_UNAVAILABLE" });
+  const calls = [];
+  const dashboard = renderer(async (url) => { calls.push("authorized_health"); assert.equal(url, `${origin}/api/local/health`); return new Response('{"status":"ready"}'); });
+  assert.equal(await processHealth(123, { dashboard, assertCdpAuthority: async () => { calls.push("owned_process_and_socket"); return true; } }), true);
+  assert.deepEqual(calls, ["owned_process_and_socket", "authorized_health", "owned_process_and_socket"]);
+  let checks = 0;
+  await assert.rejects(processHealth(123, { dashboard, assertCdpAuthority: async () => ++checks === 1 }), { code: "LINUX_REAL_APPIMAGE_CDP_AUTHORITY_UNAVAILABLE" });
+  await assert.rejects(processHealth(123, { dashboard, assertCdpAuthority: async () => false }), { code: "LINUX_REAL_APPIMAGE_CDP_AUTHORITY_UNAVAILABLE" });
 });
 
 test("pre-render diagnostics remain unobserved without an explicitly authorized transport", async () => {

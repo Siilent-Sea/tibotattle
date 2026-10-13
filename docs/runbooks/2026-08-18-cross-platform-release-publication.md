@@ -749,6 +749,72 @@ This adapter-only checksum exercise does not qualify the independent publisher
 boundary. The real AppImage update and final-lifecycle runners now refuse
 `UPDATE_TRUST_UNPROVISIONED` while the source key set is empty.
 
+For the genuine private-pair lane, the development workflow retains the frozen
+`pair.json` and both AppImages before the authorized-input gate. The owner must
+separately authorize and sign the canonical next artifact using the existing
+Linux signing producer. The ordinary workflow records that this protected
+qualification was not performed; it does not invoke the genuine updater lane.
+Use the supported native Linux host, pinned Node runtime and the complete
+same-revision packaging workspace required by the packaged Dockerfile. The two
+retained AppImages alone do not provide that build context. With the existing
+pair and exact owner-signed file, build only the qualification environments and
+prepare the inputs; these commands never rebuild the AppImages:
+
+```sh
+set -euo pipefail
+umask 077
+qualification_revision="$(git rev-parse HEAD)"
+node scripts/build-electron-linux-container.mjs --architecture amd64
+docker build --platform=linux/amd64 --network=none \
+  --file containers/electron-linux-extraction/Dockerfile \
+  --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$qualification_revision" \
+  --tag tibotattle-electron-linux-extraction:test .
+node scripts/prepare-linux-updater-qualification.mjs \
+  --signed-feed /absolute/owner-signed/latest-linux.yml
+docker build --platform=linux/amd64 \
+  --file containers/electron-linux-packaged/Dockerfile \
+  --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$qualification_revision" \
+  --tag tibotattle-electron-linux-packaged:test .
+```
+
+Preparation verifies the actual ASAR through the reviewed extraction container
+and compares its selected updater authority files with the admitted candidate
+commit and reviewed runner. It publishes the two admitted files
+`qualification/latest-linux.yml` and `qualification/qualification.json` under
+the frozen pair directory and retains private inspection/ownership state
+outside the Docker input allowlist. It never rebuilds or signs, and it requires
+the separately built extraction image with the pair's source-revision label.
+Run the genuine updater only inside this isolated
+container, selecting a new receipt path with an existing private parent:
+
+```sh
+set -euo pipefail
+set -C
+umask 077
+qualification_receipt=/absolute/new/real-appimage-updater-smoke.json
+container_user=node
+container_home_base=/home
+container_home="$container_home_base/$container_user"
+timeout 420s docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+  --shm-size=512m \
+  --add-host updates.tibotattle.com:127.0.0.1 \
+  --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  --tmpfs "$container_home:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700" \
+  --tmpfs /run/user/1000:rw,noexec,nosuid,size=1024m,uid=1000,gid=1000,mode=0700 \
+  --tmpfs /opt/tibotattle-updater-exec:rw,exec,nosuid,size=2048m,uid=1000,gid=1000,mode=0700 \
+  --env "HOME=$container_home" --env TMPDIR=/run/user/1000 --env XDG_RUNTIME_DIR=/run/user/1000 \
+  --env "XDG_CONFIG_HOME=$container_home/.config" --env "XDG_CACHE_HOME=$container_home/.cache" \
+  --env "XDG_DATA_HOME=$container_home/.local/share" --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+  --env USAGE_MONITOR_LINUX_IMAGE_PLATFORM=linux/amd64 --env USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none \
+  --entrypoint xvfb-run tibotattle-electron-linux-packaged:test \
+  --auto-servernum --server-args='-screen 0 1280x900x24 -nolisten tcp' \
+  node scripts/smoke-electron-linux-real-appimage-updater.mjs > "$qualification_receipt"
+```
+
+Do not launch the script directly on the host. Inspection outputs are excluded
+from the Docker context. No workflow automatically uploads a feed or signs metadata;
+missing or invalid signed input and empty embedded roots remain unqualified.
+
 The final Linux production-package workflow also qualifies the application
 extracted from its exact AppImage. `qualify-electron-linux-final-appimage.mjs`
 checks the final package receipt and original source stage before extraction,
@@ -768,12 +834,26 @@ closed intake binds the reviewed runner revision, frozen application revision,
 unchanged `production-source-candidate.json`, successful production packaging
 run, package-receipt digest, final AppImage size/digest, and executable/ASAR
 digests. The application revision must be an ancestor of the runner, with the
-same package version. The explicit v2 intake admits only 0.1.28 with provenance
-build `2026100901`; v1 retains 0.1.27 / `2026100301`. Both use the immutable public
+same package version. The signed-feed v4 intake admits only 0.1.28 with provenance
+build `2026100901`; v3 admits 0.1.27 / `2026100301`. Earlier unsigned v1/v2 intakes
+are rejected and are never relabeled. Both use the immutable public
 [0.1.26 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26);
 its manifest and AppImage digests are pinned in
 `scripts/lib/linux-final-artifact-intake.mjs`. Earlier owner acceptance is not
 reused for the new bytes.
+
+The intake also carries `signedFeed` with exactly `file: latest-linux.yml`,
+`bytes`, `sha256`, and canonical `base64` of the separately owner-signed output.
+Keep the complete intake within its 64 KiB JSON bound. This transports public
+signed metadata, never a signing key. The original package receipt and builder
+feed remain unchanged; the builder feed cannot supply missing authorization.
+Preparation verifies the signature against reviewed embedded roots and binds it
+to the measured final image, then copies the exact signed bytes to the isolated
+input directory. Pair schema v2 retains only the feed descriptor, plus a closed
+proof that six selected updater/policy files in the digest-verified actual ASAR
+equal both the admitted source commit and reviewed runner. This supplements the
+complete AppImage, executable, ASAR and original package/source receipt checks;
+it does not claim equivalence of arbitrary package code from six files alone.
 
 Dispatch `mode=plan` first with the reviewed intake. Both modes install the
 locked verifier dependencies; plan stops before artifact downloads or application
@@ -810,11 +890,33 @@ network, host profile mount, system credential access, signing or publication.
 `scripts/smoke-electron-linux-final-lifecycle.mjs` binds kernel FUSE mounts,
 process start identities, running executable and ASAR hashes to the installed
 image. It observes a fresh synthetic profile, local refresh and credential
-access, rejection of an intentionally mismatched feed checksum without replacing
+access, rejection of an intentionally corrupted artifact transfer without replacing
 the predecessor, the public predecessor's real Settings download/install/restart,
 exact-byte replacement, settings/opt-out/source and credential continuity,
 cold restart, no-update behavior, owned uninstall and process/mount cleanup.
-The fixed production feed URL is served only inside the network-none container.
+The automatic updater restart drops debugger arguments. Its evidence therefore
+binds the exact replacement process and observes a new, owner-only startup
+journal generation in the dedicated synthetic profile. The journal does not
+identify its writer PID or prove companion API health; the receipt records
+`automaticSuccessorStartup: verified_profile_generation` and
+`automaticSuccessorApiHealth: not_observed` separately. The later controlled
+cold restart qualifies authenticated renderer health only after the harness
+checks that its reserved debugger port was unused before launch and that the
+exact process owns the sole loopback listener before and after debugger
+discovery, connections and health reads. A replacement listener or changed
+process identity fails the gate. No loopback port scan or unauthenticated API
+fallback supplies missing evidence. The fixed production feed URL is served
+only inside the network-none container. Every phase serves the exact same
+owner-signed feed bytes. After the clean final install is uninstalled and before
+the historical predecessor starts, the negative phase flips one streamed
+artifact byte without changing its length, stored AppImage or signed metadata.
+A negative transfer counts only after the original source digest and length
+match and the HTTP response finishes; incomplete or failed transfers cannot
+advance the phase. The accepted update and controlled cold restart again serve
+the unchanged positive artifact and feed. Runtime and host receipts bind the
+feed descriptor and packaged authority proof and require
+`corruptUpdateArtifactRefusedWithoutReplacement` separately from positive update
+and no-update evidence.
 
 The host entrypoint `scripts/run-electron-linux-final-lifecycle.mjs` performs a
 fresh five-case causal AppArmor comparison in the same job: baseline denials for
@@ -836,9 +938,13 @@ Retain the original pair, `apparmor-comparison.json`, `installed-lifecycle.json`
 and `host-lifecycle.json` with the package receipts and successful workflow/run
 and ZIP provenance. The host receipt binds all three original JSON digests and
 the exact candidate-profile identity. The replacement uses
-`tibotattle-linux-final-installed-lifecycle-v2` with
-`publicPredecessorUpdate: exact_published_0.1.26_to_final_0.1.28`; the historical
-v1 receipt keeps its 0.1.27 route. Both require the same lifecycle assertions.
+`tibotattle-linux-final-installed-lifecycle-v4` with
+`publicPredecessorUpdate: exact_published_0.1.26_to_final_0.1.28`; a newly run
+0.1.27 qualification uses v3 with its existing release route. Both require the
+separate automatic startup fields above and
+`controlledColdRestartAuthorizedHealth: true`. Historical v1/v2 receipts retain
+their original evidence meaning and cannot satisfy the new admission gate or
+be relabeled as v3/v4.
 Acceptance must require the host's passed status,
 comparison/lifecycle success, no interruption and both container/profile cleanup
 before using the runtime receipt for `cleanInstallSmokePassed`. Merely uploading
