@@ -1,12 +1,16 @@
 // Unit checks for the GCP fast-path rehearsal's options and source-dump
 // resolution. Synthetic files only; no database, no network, no refresh.
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { assertCurrentImageRuntime, assertCurrentRehearsalOutputsNew, currentRehearsalOutputDestinations, parseArguments, rehearsalComparisonGates, resolveRehearsalDump, runRehearsal, syntheticRehearsalFloorDays, verifyCurrentImageRuntimePath } from "./gcp-fastpath-rehearsal.mjs";
+
+import { assertS9ChildCompleted, boundedS9ChildOutput, captureS9ChildCompletion, createS9Progress, observeS9ChildProgress, ownedKeptRehearsalSchemas, withS9OwnedSchemaCleanup,
+  readS9ChildReport, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS } from "./s9-rehearsal-diagnostics.mjs";
 
 const refused = (code) => (error) => error?.code === code;
 
@@ -322,4 +326,249 @@ test("qualifying driver invokes the fixed actual D1 producer and preserves origi
     "current report is wx-preserved before any qualifying stdout report");
   assert.match(source, /referenceSha256: currentReferenceSha256, actual, actualPreview/u,
     "comparison consumes the original producer digest, not a reminted PG or saved-file digest");
+});
+
+// S9 failure diagnostics use synthetic child results, with no subprocess, database or network.
+test("S9 preserves success and closes failed child results without exposing raw error fields", async () => {
+  assert.equal(S9_REHEARSAL_DEADLINE_MS, 2_400_000, "the original 40-minute child budget is retained");
+  const success = await captureS9ChildCompletion(async () => ({ stdout: "synthetic", stderr: "" }), () => 1);
+  assert.deepEqual(success.metadata, { state: "completed", exitCode: 0, signal: null, killed: false,
+    childCode: null, deadlineMs: S9_REHEARSAL_DEADLINE_MS, deadlineElapsed: false });
+  assert.doesNotThrow(() => assertS9ChildCompleted(success.metadata));
+  assert.equal(success.stdout.bytes.toString(), "synthetic");
+  for (const input of [
+    { code: 2, signal: null, killed: false },
+    { code: null, signal: "SIGTERM", killed: true },
+    { code: "ENOENT", signal: null, killed: false },
+    { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", signal: null, killed: true },
+    { code: "PRIVATE_TOKEN", signal: "PRIVATE_PATH", killed: "yes" },
+  ]) {
+    let time = 0;
+    const completion = await captureS9ChildCompletion(async () => {
+      time = S9_REHEARSAL_DEADLINE_MS;
+      throw { ...input, message: "PRIVATE_MESSAGE", path: "/private/synthetic", cmd: "PRIVATE_COMMAND",
+        stdout: "synthetic stdout", stderr: "synthetic stderr" };
+    }, () => time);
+    assert.equal(completion.metadata.state, "failed");
+    assert.equal(completion.metadata.deadlineElapsed, true);
+    assert.equal(completion.metadata.killed, input.killed === true);
+    assert.equal(completion.metadata.exitCode, input.code === 2 ? 2 : null);
+    assert.equal(completion.metadata.signal, input.signal === "SIGTERM" ? "SIGTERM" : null);
+    assert.equal(completion.metadata.childCode, ["ENOENT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"].includes(input.code)
+      ? input.code : "other");
+    assert.doesNotMatch(JSON.stringify(completion.metadata), /PRIVATE_|private\/synthetic/u);
+    assert.throws(() => assertS9ChildCompleted(completion.metadata), (error) =>
+      error.code === "S9_REHEARSAL_CHILD_FAILED" && error.message === error.code
+        && error.diagnostic === completion.metadata);
+  }
+});
+
+test("S9 keeps a valid failed report available for exact schema cleanup and refuses missing or malformed reports closed", async () => {
+  const failed = (await captureS9ChildCompletion(async () => { throw { code: 2 }; })).metadata;
+  const valid = { status: "error", reusedSchema: false,
+    schema: "typed_legacy_transfer_rehearsal_target_fastpath_0123abcd",
+    keptSchemas: ["typed_legacy_transfer_rehearsal_target_fastpath_0123abcd",
+      "typed_legacy_transfer_rehearsal_ctl_0123abcd"] };
+  assert.deepEqual(await readS9ChildReport("synthetic", failed, async () => JSON.stringify(valid)), valid,
+    "a child failure does not bypass the caller's owned-schema boundary");
+  for (const read of [async () => { throw { code: "ENOENT", message: "PRIVATE" }; },
+    async () => "bad JSON PRIVATE", async () => "[]", async () => "null"]) {
+    await assert.rejects(readS9ChildReport("synthetic", failed, read), (error) =>
+      error.code === "S9_REHEARSAL_CHILD_FAILED" && error.message === error.code);
+    await assert.rejects(readS9ChildReport("synthetic", { state: "completed" }, read),
+      (error) => error.code === "S9_REHEARSAL_REPORT_INVALID" && error.message === error.code);
+  }
+  const edge = await readFile(new URL("../postgres-test/edge-origin-e2e.spec.mjs", import.meta.url), "utf8");
+  const entry = edge.slice(edge.indexOf('test("S9 golden:'));
+  assert.ok(entry.indexOf("await withS9OwnedSchemaCleanup(rehearsal,")
+    < entry.indexOf("assertS9ChildCompleted(seeded.childCompletion)"));
+  assert.match(entry, /async \(kept\) => \{[\s\S]*?for \(const name of \[\.\.\.kept\]\.reverse\(\)\)/u);
+  assert.doesNotMatch(edge.slice(edge.indexOf("async function seededRehearsal()"), edge.indexOf('test("S9 golden:')),
+    /catch\(\(\) => undefined\)/u);
+});
+
+test("S9 private output preserves a bounded exact tail and its truncation fact", () => {
+  const bytes = Buffer.alloc(S9_DIAGNOSTIC_BYTES + 17, 120); bytes[bytes.length - 1] = 121;
+  const result = boundedS9ChildOutput(bytes);
+  assert.equal(result.originalBytes, bytes.length);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(result.bytes, bytes.subarray(17));
+  assert.equal(result.bytes.length, S9_DIAGNOSTIC_BYTES);
+  assert.deepEqual(boundedS9ChildOutput({ secret: "PRIVATE" }), { bytes: Buffer.alloc(0), originalBytes: 0, truncated: false });
+});
+
+test("S9 progress uses fixed stages, a monotonic clock, bounded numeric counters and a finite heartbeat", () => {
+  let time = 0, tick, interval, cancelled = 0;
+  const output = [];
+  const progress = createS9Progress("producer", { now: () => time, emit: (line) => output.push(JSON.parse(line)),
+    schedule: (callback, ms) => { tick = callback; interval = ms; return 7; },
+    cancel: (timer) => { assert.equal(timer, 7); cancelled++; } });
+  assert.equal(interval, 5_000);
+  tick(); assert.equal(output.length, 0);
+  progress.phase("admission");
+  progress.counts({ ownerOrdinal: 2, completedChunks: 3, iteration: 10_000_001,
+    completedDays: -1, scopeOrdinal: NaN, dayOrdinal: 1.5, phase: "PRIVATE", path: "/private/synthetic" });
+  time = 5_000; tick();
+  assert.deepEqual(output.at(-1), { event: "s9_rehearsal_progress", component: "producer", phase: "admission",
+    elapsedMs: 5_000, ownerOrdinal: 2, completedChunks: 3 });
+  assert.throws(() => progress.phase("PRIVATE"), /S9_PROGRESS_PHASE_INVALID/u);
+  progress.phase("native_probes");
+  assert.deepEqual(Object.keys(output.at(-1)), ["event", "component", "phase", "elapsedMs"]);
+  time = 100_000_000; tick(); assert.equal(output.at(-1).elapsedMs, 86_400_000);
+  for (let n = 0; n < 2_000; n++) tick();
+  assert.equal(output.length, 1_024);
+  assert.doesNotMatch(JSON.stringify(output), /PRIVATE|private\/synthetic/u);
+  progress.close(); progress.close(); tick();
+  assert.equal(cancelled, 1); assert.equal(output.length, 1_024);
+  assert.throws(() => createS9Progress("PRIVATE"), /S9_PROGRESS_COMPONENT_INVALID/u);
+  const broken = createS9Progress("controller", { emit: () => { throw new Error("sink unavailable"); },
+    schedule: () => 8, cancel: () => {} });
+  assert.doesNotThrow(() => broken.phase("current_d1_replay")); broken.close();
+});
+
+
+test("S9 executes exact owned-schema cleanup before a sanitized failed-child rejection", async () => {
+  const report = { reusedSchema: false, schema: "typed_legacy_transfer_rehearsal_target_fastpath_0123abcd",
+    keptSchemas: ["typed_legacy_transfer_rehearsal_target_fastpath_0123abcd", "typed_legacy_transfer_rehearsal_ctl_0123abcd"] };
+  const completion = (await captureS9ChildCompletion(async () => { throw { code: 2, message: "PRIVATE" }; })).metadata;
+  const events = [];
+  await assert.rejects(withS9OwnedSchemaCleanup(report, async (kept) => {
+    events.push("entered"); assert.deepEqual(kept, report.keptSchemas); assertS9ChildCompleted(completion);
+  }, async (kept) => {
+    for (const name of [...kept].reverse()) events.push(name);
+  }), (error) => { events.push("rejected"); return error.code === "S9_REHEARSAL_CHILD_FAILED"; });
+  assert.deepEqual(events, ["entered", ...report.keptSchemas.toReversed(), "rejected"]);
+  for (const invalid of [{}, { ...report, reusedSchema: true }, { ...report, schema: "private_schema" },
+    { ...report, keptSchemas: ["private_schema"] }, { ...report, keptSchemas: [...report.keptSchemas, report.schema] },
+    { ...report, keptSchemas: [report.schema, report.schema] }, { ...report, keptSchemas: null }]) {
+    let touched = false;
+    await assert.rejects(withS9OwnedSchemaCleanup(invalid, async () => { touched = true; }, async () => { touched = true; }));
+    assert.equal(touched, false, "unknown ownership cannot enter a work or cleanup callback");
+  }
+  const success = (await captureS9ChildCompletion(async () => ({ stdout: "", stderr: "" }))).metadata;
+  assert.equal(await withS9OwnedSchemaCleanup(report, async () => {
+    assertS9ChildCompleted(success); return "same result";
+  }, async () => events.push("successful cleanup")), "same result");
+  assert.equal(events.at(-1), "successful cleanup");
+  assert.deepEqual(ownedKeptRehearsalSchemas({ ...report, keptSchemas: [] }), [], "pre-PG errors own no schema");
+});
+
+test("S9 live progress preserves split records and heartbeats before child completion and closes exactly", async () => {
+  const stderr = new EventEmitter(), lines = [], buffered = [];
+  stderr.on("data", (chunk) => buffered.push(chunk));
+  const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(line));
+  const value = { event: "s9_rehearsal_progress", component: "producer", phase: "settle_cache", elapsedMs: 5_000, iteration: 3 };
+  const line = `${JSON.stringify(value)}\n`;
+  stderr.emit("data", Buffer.from(line.slice(0, 17)));
+  stderr.emit("data", Buffer.from(line.slice(17, 41)));
+  stderr.emit("data", Buffer.from(line.slice(41)));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lines.map((text) => JSON.parse(text)), [value], "the child has not exited, yet phase evidence is retained");
+  stderr.emit("data", line);
+  const first = await observer.close(), second = await observer.close();
+  assert.equal(first.records, 2); assert.equal(first.rejected, 0); assert.equal(first.preserved, true);
+  assert.equal(first.bytes, lines.reduce((sum, text) => sum + Buffer.byteLength(text), 0));
+  assert.deepEqual(second, first);
+  stderr.emit("data", line); assert.equal(lines.length, 2);
+  assert.equal(buffered.length, 5, "the observer does not consume or alter execFile's own stream");
+  assert.equal(stderr.listenerCount("data"), 1, "only the diagnostic observer is detached");
+});
+
+test("S9 live progress rejects raw, private, malformed, oversized and out-of-contract values", async () => {
+  const stderr = new EventEmitter(), lines = [];
+  const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(line));
+  const good = { event: "s9_rehearsal_progress", component: "controller", phase: "current_d1_replay", elapsedMs: 0 };
+  for (const value of [{ ...good, privatePath: "/private/SENSITIVE_CANARY" }, { ...good, phase: "SENSITIVE_CANARY" },
+    { ...good, component: "SENSITIVE_CANARY" }, { ...good, component: { toString: "SENSITIVE_CANARY" } },
+    { ...good, elapsedMs: -1 }, { ...good, elapsedMs: 86_400_001 }, { ...good, elapsedMs: 1.5 },
+    { ...good, iteration: "SENSITIVE_CANARY" }, { ...good, iteration: -1 }, { ...good, iteration: 10_000_001 },
+    { ...good, iteration: 1.5 }, { ...good, event: "SENSITIVE_CANARY" }, [], null, {}]) {
+    assert.doesNotThrow(() => stderr.emit("data", `${JSON.stringify(value)}\n`));
+  }
+  stderr.emit("data", "raw stderr /private/SENSITIVE_CANARY\nmalformed SENSITIVE_CANARY\n");
+  stderr.emit("data", "SENSITIVE_CANARY".repeat(100)); stderr.emit("data", "discarded remainder\n");
+  stderr.emit("data", Buffer.alloc(64 * 1024 + 1, 120)); stderr.emit("data", "\n");
+  stderr.emit("data", `${JSON.stringify(good)}\n`);
+  stderr.emit("data", '{"event":"SENSITIVE_CANARY"');
+  const result = await observer.close();
+  assert.equal(result.records, 1); assert.equal(result.preserved, true); assert.ok(result.rejected >= 19);
+  assert.deepEqual(lines.map((line) => JSON.parse(line)), [good]);
+  assert.doesNotMatch(lines.join(""), /SENSITIVE_CANARY|private/u);
+  assert.throws(() => observeS9ChildProgress({}, async () => {}), /S9_PROGRESS_STREAM_INVALID/u);
+});
+
+test("S9 live progress file and record caps remain finite and write failures are explicit", async () => {
+  for (const large of [false, true]) {
+    const stderr = new EventEmitter(), lines = [];
+    const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(line));
+    const value = { event: "s9_rehearsal_progress", component: "producer", phase: "admission", elapsedMs: 0,
+      ...(large ? Object.fromEntries(["iteration", "completedSteps", "scopeOrdinal", "ownerOrdinal", "dayOrdinal",
+        "chunkOrdinal", "completedOwners", "completedDays", "completedChunks"].map((key) => [key, 10_000_000])) : {}) };
+    for (let n = 0; n < 2_000; n++) stderr.emit("data", `${JSON.stringify(value)}\n`);
+    const result = await observer.close();
+    assert.ok(result.records <= 1_024 && result.bytes <= S9_DIAGNOSTIC_BYTES);
+    assert.ok(result.rejected > 0); assert.equal(result.preserved, true);
+    assert.equal(lines.length, result.records);
+    assert.equal(result.bytes, lines.reduce((sum, line) => sum + Buffer.byteLength(line), 0));
+    if (!large) assert.equal(result.records, 1_024); else assert.ok(result.records < 1_024, "byte cap is exercised independently");
+  }
+  const stderr = new EventEmitter(); let writes = 0;
+  const observer = observeS9ChildProgress({ stderr }, async () => { writes++; throw new Error("PRIVATE_WRITE_FAILURE"); });
+  const line = `${JSON.stringify({ event: "s9_rehearsal_progress", component: "producer", phase: "oracle", elapsedMs: 0 })}\n`;
+  stderr.emit("data", line); stderr.emit("data", line);
+  const result = await observer.close(); assert.equal(result.preserved, false); assert.equal(writes, 1);
+  assert.equal(result.records, 0); assert.equal(result.bytes, 0); assert.equal(result.rejected, 2);
+  const partial = new EventEmitter(), retained = []; let attempts = 0;
+  const prefix = observeS9ChildProgress({ stderr: partial }, async (text) => {
+    if (++attempts === 2) throw new Error("PRIVATE_WRITE_FAILURE"); retained.push(text);
+  });
+  partial.emit("data", line); partial.emit("data", line); partial.emit("data", line);
+  const prefixResult = await prefix.close();
+  assert.equal(prefixResult.preserved, false); assert.equal(attempts, 2);
+  assert.equal(prefixResult.records, retained.length); assert.equal(prefixResult.records, 1);
+  assert.equal(prefixResult.bytes, Buffer.byteLength(retained.join(""))); assert.equal(prefixResult.rejected, 2);
+});
+
+
+test("S9 live progress enforces monotonic clocks separately for interleaved components", async () => {
+  const stderr = new EventEmitter(), lines = [];
+  const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(JSON.parse(line)));
+  const send = (component, elapsedMs) => stderr.emit("data", `${JSON.stringify({ event: "s9_rehearsal_progress",
+    component, phase: component === "producer" ? "oracle" : "current_d1_replay", elapsedMs })}\n`);
+  send("controller", 5_000); send("producer", 0); send("producer", 5_000);
+  send("producer", 0); send("controller", 1_000); send("controller", 5_000); send("producer", 5_001);
+  const result = await observer.close();
+  assert.equal(result.records, 5); assert.equal(result.rejected, 2); assert.equal(result.preserved, true);
+  assert.deepEqual(lines.map(({ component, elapsedMs }) => [component, elapsedMs]),
+    [["controller", 5_000], ["producer", 0], ["producer", 5_000], ["controller", 5_000], ["producer", 5_001]]);
+});
+
+
+test("S9 successful cleanup preserves only a bounded exact closed progress journal", async () => {
+  const values = [{ event: "s9_rehearsal_progress", component: "producer", phase: "oracle", elapsedMs: 5_000 },
+    { event: "s9_rehearsal_progress", component: "controller", phase: "current_d1_replay", elapsedMs: 0 }];
+  const bytes = Buffer.from(values.map((value) => `${JSON.stringify(value)}\n`).join(""));
+  const receipt = { records: 2, bytes: bytes.length, preserved: true };
+  assert.deepEqual(validateS9ProgressJournal(bytes, receipt), values);
+  assert.deepEqual(validateS9ProgressJournal(Buffer.alloc(0), { records: 0, bytes: 0, preserved: true }), []);
+  for (const changed of [{ ...receipt, preserved: false }, { ...receipt, records: 1 },
+    { ...receipt, records: 1_025 }, { ...receipt, bytes: bytes.length + 1 }]) {
+    assert.throws(() => validateS9ProgressJournal(bytes, changed));
+  }
+  for (const content of ["raw SENSITIVE_CANARY\n", '{"privatePath":"SENSITIVE_CANARY"}\n',
+    JSON.stringify(values[0]), `${JSON.stringify(values[0])}\n${JSON.stringify({ ...values[0], elapsedMs: 0 })}\n`,
+    `${JSON.stringify({ ...values[0], iteration: 10_000_001 })}\n`, "x".repeat(1_025) + "\n"]) {
+    const input = Buffer.from(content), records = content.endsWith("\n") ? content.split("\n").length - 1 : 1;
+    assert.throws(() => validateS9ProgressJournal(input, { records, bytes: input.length, preserved: true }));
+  }
+  assert.throws(() => validateS9ProgressJournal(Buffer.alloc(S9_DIAGNOSTIC_BYTES + 1),
+    { records: 0, bytes: S9_DIAGNOSTIC_BYTES + 1, preserved: true }));
+  const edge = await readFile(new URL("../postgres-test/edge-origin-e2e.spec.mjs", import.meta.url), "utf8");
+  const body = edge.slice(edge.indexOf("async function seededRehearsal()"), edge.indexOf('test("S9 golden:'));
+  const completion = body.indexOf('await preserve("s9-child-completion"');
+  const progress = body.indexOf('await preserve("s9-progress"');
+  const discard = body.indexOf('discardDirectory = completion.metadata.state === "completed" && artifactsPreserved');
+  const remove = body.indexOf('await rm(directory,');
+  assert.ok(completion >= 0 && progress > completion && discard > progress && remove > discard,
+    "successful directory deletion occurs only after requested wx diagnostic sidecars are preserved");
 });

@@ -165,6 +165,8 @@ import {
   runPostgresV12Transfer,
 } from "./postgres-v12-transfer.mjs";
 
+import { createS9Progress } from "./s9-rehearsal-diagnostics.mjs";
+
 export const GCP_FASTPATH_REHEARSAL_REPORT_VERSION = "gcp-fastpath-rehearsal-report-v1";
 export const GCP_FASTPATH_CURRENT_REHEARSAL_REPORT_VERSION = "gcp-fastpath-current-rehearsal-report-v1";
 
@@ -1033,6 +1035,7 @@ export async function runRehearsal(options) {
     gates: {},
     timingsMs: timings,
   };
+  const progress = createS9Progress("controller");
   const pool = new pg.Pool(poolOptions(endpoint, 6, "gcp-fastpath-rehearsal"));
   pool.on("error", () => {});
   let origin = null;
@@ -1049,12 +1052,15 @@ export async function runRehearsal(options) {
       currentPostgresInputs = await currentPostgresInputBinding({ node22: options.node22, node22Version,
         stagedPrimary: options.stagedPrimary });
       report.currentPostgresInputs = currentPostgresInputs;
+      progress.phase("input_binding");
       currentReferenceBinding = await timed(timings, "current-d1:input-binding", captureCurrentQ1ReferenceBinding);
       const window = currentReferenceBinding.corpusStructure.window;
       if (golden.from !== window.fromDay || golden.to !== window.throughDay
         || nowMs !== currentReferenceBinding.runtime.pinnedNowMs
         || manifest.sourceCommit !== currentReferenceBinding.corpus.sourceCommit) fail("REHEARSAL_CURRENT_CORPUS_MISMATCH");
+      progress.phase("current_d1_replay");
       currentReference = await timed(timings, "current-d1:replay", runCurrentQ1D1Reference);
+      progress.phase("current_d1_acceptance");
       validateCurrentQ1ReferenceBinding({ reference: currentReference, expected: currentReferenceBinding });
       currentReferenceSha256 = createHash("sha256").update(JSON.stringify(currentReference)).digest("hex");
       const bindingSha256 = createHash("sha256").update(JSON.stringify(currentReferenceBinding)).digest("hex");
@@ -1081,6 +1087,7 @@ export async function runRehearsal(options) {
       }
       if (currentReference.qualification !== "complete") fail("REHEARSAL_CURRENT_REFERENCE_INCOMPLETE");
     }
+    progress.phase("postgres");
     const version = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
     if (Math.floor(version.rows[0].version / 10_000) !== 17) fail("REHEARSAL_POSTGRES_17_REQUIRED");
 
@@ -1091,6 +1098,7 @@ export async function runRehearsal(options) {
     } else {
       // 1. Fresh schemas, every promoted primary migration through the
       // production runner.
+      progress.phase("migrate");
       await timed(timings, "migrate", async () => {
         for (const name of [schema, controlSchema]) {
           await pool.query(`CREATE SCHEMA ${quoteIdentifier(name)}`);
@@ -1120,11 +1128,13 @@ export async function runRehearsal(options) {
       });
 
       // 2. The sealed SQLite rebuild of the oracle's USAGE_MONITOR_DB dump.
+      progress.phase("sqlite");
       workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-rehearsal-")));
       const sealed = await timed(timings, "sqlite", async () => sealFastpathRehearsalSource({ dumpPath, workDirectory }));
       report.steps.sqlite = sealed.report;
 
       // 3. Importers, in the plan's order (shared with the GCP seed).
+      progress.phase("importers");
       Object.assign(report.steps, await loadFastpathRehearsalImporters({
         pool, schema, controlSchema, suffix, sealedSource: sealed.sealedSource, dumpPath, workDirectory,
         roster: manifest.owners, timings,
@@ -1140,6 +1150,7 @@ export async function runRehearsal(options) {
     }
 
     // 4. analytics-refresh (dist, Node 22) at the golden's clock.
+    progress.phase("refresh_first");
     const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
       timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers,
       modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut });
@@ -1161,6 +1172,7 @@ export async function runRehearsal(options) {
     }
 
     // 5-6. The fastpath-test origin and the public read.
+    progress.phase("origin");
     origin = await timed(timings, "origin:start", async () => spawnOrigin({
       node: options.node22, endpoint, schema, nowMs,
     }));
@@ -1182,6 +1194,7 @@ export async function runRehearsal(options) {
     // 7. Parity. A dense golden's served read predates production's model and
     // preview publication, so its allowance families come from its per-date
     // expectation; every other family is the served read's.
+    progress.phase("parity");
     report.parity = await timed(timings, "parity", async () => (options.dense
       ? compareAnalyticsV2Parity({
         golden: { ...golden, ...PUBLISHED_ALLOWANCE_STATE, allowanceBreakdowns: perDateExpected.allowanceBreakdowns },
@@ -1210,6 +1223,7 @@ export async function runRehearsal(options) {
     }
 
     // 8. A second run at the same clock must create no revision.
+    progress.phase("refresh_second");
     const second = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
       timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers,
       modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut });
@@ -1231,6 +1245,7 @@ export async function runRehearsal(options) {
     // equality covers refusal fields in the served DTOs; sparse D1 native
     // probe evidence is not a matching PG kernel refusal protocol.
     report.runs = await refusalSummary(pool, schema);
+    progress.phase("source_recheck");
     if (currentReferenceCapture !== null) {
       const { validateCurrentQ1ReferenceBinding } = await import("../postgres-test/fixtures/current-q1-d1-reference.mjs");
       const after = await currentReferenceCapture();
@@ -1269,24 +1284,27 @@ export async function runRehearsal(options) {
       ...(typeof error?.code !== "string" ? { message: String(error?.message ?? error).slice(0, 300) } : {}),
     };
   } finally {
-    if (origin !== null) {
-      report.originExit = await origin.close().catch(() => null);
-    }
-    if (workDirectory !== null) await rm(workDirectory, { recursive: true, force: true });
-    if (options.reuseSchema !== null) {
-      report.keptSchemas = [schema, controlSchema];
-    } else if (!options.keepSchema) {
-      await timed(timings, "cleanup", async () => {
-        for (const name of [...created].reverse()) {
-          await pool.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(name)} CASCADE`).catch(() => {});
-        }
-      });
-      report.droppedSchemas = created.length;
-    } else {
-      report.keptSchemas = created;
-    }
-    await pool.end().catch(() => {});
-    report.finishedAt = new Date().toISOString();
+    progress.phase("cleanup");
+    try {
+      if (origin !== null) {
+        report.originExit = await origin.close().catch(() => null);
+      }
+      if (workDirectory !== null) await rm(workDirectory, { recursive: true, force: true });
+      if (options.reuseSchema !== null) {
+        report.keptSchemas = [schema, controlSchema];
+      } else if (!options.keepSchema) {
+        await timed(timings, "cleanup", async () => {
+          for (const name of [...created].reverse()) {
+            await pool.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(name)} CASCADE`).catch(() => {});
+          }
+        });
+        report.droppedSchemas = created.length;
+      } else {
+        report.keptSchemas = created;
+      }
+      await pool.end().catch(() => {});
+      report.finishedAt = new Date().toISOString();
+    } finally { progress.close(); }
   }
   const text = `${JSON.stringify(report, null, 2)}\n`;
   if (options.comparisonMode === "current-worker-d1") {

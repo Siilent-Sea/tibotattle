@@ -40,7 +40,7 @@ import { after, test } from "node:test";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -63,6 +63,8 @@ import {
   perDateExpectationFor,
   withheldModelDatesOf,
 } from "../scripts/analytics-v2-parity-compare.mjs";
+import { assertS9ChildCompleted, captureS9ChildCompletion, observeS9ChildProgress, ownedKeptRehearsalSchemas, readS9ChildReport, withS9OwnedSchemaCleanup, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS }
+  from "../scripts/s9-rehearsal-diagnostics.mjs";
 import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import {
   assertCurrentImageRuntime,
@@ -2332,16 +2334,6 @@ async function s9RehearsalNode() {
   return { node, runtime };
 }
 
-function ownedKeptRehearsalSchemas(report) {
-  assert.equal(report.reusedSchema, false, "S9 owns only a fresh rehearsal");
-  const match = /^typed_legacy_transfer_rehearsal_target_fastpath_([0-9a-f]{8})$/u.exec(report.schema);
-  assert.ok(match, "the fresh target has the generated rehearsal prefix and suffix");
-  const allowed = [report.schema, `typed_legacy_transfer_rehearsal_ctl_${match[1]}`];
-  assert.ok(Array.isArray(report.keptSchemas) && report.keptSchemas.length <= 2
-    && new Set(report.keptSchemas).size === report.keptSchemas.length
-    && report.keptSchemas.every((name) => allowed.includes(name)), "only this generated target/control pair is owned");
-  return report.keptSchemas;
-}
 
 async function preserveS9Artifact(suffix, value) {
   if (!process.env.EDGE_E2E_REPORT) return;
@@ -2444,33 +2436,73 @@ async function seededRehearsal() {
   const imageRuntime = CURRENT_Q1 ? await verifyCurrentImageRuntimePath(process.execPath) : null;
   const { node, runtime } = await s9RehearsalNode();
   const directory = await mkdtemp(join(tmpdir(), "edge-e2e-rehearsal-"));
+  await chmod(directory, 0o700);
   const out = join(directory, "report.json");
   let discardDirectory = false;
   let result = null;
   const staged = (await readdir(join(WORKER_ROOT, "postgres", "staged-migrations", "primary")).catch(() => []))
     .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name)).sort();
   try {
-    await execFileAsync(node,
-      [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
-        "--comparison-mode", S9_COMPARISON_MODE,
-        ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
-        ...staged.flatMap((name) => ["--staged-primary", name])], {
-        cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: 40 * 60_000,
-        env: { PATH: process.env.PATH, HOME: process.env.HOME, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
-          PG_TEST_PORT: String(PG_TEST_PORT), GCP_FASTPATH_NODE22: process.execPath,
-          ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
-          ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}) },
-      }).catch(() => undefined);
-    const report = JSON.parse(await readFile(out, "utf8"));
+    // This wx handle receives only parsed closed progress while the child runs.
+    const progressFile = await open(join(directory, "child-progress.jsonl"), "wx", 0o600);
+    let observer, liveProgress;
+    let completion;
+    try {
+      completion = await captureS9ChildCompletion(() => {
+        const pending = execFileAsync(node,
+          [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
+            "--comparison-mode", S9_COMPARISON_MODE,
+            ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
+            ...staged.flatMap((name) => ["--staged-primary", name])], {
+            cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: S9_REHEARSAL_DEADLINE_MS,
+            env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: directory, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
+              PG_TEST_PORT: String(PG_TEST_PORT), GCP_FASTPATH_NODE22: process.execPath,
+              ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
+              ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}) },
+          });
+        observer = observeS9ChildProgress(pending.child, (line) => progressFile.writeFile(line));
+        return pending;
+      });
+    } finally {
+      let progressFailed = false;
+      try { liveProgress = await observer?.close(); } catch { progressFailed = true; }
+      try { await progressFile.close(); } catch { progressFailed = true; }
+      if (progressFailed) liveProgress = { records: liveProgress?.records ?? 0, bytes: liveProgress?.bytes ?? 0,
+        rejected: liveProgress?.rejected ?? 0, preserved: false };
+    }
+    // Raw child output remains solely in this owner-private local directory.
+    // Preserve failures before attempting a report; missing sidecars keep it intact.
+    let failureOutputPreserved = liveProgress?.preserved === true;
+    if (completion.metadata.state === "failed") {
+      try {
+        await writeFile(join(directory, "child-completion.json"), `${JSON.stringify({ ...completion.metadata,
+          stdout: { originalBytes: completion.stdout.originalBytes, truncated: completion.stdout.truncated },
+          stderr: { originalBytes: completion.stderr.originalBytes, truncated: completion.stderr.truncated } })}\n`,
+        { flag: "wx", mode: 0o600 });
+        for (const stream of ["stdout", "stderr"]) await writeFile(join(directory, `child-${stream}.log`),
+          completion[stream].bytes, { flag: "wx", mode: 0o600 });
+      } catch { failureOutputPreserved = false; }
+    }
+    const report = await readS9ChildReport(out, completion.metadata);
     assert.ok(report && typeof report === "object" && !Array.isArray(report), "a controller report is required");
     ownedKeptRehearsalSchemas(report);
-    let artifactsPreserved = true;
+    let artifactsPreserved = failureOutputPreserved;
     // Return the parsed report even when preservation fails so the caller can
     // close this controller's exact kept schemas before failing the test.
     const preserve = async (suffix, value) => {
       try { await preserveS9Artifact(suffix, value); } catch { artifactsPreserved = false; }
     };
     await preserve("s9-rehearsal", report);
+    await preserve("s9-child-completion", { schemaVersion: "s9-rehearsal-child-completion-v1",
+      child: completion.metadata, liveProgress });
+    try {
+      const progressPath = join(directory, "child-progress.jsonl"), metadata = await lstat(progressPath);
+      assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1
+        && metadata.uid === process.getuid() && (metadata.mode & 0o077) === 0 && metadata.size <= S9_DIAGNOSTIC_BYTES,
+      "the bounded progress journal remains an owner-private regular file");
+      const records = validateS9ProgressJournal(await readFile(progressPath), liveProgress);
+      await preserve("s9-progress", { schemaVersion: "s9-rehearsal-progress-v1", records });
+    } catch { artifactsPreserved = false; }
     let evidence = null;
     if (CURRENT_Q1) {
       // Parse and preserve the producer's original sidecars before removing the
@@ -2484,8 +2516,9 @@ async function seededRehearsal() {
       if (values.every(({ status }) => status === "fulfilled")) evidence = {
         reference: values[0].value, binding: values[1].value, acceptance: values[2].value };
     }
-    discardDirectory = artifactsPreserved && (!CURRENT_Q1 || evidence !== null);
-    result = { report, evidence, runtime, imageRuntime, staged, artifactsPreserved, temporaryOutputRemoved: false };
+    discardDirectory = completion.metadata.state === "completed" && artifactsPreserved && (!CURRENT_Q1 || evidence !== null);
+    result = { report, evidence, runtime, imageRuntime, staged, artifactsPreserved,
+      childCompletion: completion.metadata, liveProgress, temporaryOutputRemoved: false };
     return result;
   } finally {
     // Keep the sole private diagnostic bytes if ownership or any required
@@ -2510,11 +2543,10 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
   const manifest = JSON.parse(await readFile(join(GOLDEN, "manifest.json"), "utf8"));
   const seeded = await seededRehearsal();
   const rehearsal = seeded.report;
-  let kept = [];
   let origin = null;
   let instance = null;
-  try {
-    kept = ownedKeptRehearsalSchemas(rehearsal);
+  await withS9OwnedSchemaCleanup(rehearsal, async (kept) => {
+    assertS9ChildCompleted(seeded.childCompletion);
     assert.equal(seeded.artifactsPreserved, true, "requested evidence is preserved without overwriting an existing artifact");
     assert.equal(seeded.temporaryOutputRemoved, true, "complete producer evidence was read and owned temporary output was removed");
     assert.notEqual(rehearsal.status, "error", JSON.stringify(rehearsal.error ?? null));
@@ -2627,7 +2659,7 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.ok(capabilities.length >= 1 && capabilities.every(({ status }) => status === 200), JSON.stringify(writes));
     assert.ok(writes.some(({ path, status }) => path === "/api/v1/me/telemetry-v12/domain-activate" && status === 201));
     f.rows.push({ stage: "S9", id: "golden-write-tier", statuses: writes.map(({ id, status }) => [id, status]) });
-  } finally {
+  }, async (kept) => {
     await instance?.dispose().catch(() => {});
     await origin?.close().catch(() => {});
     for (const name of [...kept].reverse()) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
@@ -2636,7 +2668,7 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
         [kept]);
       assert.deepEqual(remaining.rows, [], "the exact owned generated schemas are independently absent");
     }
-  }
+  });
 });
 
 // ---------------------------------------------------------------------------

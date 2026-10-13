@@ -21,6 +21,8 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { createS9Progress } from "../../scripts/s9-rehearsal-diagnostics.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(HERE, "../..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
@@ -161,7 +163,7 @@ async function sourceSnapshot() {
   };
   for (const path of ["src", "node_modules/@app-usagemonitor", "test/helpers/telemetry-v11.ts",
     "package.json", "package-lock.json", "wrangler.jsonc", "cloud-run/sealed-sqlite-d1-adapter.mjs",
-    "postgres-test/fixtures/current-q1-d1-reference.mjs", ...INGESTION_MIGRATIONS,
+    "postgres-test/fixtures/current-q1-d1-reference.mjs", "scripts/s9-rehearsal-diagnostics.mjs", ...INGESTION_MIGRATIONS,
     "analytics-migrations", "deletion-ledger-migrations"]) await collect(join(WORKER_ROOT, path));
   const files = [];
   for (const path of paths.sort()) files.push({ path: relative(REPOSITORY_ROOT, path), sha256: sha(await boundedFile(path)) });
@@ -497,19 +499,20 @@ async function seedCorpus(ctx, owners) {
     const ready = [];
     for (const [dayIndex, { day, records }] of days.entries()) {
       diagnostic.progress.dayOrdinal = dayIndex + 1; diagnostic.progress.chunkOrdinal = 0;
+      ctx.progress.counts(diagnostic.progress);
       const prepared = await P.makeV11Day(day, records, "synthetic-gcp-oracle-v11");
       await P.registerTelemetryV11DayManifest(ingestion, principal, prepared.manifest);
       for (const [chunkIndex, chunk] of prepared.chunks.entries()) {
-        diagnostic.progress.chunkOrdinal = chunkIndex + 1;
+        diagnostic.progress.chunkOrdinal = chunkIndex + 1; ctx.progress.counts(diagnostic.progress);
         await P.persistTypedV11StagedChunk(ingestion, principal, chunk,
           { sourceNamespace: NAMESPACE, ...await coordinates(principal,
             `v11:${principal.participantId}:${day}:${chunk.chunkId}:${chunk.manifestDigest}`) });
-        diagnostic.progress.completedChunks++;
+        diagnostic.progress.completedChunks++; ctx.progress.counts(diagnostic.progress);
       }
       ready.push(await P.registerTelemetryV11DayManifest(ingestion, principal, prepared.manifest));
       admissions.push({ participantId: principal.participantId, format: "v11", day,
         manifestDigest: prepared.manifest.manifestDigest, chunks: prepared.manifest.chunks });
-      diagnostic.progress.completedDays++;
+      diagnostic.progress.completedDays++; ctx.progress.counts(diagnostic.progress);
     }
     const predecessor = await P.createTelemetryV11DomainPredecessor(ingestion, principal, CURRENT_Q1_REFERENCE_NOW_MS);
     const domain = { schemaVersion: "telemetry-domain-manifest-v1.1", fromDay: ready[0].day,
@@ -523,9 +526,10 @@ async function seedCorpus(ctx, owners) {
     const ready = [], consent = P.telemetryV12RequiredConsent();
     for (const [dayIndex, { day, records }] of days.entries()) {
       diagnostic.progress.dayOrdinal = dayIndex + 1; diagnostic.progress.chunkOrdinal = 0;
+      ctx.progress.counts(diagnostic.progress);
       const chunks = [];
       for (const stream of STREAMS) for (let offset = 0; offset < records[stream].length; offset += 200) {
-        diagnostic.progress.chunkOrdinal = chunks.length + 1;
+        diagnostic.progress.chunkOrdinal = chunks.length + 1; ctx.progress.counts(diagnostic.progress);
         const rows = records[stream].slice(offset, offset + 200);
         chunks.push({ schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64),
           chunkId: `${stream}:${day}:${offset / 200}`, chunkRevision: 1,
@@ -538,7 +542,7 @@ async function seedCorpus(ctx, owners) {
       manifest.manifestDigest = await P.sha256Hex(P.telemetryV12DayManifestDigestInput(manifest));
       await P.registerTelemetryV12DayManifest(ingestion, principal, manifest);
       for (const [chunkIndex, chunk] of chunks.entries()) {
-        diagnostic.progress.chunkOrdinal = chunkIndex + 1;
+        diagnostic.progress.chunkOrdinal = chunkIndex + 1; ctx.progress.counts(diagnostic.progress);
         chunk.manifestDigest = manifest.manifestDigest;
         P.parseTelemetryV12Chunk(chunk);
         const metadata = await coordinates(principal,
@@ -547,12 +551,12 @@ async function seedCorpus(ctx, owners) {
         await P.putTrackedQuarantineObject(ingestion, ctx.objects, { contributionId: metadata.chunkRowId,
           objectKind: "telemetry", r2Key: metadata.r2Key, registeredAt: new Date().toISOString() }, "synthetic v1.2 bytes");
         await P.persistTelemetryV12StagedChunk(ingestion, principal, chunk, metadata);
-        diagnostic.progress.completedChunks++;
+        diagnostic.progress.completedChunks++; ctx.progress.counts(diagnostic.progress);
       }
       ready.push(await P.registerTelemetryV12DayManifest(ingestion, principal, manifest));
       admissions.push({ participantId: principal.participantId, format: "v12", day,
         manifestDigest: manifest.manifestDigest, chunks: manifest.chunks });
-      diagnostic.progress.completedDays++;
+      diagnostic.progress.completedDays++; ctx.progress.counts(diagnostic.progress);
     }
     const predecessor = await P.createTelemetryV12DomainPredecessor(ingestion, principal, CURRENT_Q1_REFERENCE_NOW_MS);
     const domain = { schemaVersion: "telemetry-domain-manifest-v1.2", fromDay: ready[0].day, throughDay: ready.at(-1).day,
@@ -565,13 +569,14 @@ async function seedCorpus(ctx, owners) {
   const insertV1 = async (principal, days) => {
     for (const [dayIndex, { day, records }] of days.entries()) {
       diagnostic.progress.dayOrdinal = dayIndex + 1; diagnostic.progress.chunkOrdinal = 0;
+      ctx.progress.counts(diagnostic.progress);
       for (const stream of STREAMS) {
         const rows = records[stream].map((record) => {
           const projected = P.telemetryV11LegacyProjection(stream, record);
           requireFact(projected !== null, "CURRENT_Q1_ADMISSION_FAILED"); return JSON.parse(projected.canonicalRecord);
         });
         for (let offset = 0; offset < rows.length; offset += 200) {
-          diagnostic.progress.chunkOrdinal++;
+          diagnostic.progress.chunkOrdinal++; ctx.progress.counts(diagnostic.progress);
           const page = rows.slice(offset, offset + 200), seq = offset / 200;
           const chunk = P.parseTelemetryV1Chunk({ schemaVersion: "telemetry-contribution-v1.0", chunkId: `${stream}:${day}:${seq}`,
             chunkRevision: 1, chunkDigest: await P.sha256Hex(P.canonicalJson(page)), parserVersion: "synthetic-gcp-oracle-v1",
@@ -584,15 +589,16 @@ async function seedCorpus(ctx, owners) {
             createdAt: new Date().toISOString(), supersedes: null }, NAMESPACE);
           admissions.push({ participantId: principal.participantId, format: "v1", day,
             chunkDigest: chunk.chunkDigest, stream, records: page.length });
-          diagnostic.progress.completedChunks++;
+          diagnostic.progress.completedChunks++; ctx.progress.counts(diagnostic.progress);
         }
       }
-      diagnostic.progress.completedDays++;
+      diagnostic.progress.completedDays++; ctx.progress.counts(diagnostic.progress);
     }
   };
   for (const [ownerIndex, owner] of owners.entries()) {
     diagnostic.progress.ownerOrdinal = ownerIndex + 1;
     diagnostic.progress.dayOrdinal = 0; diagnostic.progress.chunkOrdinal = 0;
+    ctx.progress.counts(diagnostic.progress);
     if (owner.kind === "accountless") {
       const principal = await accountless(owner); await pinOwner(owner); await stageV11(principal, owner.days);
     } else if (owner.key === "c") {
@@ -610,7 +616,7 @@ async function seedCorpus(ctx, owners) {
       if (owner.key === "a") await insertV1(await P.createV11DeviceFixture(ingestion,
         { participantId: owner.participantId }), extras);
     }
-    diagnostic.progress.completedOwners++;
+    diagnostic.progress.completedOwners++; ctx.progress.counts(diagnostic.progress);
   }
   return admissions;
 }
@@ -619,6 +625,7 @@ const bindings = (ctx) => ({ source: ctx.ingestion, target: ctx.analytics,
   sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE });
 
 async function settle(ctx) {
+  ctx.progress.phase("settle_bootstrap");
   let bootstrap = false;
   for (let n = 0; n < BOUNDS.bootstrap; n++) if ((await ctx.P.drainCommunityPublicSourceBootstrap(ctx.ingestion)).completed) {
     bootstrap = true; break;
@@ -627,21 +634,31 @@ async function settle(ctx) {
   let settled = false;
   for (let round = 0; round < BOUNDS.settleRounds; round++) {
     let delivered = false, published = false;
+    ctx.progress.phase("settle_delivery");
+    ctx.progress.counts({ iteration: round + 1 });
     for (let n = 0; n < BOUNDS.delivery; n++) {
+      ctx.progress.counts({ iteration: n + 1 });
       const step = await ctx.P.advanceStorageAnalytics(bindings(ctx));
       if (step.state === "idle") break;
       delivered = true;
     }
+    ctx.progress.phase("settle_daily");
+    ctx.progress.counts({ iteration: round + 1 });
     for (const preferStaleHead of [false, true]) for (let n = 0; n < BOUNDS.daily; n++) {
+      ctx.progress.counts({ iteration: n + 1 });
       const step = await ctx.P.advanceNextStorageCommunityDaily({ ...bindings(ctx), preferStaleHead, nowMs: CURRENT_Q1_REFERENCE_NOW_MS });
       if (step.state === "idle") break;
       published = true;
     }
+    ctx.progress.phase("settle_retirement");
+    ctx.progress.counts({ iteration: round + 1 });
     for (let n = 0; n < BOUNDS.dailyRetirement; n++) if (await ctx.P.retireStorageCommunityDailyPage(bindings(ctx)) === 0) break;
     if (!delivered && !published) { settled = true; break; }
   }
   requireFact(settled, "CURRENT_Q1_NOT_SETTLED");
+  ctx.progress.phase("settle_cache");
   for (let n = 0; n < BOUNDS.cachePasses; n++) {
+    ctx.progress.counts({ iteration: n + 1 });
     const step = await ctx.P.advanceCacheRetentionDayLane({ target: ctx.analytics, sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID,
       build: ctx.P.createCacheRetentionDaySourceBuild({ ...bindings(ctx), now: () => CURRENT_Q1_REFERENCE_NOW_MS }),
       // Matches the maintained export fixture, rather than changing a production budget.
@@ -932,14 +949,16 @@ async function missingScopes(ctx, corpus, oracle) {
       FROM analytics_history_checkpoint_stages`),
     ctx.analytics.prepare(`SELECT COUNT(*) AS n,COALESCE(SUM(payload_bytes),0) AS bytes FROM analytics_history_checkpoint_parts`),
   ])).map((result) => result.results);
-  for (const { owner, metric, day } of scopes) {
+  for (const [scopeIndex, { owner, metric, day }] of scopes.entries()) {
     const item = { owner: ownerKey.get(owner.ownerDigest), metric, day, state: "unresolved", invocations: 0 };
     requireFact(["a", "b", "c", "d"].includes(item.owner), "CURRENT_Q1_ADMISSION_FAILED");
     try {
+      ctx.progress.counts({ scopeOrdinal: scopeIndex + 1, iteration: 0 });
       const scope = await ctx.P.captureStorageGraphScope(ctx.ingestion, { owner, metric, day,
         sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE, preparedFold: false });
       let previous = jsonSha(await progress()), stall = 0;
       for (let n = 0; n < BOUNDS.nativeInvocations; n++) {
+        ctx.progress.counts({ scopeOrdinal: scopeIndex + 1, iteration: n + 1 });
         const outcome = await ctx.P.computeStorageGraphResult(bindings(ctx), scope,
           { preparedFold: false, now: () => CURRENT_Q1_REFERENCE_NOW_MS });
         item.invocations++;
@@ -980,14 +999,15 @@ async function missingScopes(ctx, corpus, oracle) {
 export async function runCurrentQ1D1Reference() {
   requireFact(!held, "CURRENT_Q1_BUSY"); held = true;
   let root, identity, vite, restore;
+  const progress = createS9Progress("producer");
   let phase = "source_provenance";
+  const enter = (value) => { phase = value; progress.phase(value); };
   let admissionTrace;
   const handles = [];
   try {
-    phase = "runtime";
-    phase = "source_provenance";
+    enter("source_provenance");
     const expected = await captureCurrentQ1ReferenceBinding(), { runtime, source } = expected;
-    phase = "runtime";
+    enter("runtime");
     const { DatabaseSync } = await import("node:sqlite");
     const { createServer } = await import("vite");
     const { openSealedSqliteD1 } = await import("../../cloud-run/sealed-sqlite-d1-adapter.mjs");
@@ -996,21 +1016,21 @@ export async function runCurrentQ1D1Reference() {
     await chmod(root, 0o700); identity = await lstat(root);
     requireFact(identity.isDirectory() && !identity.isSymbolicLink() && identity.uid === process.getuid()
       && (identity.mode & 0o077) === 0, "CURRENT_Q1_SCRATCH_INVALID");
-    phase = "module_load";
+    enter("module_load");
     vite = await createServer({ root: WORKER_ROOT, configFile: false, appType: "custom", logLevel: "silent",
       server: { middlewareMode: true, hmr: false, ws: false, watch: null } });
     const P = await loadCurrent(vite);
-    phase = "corpus_validation";
+    enter("corpus_validation");
     const corpus = await corpusInput(P), migrations = [];
     admissionTrace = admissionDiagnostic(P);
-    const ctx = { P, admissionDiagnostic: admissionTrace, objects: inertObjectStore() };
+    const ctx = { P, progress, admissionDiagnostic: admissionTrace, objects: inertObjectStore() };
     const paths = {};
     for (const role of ["ingestion", "analytics", "ledger"]) {
       paths[role] = join(root, `${role}.sqlite`);
       const handle = openSealedSqliteD1(paths[role], { create: true, pinnedNowMs: CURRENT_Q1_REFERENCE_NOW_MS });
       handles.push(handle); ctx[role] = handle.database; await chmod(paths[role], 0o600);
     }
-    phase = "migrations";
+    enter("migrations");
     for (const directory of INGESTION_MIGRATIONS.slice(0, 4)) await applyMigrations(ctx.ingestion, directory, migrations);
     await applyMigrations(ctx.analytics, "analytics-migrations", migrations);
     await applyMigrations(ctx.ledger, "deletion-ledger-migrations", migrations);
@@ -1027,26 +1047,26 @@ export async function runCurrentQ1D1Reference() {
     const runtimeContracts = await ctx.ingestion.prepare(`SELECT a.runtime_contract_version AS v1,b.runtime_contract_version AS v11
       FROM typed_v1_admission_state a JOIN typed_v11_admission_state b ON b.id=a.id WHERE a.id=1`).first();
     requireFact(runtimeContracts?.v1 === 1 && runtimeContracts?.v11 === 1, "CURRENT_Q1_ADMISSION_FAILED");
-    phase = "admission";
+    enter("admission");
     const admissions = await seedCorpus(ctx, corpus.owners);
-    phase = "settle"; await settle(ctx);
+    enter("settle"); await settle(ctx);
     const cohort = await P.readStorageCommunityOwnerPage(ctx.ingestion, { limit: 5 });
     requireFact(cohort.length === 4 && cohort.every((owner) => corpus.owners.some((expected) =>
       expected.participantId === owner.participantId && expected.pinnedOwnerDigest === owner.ownerDigest)), "CURRENT_Q1_ADMISSION_FAILED");
-    phase = "public_before";
+    enter("public_before");
     const beforeForcedRecompute = await responseDTO(ctx, corpus);
     const steps = [];
-    phase = "oracle";
+    enter("oracle");
     const oracle = await P.runD1AnalyticsExportOracle({ ingestion: ctx.ingestion, analytics: ctx.analytics, ledger: ctx.ledger,
       pinnedNowMs: CURRENT_Q1_REFERENCE_NOW_MS, sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE,
       cacheRetentionFromDay: null, foldHistory: [{ value: "disabled", fromMs: 1_700_000_000_000, untilMs: null }],
-      moduleDigest: source.sha256, onStep: (step, counts) => steps.push({ step, counts }) });
-    phase = "public_after";
+      moduleDigest: source.sha256, onStep: (step, counts) => { steps.push({ step, counts }); progress.counts({ completedSteps: steps.length }); } });
+    enter("public_after");
     const afterForcedRecompute = await responseDTO(ctx, corpus);
-    phase = "native_probes";
+    enter("native_probes");
     const nativeEvidence = await missingScopes(ctx, corpus, oracle);
     const afterNativeProbes = await responseDTO(ctx, corpus);
-    phase = "source_recheck";
+    enter("source_recheck");
     const after = await sourceSnapshot();
     requireFact(after.head === source.head && after.sha256 === source.sha256, "CURRENT_Q1_SOURCE_CHANGED");
     for (const migration of migrations) requireFact(sha(await boundedFile(join(REPOSITORY_ROOT, migration.path))) === migration.sha256,
@@ -1073,6 +1093,7 @@ export async function runCurrentQ1D1Reference() {
     enumerable: false, writable: false, configurable: false });
     throw closed;
   } finally {
+    enter("cleanup");
     let cleanupFailed = false;
     try {
       for (const handle of handles.reverse()) {
@@ -1088,7 +1109,7 @@ export async function runCurrentQ1D1Reference() {
           "CURRENT_Q1_CLEANUP_FAILED");
           await rm(root, { recursive: true });
         }
-      } finally { restore?.(); held = false; }
+      } finally { restore?.(); held = false; progress.close(); }
     }
     requireFact(!cleanupFailed, "CURRENT_Q1_CLEANUP_FAILED");
   }
