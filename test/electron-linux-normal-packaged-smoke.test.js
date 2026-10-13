@@ -330,7 +330,7 @@ function sourceCandidate({ sourceRevision = SOURCE_REVISION, version = "0.1.0" }
     version,
     stagingDirectory: ".release-build/electron-production/linux-x64/app",
     builderConfiguration: "apps/electron/electron-builder.production.config.cjs",
-    updaterEnabled: true,
+    updaterEnabled: false,
     signingRequired: false,
     signingPerformed: false,
     publishingPerformed: false,

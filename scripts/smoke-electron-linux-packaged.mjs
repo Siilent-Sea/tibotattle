@@ -393,7 +393,7 @@ function validateSourceCandidate(value, sourceRevision) {
       || value.sourceRevision !== sourceRevision
       || value.stagingDirectory !== ".release-build/electron-production/linux-x64/app"
       || value.builderConfiguration !== "apps/electron/electron-builder.production.config.cjs"
-      || value.updaterEnabled !== true || value.signingRequired !== false
+      || value.updaterEnabled !== false || value.signingRequired !== false
       || value.signingPerformed !== false || value.publishingPerformed !== false) {
     fail("SOURCE_CANDIDATE_INVALID");
   }

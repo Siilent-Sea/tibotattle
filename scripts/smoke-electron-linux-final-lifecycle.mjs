@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Exact public predecessor -> final candidate, ordinary FUSE launcher only.
+import distribution from "../config/electron-production-distribution.cjs";
 import { spawn, spawnSync } from 'node:child_process';
 import { constants, createReadStream } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, readFile, readdir, readlink, rename, rm, unlink } from 'node:fs/promises';
@@ -495,6 +496,7 @@ export async function runLinuxFinalNormalJourney({ run, readIdentity, assertSand
   return identity;
 }
 export async function runLinuxFinalLifecycle() {
+  if (distribution.PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS.length === 0) fail("UPDATE_TRUST_UNPROVISIONED");
   const contract = assertContainerContract();
   const nonce = process.env.TIBOTATTLE_LINUX_FINAL_NONCE, temporary = linuxFinalTemporary(nonce);
   const sampleLinuxStartupFuseMount = () => sampleLinuxMountProbeFacts(temporary);

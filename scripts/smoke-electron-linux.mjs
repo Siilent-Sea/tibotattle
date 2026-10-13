@@ -26,6 +26,7 @@ import { once } from "node:events";
 import { createServer, isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { createLinuxStartupDiagnostics } from "./lib/linux-startup-diagnostics.mjs";
+import { createAuthorizedRendererFetch, fetchRendererJson } from "./lib/authorized-renderer-fetch.mjs";
 
 import {
   DESKTOP_FIRST_RUN_RECEIPT_FILE_NAME,
@@ -525,7 +526,7 @@ export function validateRendererReadinessDiagnostics(value) {
 
 /** Probe only the fixed split dashboard reads after their original readiness failure. */
 export async function probeRendererReadinessPrimaryApis(origin, {
-  fetchImpl = globalThis.fetch,
+  fetchImpl,
   timeoutMs = RENDERER_READINESS_DIAGNOSTIC_PROBE_MS,
 } = {}) {
   if (typeof origin !== "string" || typeof fetchImpl !== "function"
@@ -677,7 +678,7 @@ async function readRendererCompanionSnapshot(origin, {
  * requests themselves never replace that last safe state.
  */
 export function createRendererReadinessCompanionSnapshotObserver(origin, {
-  fetchImpl = globalThis.fetch,
+  fetchImpl,
   pollIntervalMs = RENDERER_READINESS_COMPANION_HEALTH_POLL_MS,
   requestTimeoutMs = RENDERER_READINESS_COMPANION_HEALTH_REQUEST_MS,
   maximumBytes = RENDERER_READINESS_COMPANION_HEALTH_MAX_BODY_BYTES,
@@ -1856,6 +1857,7 @@ export function observeLocalRefreshRequests(cdp) {
  * only proves the real renderer startup request and its terminal receipt.
  */
 async function assertAutomaticStartupRefresh({
+  cdp,
   child,
   dashboardUrl,
   refreshObserver,
@@ -1889,7 +1891,7 @@ async function assertAutomaticStartupRefresh({
       if (noReceiptDecision.status === "failed") failFixed(noReceiptDecision.errorCode);
       let status;
       try {
-        status = await jsonFetch(refreshUrl);
+        status = await fetchRendererJson(cdp, refreshUrl, { timeoutMs: MAX_OPERATION_MS, maximumBytes: MAX_JSON_RESPONSE_BYTES });
       } catch (error) {
         acceptanceTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
           phase: "acceptance", requestCount: requests.length, refresh: { status: "unavailable" },
@@ -1942,7 +1944,7 @@ async function assertAutomaticStartupRefresh({
       }
       let status;
       try {
-        status = await jsonFetch(refreshUrl);
+        status = await fetchRendererJson(cdp, refreshUrl, { timeoutMs: MAX_OPERATION_MS, maximumBytes: MAX_JSON_RESPONSE_BYTES });
       } catch (error) {
         completionTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
           phase: "completion", requestCount: requests.length, refresh: { status: "unavailable" },
@@ -2247,6 +2249,7 @@ export async function runSmoke({
     }
     companionSnapshotObserver = createRendererReadinessCompanionSnapshotObserver(
       selectedDashboardUrl.origin,
+      { fetchImpl: createAuthorizedRendererFetch(cdp, { timeoutMs: RENDERER_READINESS_COMPANION_HEALTH_REQUEST_MS, maximumBytes: RENDERER_READINESS_COMPANION_HEALTH_MAX_BODY_BYTES }) },
     );
     await cdp.request("Runtime.enable");
     selectRequiredRefreshLoader(refreshObserver, await waitFor(
@@ -2287,7 +2290,7 @@ export async function runSmoke({
       fail("dashboard origin was not accepted as the validated loopback origin");
     }
     failureStage = "renderer_health";
-    const health = await jsonFetch(new URL("/api/local/health", dashboardUrl));
+    const health = await fetchRendererJson(cdp, new URL("/api/local/health", dashboardUrl), { timeoutMs: MAX_OPERATION_MS, maximumBytes: MAX_JSON_RESPONSE_BYTES });
     if (health.status !== "ready") fail("companion health was not ready");
     failureStage = "renderer_resource";
     const remoteResources = ready.resources.filter((resource) => {
@@ -2305,6 +2308,7 @@ export async function runSmoke({
     await assertRendererShell(cdp);
     failureStage = "initial_refresh";
     const initialStartupRefresh = await assertAutomaticStartupRefresh({
+      cdp,
       child,
       dashboardUrl,
       refreshObserver,
@@ -2320,7 +2324,7 @@ export async function runSmoke({
 
     failureStage = "reload_refresh";
     resourceDiagnostics.setReloadSubstage("previous_status");
-    const previousStatus = await jsonFetch(new URL("/api/local/refresh", dashboardUrl));
+    const previousStatus = await fetchRendererJson(cdp, new URL("/api/local/refresh", dashboardUrl), { timeoutMs: MAX_OPERATION_MS, maximumBytes: MAX_JSON_RESPONSE_BYTES });
     const previousRefreshId = typeof previousStatus?.refresh?.refreshId === "string"
       ? previousStatus.refresh.refreshId
       : null;
@@ -2359,6 +2363,7 @@ export async function runSmoke({
     await assertRendererShell(cdp);
     resourceDiagnostics.setReloadSubstage("automatic_refresh");
     const reloadStartupRefresh = await assertAutomaticStartupRefresh({
+      cdp,
       child,
       dashboardUrl,
       refreshObserver,
@@ -2477,6 +2482,7 @@ export async function runSmoke({
         const companionSnapshot = companionSnapshotObserver?.snapshot?.()
           ?? unobservedRendererCompanionSnapshot();
         const diagnostic = await rendererReadinessDiagnostics?.snapshotWithTimingAndProbe?.({
+          probe: (origin) => probeRendererReadinessPrimaryApis(origin, { fetchImpl: createAuthorizedRendererFetch(cdp, { timeoutMs: RENDERER_READINESS_DIAGNOSTIC_PROBE_MS }) }),
           companionSnapshot,
         })
           ?? rendererReadinessDiagnostics?.snapshot?.({ companionSnapshot })

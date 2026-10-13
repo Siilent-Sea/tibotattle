@@ -604,7 +604,28 @@ desktop notification behavior remain unqualified. The receipt retains
 `productionReady: false`. A passing portable harness test is not a native
 installed result.
 
-#### Source-bound Azure builder preflight
+#### Source-bound Windows candidate validation and signing
+
+Before entering the protected signer, require independent admission of the
+complete offline signing tool closure. The
+[Windows signing tool review](../reviews/2026-10-12-windows-signing-tool-closure.md)
+records the baseline inventory and provisioning gates. Initial trust state is
+`provisioning_required`; it must not be treated as a ready signing lane. Prepare
+dependencies without OIDC or signing credentials, then restore only the exact
+repository-reviewed closure into a fresh signer. Missing or changed tools
+must fail without registry, gallery or package-manager installation. Keep
+candidate execution and installed qualification outside that privileged
+boundary. Native Windows publisher and offline-restoration evidence are still
+required before the replacement lane can be called qualified.
+
+The [build composite](../../.github/actions/windows-unprivileged-build/action.yml)
+admits Node 26.2.0 and pnpm 11.9.0 through the
+[bootstrap policy](../../config/windows-build-bootstrap.json) before executing
+them. It checks Node's archive SHA-256 and pnpm's SHA-512 plus committed npm
+registry signature, then runs the frozen workspace install with lifecycle
+scripts disabled. The initial verifier's Node interpreter, PowerShell/.NET and
+host operating system remain trusted runner components. The Node archive pin
+does not establish Authenticode or upstream release-signature verification.
 
 For the canonical prepared Windows source candidate, the no-write preflight is:
 
@@ -613,30 +634,51 @@ node scripts/finalize-electron-windows-signing.mjs \
   --candidate-receipt .release-build/electron-production/win32-x64/production-source-candidate.json
 ```
 
-It binds only that receipt, its SHA-256, the reviewed `win32-x64` staging
-layout, and the release builder configuration. It does not contact Azure,
-invoke electron-builder, sign a file, create an installer, or publish an
-update. A ready result still requires a Windows x64 host with Node 26.2.0 and
-the reviewed non-secret Azure resource selection; Azure CLI authentication is
-checked only by the protected operation.
+It validates the canonical `win32-x64` candidate receipt and its SHA-256
+against the source candidate contract. It does not contact Azure, load signing
+configuration, invoke electron-builder, sign a file, create an installer, or
+publish an update. Its result is
+`candidate_validated_signing_pipeline_required`; Azure resource configuration
+is explicitly `not_evaluated`. A matching Windows x64 / Node 26.2.0 host is
+reported separately and does not turn candidate validation into signer
+readiness.
 
-After separate authorization for the exact candidate and signing resource, the
-explicit builder pass is:
+The legacy finalizer's `--sign` and `--prepare-builder-host` modes are retired
+and must fail closed. Do not restore the earlier builder-in-signer lane to
+unblock a release. The
+[replacement workflow](../../.github/workflows/electron-windows-signing.yml)
+alternates unprivileged preparation with isolated signing for native modules,
+the staged application, generated NSIS uninstaller and final outer installer.
+The [stage helper](../../scripts/prepare-electron-windows-signing-stage.mjs)
+verifies each signature transfer and resumes the saved NSIS continuation;
+the [direct signer](../../scripts/sign-electron-windows-subjects.mjs) does not
+execute candidate bytes or install dependencies. Final installed qualification
+runs without signing authority.
 
-```sh
-node scripts/finalize-electron-windows-signing.mjs \
-  --sign --confirm-azure-trusted-signing \
-  --candidate-receipt .release-build/electron-production/win32-x64/production-source-candidate.json
-```
+The resumed compiler retains the pinned builder's output and installer-size
+checks. After the outer signature is applied and verified, finalization
+regenerates its `.exe.blockmap` sidecar and `latest.yml` from the final signed
+installer and verifies that blockmap generation leaves those installer bytes
+unchanged. This does not change the inner archive's
+`differentialPackage: false` setting. The direct signing interface follows
+[Microsoft's SignTool integration](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-signing-integrations);
+that documentation does not qualify this lane's binary or publisher pins.
 
-It requires a clean source revision matching the candidate, verifies the Azure
-CLI session without printing its identity, and invokes the reviewed builder
-with `--win nsis --x64 --publish never`. Its success remains
-`builder_signing_completed_pending_native_module_finalization`: it is not a
-signed-candidate receipt, production credential proof, installed-app proof, or
-publication permission. The unpacked native modules still need a separately
-reviewed signature/rebinding finalizer and final-byte artifact checks before any
-installer or updater claim.
+The reusable signer applies the
+[outbound firewall policy](../../scripts/windows-signing-egress.ps1) before
+signing, allowing resolved authentication, signing and timestamp addresses plus
+configured DNS, and restores prior state in `finally` and an `always()` step.
+Native registry denial, certificate-check availability and restoration still
+require verification on the disposable Windows runner.
+
+The [tool policy](../../config/windows-signing-toolchain.json) remains
+unprovisioned and fails admission. Populate it only from independently reviewed
+tool-byte and native publisher evidence, then qualify the complete staged
+workflow on Windows with authorization for the exact candidate and signing
+resource. Source architecture and portable tests do not establish operational
+OIDC, network isolation, native trust, installed behavior or updater
+availability. Until these gates have their own evidence, the replacement lane
+cannot produce a release claim or updater authorization.
 
 #### Native-module integrity rebinding
 
@@ -680,11 +722,15 @@ install, update/no-update, and uninstall behavior. Add detached signature or
 repository metadata as the selected distribution requires. Flathub and Snap
 are separate `store` channel subjects.
 
-The selected direct Linux updater path is AppImage. It does not require a new
-detached-signing service merely to exercise updates. The pinned updater must
-still verify downloaded bytes from the selected feed, replace the correct
-installed image, restart, and preserve settings and sharing choice. DEB/RPM
-package-manager updates are a distinct delivery path.
+The selected direct Linux updater path is AppImage. Current source requires
+[independent publisher authentication](../decisions/2026-10-12-linux-update-publisher-authentication.md)
+before a feed entry can authorize a download or installation. The production
+key set is empty, so in-app updating and authenticated publication are blocked
+until owner-approved provisioning and exact installed qualification. A checksum
+from the same feed is insufficient. The explicit local signing producer,
+sequence/expiration operation, key rotation and migration of existing unrooted
+clients are defined in that decision. DEB/RPM package-manager updates remain a
+distinct delivery path.
 
 The bounded adapter qualification is:
 
@@ -699,6 +745,9 @@ execution, real AppImage/FUSE integration, desktop notifications and production
 credentials. It refuses real-product execution mode. Run it on Linux; a skip
 on another operating system is not Linux evidence. Retain the native packaged
 startup/credential/cold-restart receipts separately from this adapter receipt.
+This adapter-only checksum exercise does not qualify the independent publisher
+boundary. The real AppImage update and final-lifecycle runners now refuse
+`UPDATE_TRUST_UNPROVISIONED` while the source key set is empty.
 
 The final Linux production-package workflow also qualifies the application
 extracted from its exact AppImage. `qualify-electron-linux-final-appimage.mjs`
@@ -733,8 +782,26 @@ execution. `mode=execute` also requires
 `scripts/qualify-electron-linux-installed-lifecycle.mjs` (`--preflight`,
 `--acquire`, then `--prepare`); downloads require the workflow's read-only token.
 It rejects other workflow sources, incomplete runs, unexpected ZIP members,
-links, changed receipts and different artifact bytes. Extraction establishes
-comparison hashes only and is never counted as installed execution.
+links, changed receipts and different artifact bytes. Before `--prepare`, both
+downloaded-artifact qualification and mount-diagnosis workflows build the minimal
+digest-pinned `containers/electron-linux-extraction/Dockerfile` boundary and run
+its synthetic marker confinement test. The candidate's extraction entrypoint
+runs only there, without networking, credentials, FUSE, capabilities or writable
+host mounts. A single read-only input and bounded temporary storage are exposed.
+The host accepts only two bounded byte strings into newly created fixed regular
+files, independently hashes them, checks the known final ASAR/executable digests
+before ASAR parsing, and rechecks the original AppImage. No extractor-provided
+path, link or receipt is trusted. Owned-container cleanup runs on failure and
+interruption, with an `always()` recovery step using the exact recorded owner.
+Extraction establishes comparison hashes only and is never counted as installed
+execution.
+
+This downloaded-artifact boundary is distinct from production packaging above:
+`qualify-electron-linux-final-appimage.mjs` extracts the same-job electron-builder
+output on the trusted source-build host before its normal runtime smoke. That
+path executes reviewed build source and its dependencies already; it does not
+accept a downloaded AppImage from another run. It does not establish containment
+of a malicious same-job build or compromised build dependency.
 
 The native x64 job requires `/dev/fuse`, the scoped `SYS_ADMIN` capability and
 FUSE device, an ordinary AppImage launcher, enabled Chromium sandbox, Xvfb and
@@ -877,6 +944,57 @@ those exact bytes. Windows configuration also retains its exact publisher gate.
 No absent installer, stale signature or rehearsal build can be replaced by a
 synthetic fixture to prepare an actual release.
 
+Before preparing the proposal, finalize the Linux feed with its independent
+publisher signature. **Current source is unprovisioned:** the embedded public
+key array is empty, so both this signing command and normal four-target
+preparation refuse. Provisioning requires a separate owner-approved key and
+reviewed rooted application; it is not implied by preparing release files.
+Never insert synthetic fixture keys to satisfy this gate.
+
+Once provisioned and explicitly authorized to sign, select a sequence higher
+than the last published signed metadata and within the embedded key's approved
+interval. Select an expiration in Unix milliseconds that allows the release
+window and is no more than 31 days ahead. Plan a separately authorized renewal
+before expiration; no automatic renewal job is created by this procedure.
+Keep the private key in its protected secret store (Keychain when operating
+on macOS). This CLI accepts only an explicit, temporary owner-only key-file
+export: use mode `0600`, keep it outside the artifact tree, never print it or
+pass its contents in shell arguments, and remove the owned export when signing
+finishes. Exporting or using a production key is itself protected work.
+
+The variables below name reviewed local inputs and a **new**, unused output
+path whose basename is `latest-linux.yml`; they never contain private-key bytes.
+The original builder feed remains a separate input.
+
+```sh
+node scripts/sign-electron-linux-update.mjs --sign \
+  --artifact "$LINUX_FINAL_APPIMAGE" --feed "$LINUX_BUILDER_FEED" \
+  --sequence "$LINUX_UPDATE_SEQUENCE" --expires-at "$LINUX_UPDATE_EXPIRY_MS" \
+  --key-id "$LINUX_PUBLISHER_KEY_ID" --private-key-file "$LINUX_PRIVATE_KEY_EXPORT" \
+  --output "$LINUX_SIGNED_FEED"
+```
+
+The command verifies final bytes against the builder feed and the supplied key
+against the embedded public root, then verifies the produced signature. It does
+not publish. Use **this exact signed output**, its new byte length and SHA-256
+in the proposal's Linux `manifest` reference. The planner independently checks
+the signature and AppImage digest/size; retaining the earlier checksum-only
+feed in the proposal fails. A higher sequence may renew the same version and
+artifact, but cannot authorize different bytes for that version. Renewal changes
+feed bytes and requires a new reviewed plan and publication authorization.
+For this renewal, retain all four exact current feed preimages as the proposal's
+same-version predecessors. The three non-Linux proposed feeds must be byte-for-byte
+identical to those preimages; they are verified no-ops, never rewritten or claimed
+as owned changes. The earlier Linux feed must independently authenticate, bind
+the unchanged final AppImage, and carry a lower sequence and earlier expiration.
+An expired predecessor signature is checked at its bounded historical validity
+time solely to authorize this renewal relationship. The new signature must be
+valid now. All immutable artifacts must already exist with the exact approved
+bytes. A missing artifact, mixed/absent predecessor, changed other-platform feed,
+same sequence, shortened expiration or changed Linux artifact refuses renewal.
+Only the Linux feed is written; readback still checks every target. Exact owned
+rollback restores only that Linux preimage and preserves the other feeds.
+
 ```sh
 node scripts/prepare-electron-stable-publication.mjs \
   --artifact-root <verified-artifacts> --proposal <proposal.json> \
@@ -893,6 +1011,15 @@ This preparation tool has no writer or automatic retry; the separate explicit
 writer below consumes its exact reviewed plan. Native `appcast.xml`,
 `intel/appcast.xml`, preview/rehearsal routes and all previous installers remain
 untouched. Website/download publication is a separate existing release gate.
+The writer records `publisherVerifiedAt` in its owned journal and rechecks Linux
+metadata expiration before writing that feed. Exact owned rollback revalidates
+the previously approved bytes at that recorded time, so expiration does not
+prevent withdrawing the owned feed. It cannot authorize new expired metadata
+or downgrade installed version/high-water state. A saved checksum-only
+predecessor remains exact discovery rollback data; it does not establish
+publisher authentication for older installed clients. Follow the
+[rooted-client migration boundary](../decisions/2026-10-12-linux-update-publisher-authentication.md#release-and-migration-gates)
+before treating their update path as protected.
 
 After an independently authorized publication, or before it to verify the saved
 predecessors, use the same inputs and existing operation directory:

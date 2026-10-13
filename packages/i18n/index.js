@@ -20,6 +20,11 @@ export const LANGUAGE_OPTIONS = Object.freeze([
 ]);
 
 export const EN_US_CATALOG = Object.freeze({
+  "localAuthorization.title": "Unlock your local dashboard",
+  "localAuthorization.description": "Choose the private authorization file created when you started the local companion. Access stays in this tab until you reload or close it, or restart the companion.",
+  "localAuthorization.choose": "Choose authorization file",
+  "localAuthorization.checking": "Checking local access…",
+  "localAuthorization.invalid": "This file cannot unlock the current companion. Choose its current authorization file; restart the companion if the file has expired.",
   "continuityConsent.title": "Turn boundaries and cache details",
   "continuityConsent.description": "This optional update adds turn starts, preceding compaction, same-time event order and reported cache-write lifetimes. It requires a new review and approval.",
   "continuityConsent.reviewTitle": "Review turn and cache contribution",
@@ -816,7 +821,7 @@ export const EN_US_CATALOG = Object.freeze({
   "electron.settings.about.versionUnavailable": "Version unavailable",
   "electron.settings.about.buildUnavailable": "Build unavailable",
   "electron.settings.updates.title": "Automatic updates",
-  "electron.settings.updates.unavailable": "Update checks are unavailable in this development build.",
+  "electron.settings.updates.unavailable": "Update checks are unavailable in this build.",
   "electron.settings.updates.checking": "Checking the signed update feed…",
   "electron.settings.updates.available": "A signed update is available.",
   "electron.settings.updates.current": "This is the latest signed build available to this installation.",
@@ -921,6 +926,11 @@ export const EN_US_CATALOG = Object.freeze({
 });
 
 export const ZH_HANS_CATALOG = Object.freeze({
+  "localAuthorization.title": "解锁本地仪表盘",
+  "localAuthorization.description": "请选择启动本地伴随服务时创建的私密授权文件。访问权限仅在此标签页中保留，重新加载或关闭标签页，或重启伴随服务后失效。",
+  "localAuthorization.choose": "选择授权文件",
+  "localAuthorization.checking": "正在检查本地访问权限…",
+  "localAuthorization.invalid": "此文件无法解锁当前伴随服务。请选择其当前授权文件；如果文件已过期，请重启伴随服务。",
   "continuityConsent.title": "轮次边界与缓存详情",
   "continuityConsent.description": "此可选更新新增轮次起点、此前的压缩、同一时间事件顺序和已报告的缓存写入有效期，需要重新审阅和核准。",
   "continuityConsent.reviewTitle": "审阅轮次与缓存贡献",
@@ -1717,7 +1727,7 @@ export const ZH_HANS_CATALOG = Object.freeze({
   "electron.settings.about.versionUnavailable": "版本不可用",
   "electron.settings.about.buildUnavailable": "构建不可用",
   "electron.settings.updates.title": "自动更新",
-  "electron.settings.updates.unavailable": "此开发构建中无法检查更新。",
+  "electron.settings.updates.unavailable": "此版本中无法检查更新。",
   "electron.settings.updates.checking": "正在检查已签名的更新源…",
   "electron.settings.updates.available": "有可用的已签名更新。",
   "electron.settings.updates.current": "这是此安装可用的最新已签名构建。",
@@ -1822,6 +1832,11 @@ export const ZH_HANS_CATALOG = Object.freeze({
 });
 
 export const ES_CATALOG = Object.freeze({
+  "localAuthorization.title": "Desbloquea tu panel local",
+  "localAuthorization.description": "Elige el archivo de autorización privado creado al iniciar el servicio local. El acceso permanece en esta pestaña hasta que la recargues o cierres, o reinicies el servicio.",
+  "localAuthorization.choose": "Elegir archivo de autorización",
+  "localAuthorization.checking": "Comprobando el acceso local…",
+  "localAuthorization.invalid": "Este archivo no permite acceder al servicio actual. Elige su archivo de autorización actual; reinicia el servicio si el archivo ha caducado.",
   "continuityConsent.title": "Límites de turnos y detalles de caché",
   "continuityConsent.description": "Esta actualización opcional añade inicios de turnos, compactación previa, orden de eventos simultáneos y duraciones de escritura de caché. Requiere una nueva revisión y aprobación.",
   "continuityConsent.reviewTitle": "Revisar contribución de turnos y caché",
@@ -2618,7 +2633,7 @@ export const ES_CATALOG = Object.freeze({
   "electron.settings.about.versionUnavailable": "Versión no disponible",
   "electron.settings.about.buildUnavailable": "Compilación no disponible",
   "electron.settings.updates.title": "Actualizaciones automáticas",
-  "electron.settings.updates.unavailable": "Las comprobaciones de actualización no están disponibles en esta compilación de desarrollo.",
+  "electron.settings.updates.unavailable": "Las comprobaciones de actualización no están disponibles en esta compilación.",
   "electron.settings.updates.checking": "Comprobando el canal de actualizaciones firmado…",
   "electron.settings.updates.available": "Hay una actualización firmada disponible.",
   "electron.settings.updates.current": "Esta es la compilación firmada más reciente disponible para esta instalación.",

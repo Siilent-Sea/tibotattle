@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /** Real normal-app update; fixed production URL resolves only inside network-none. */
+import distribution from "../config/electron-production-distribution.cjs";
 import { spawn, spawnSync } from "node:child_process";
+import { fetchRendererJson } from "./lib/authorized-renderer-fetch.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createServer } from "node:https";
@@ -140,36 +142,20 @@ async function processIdentityDiagnostics() {
   }
   return result;
 }
-export async function processHealth(pid) {
-  // Read only socket identities for this process and its children; never
-  // probe unrelated ports or export command lines/environment material.
-  const pids = new Set([pid]);
-  for (let pass = 0; pass < 3; pass++) {
-    for (const entry of await readdir("/proc")) {
-      if (!/^\d+$/u.test(entry)) continue;
-      try { const status = await readFile(`/proc/${entry}/status`, "utf8");
-        if (pids.has(Number(/^PPid:\s+(\d+)/mu.exec(status)?.[1]))) pids.add(Number(entry));
-      } catch {}
-    }
+export async function processHealth(pid, { dashboard = null } = {}) {
+  // AppImage updater restarts currently drop the debugger launch arguments.
+  // No unauthenticated socket scan may stand in for a trusted next renderer.
+  if (!Number.isSafeInteger(pid) || pid < 1 || typeof dashboard?.evaluate !== "function") {
+    fail("RESTART_AUTHORIZATION_UNAVAILABLE");
   }
-  const sockets = new Set();
-  for (const child of pids) {
-    try { for (const fd of await readdir(`/proc/${child}/fd`)) {
-      try { const target = await readlink(`/proc/${child}/fd/${fd}`); const match = /^socket:\[(\d+)\]$/u.exec(target); if (match) sockets.add(match[1]); } catch {}
-    } } catch {}
-  }
-  const lines = (await readFile("/proc/net/tcp", "utf8")).trim().split("\n").slice(1);
-  for (const line of lines) {
-    const cols = line.trim().split(/\s+/u); const [address, port] = cols[1].split(":");
-    if (cols[3] !== "0A" || address !== "0100007F" || !sockets.has(cols[9])) continue;
-    try { const response = await fetch(`http://127.0.0.1:${Number.parseInt(port, 16)}/api/local/health`, { signal: AbortSignal.timeout(1000) });
-      if ((await response.json())?.status === "ready") return true;
-    } catch {}
-  }
-  return false;
+  const origin = await dashboard.evaluate("location.origin");
+  const health = await fetchRendererJson(dashboard, new URL("/api/local/health", origin), { timeoutMs: 1000, maximumBytes: 64 * 1024 });
+  return health?.status === "ready";
 }
+
 async function digest(path) { const hash = createHash("sha256"); for await (const chunk of createReadStream(path)) hash.update(chunk); return hash.digest("hex"); }
 export async function runRealLinuxAppImageUpdater() {
+  if (distribution.PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS.length === 0) fail("UPDATE_TRUST_UNPROVISIONED");
   const contract = assertContainerContract();
   if (process.arch !== "x64" || process.getuid() !== 1000 || (await lookup(HOST)).address !== "127.0.0.1") fail("ISOLATION_REQUIRED");
   const execStat = await lstat(EXEC);
@@ -286,7 +272,9 @@ export async function runRealLinuxAppImageUpdater() {
           if (executable === null) continue;
           if (await digest(join(dirname(executable), "resources/app.asar")) !== pair.images.next.asarSha256) continue;
           if (await processHealth(pid)) return pid;
-        } catch {}
+        } catch (error) {
+          if (error.code === "LINUX_REAL_APPIMAGE_RESTART_AUTHORIZATION_UNAVAILABLE") throw error;
+        }
       }
       return null;
     }, 90000);

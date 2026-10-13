@@ -3,11 +3,12 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, copyFile, lstat, mkdir, open, readFile, realpath } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, open, readFile, realpath } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { linuxAppImageIdentity } from './build-linux-updater-rehearsal.mjs';
 import { readLinuxPackagedAsarManifest } from './smoke-electron-linux-packaged.mjs';
+import { extractLinuxFinalImage, cleanupLinuxExtraction } from './lib/linux-final-extraction.mjs';
 import { LINUX_FINAL_INPUT, LINUX_FINAL_PREDECESSOR, LINUX_FINAL_FEED, linuxFinalFailure as fail,
   preflightLinuxFinalIntake, linuxFinalArtifactName, validateLinuxFinalPackageRun,
   validateLinuxFinalPackageReceipt, validateLinuxFinalPair, sha256 } from './lib/linux-final-artifact-intake.mjs';
@@ -163,13 +164,14 @@ export async function prepareLinuxFinalArtifacts(intake, { root = ROOT } = {}) {
     const expected = role === 'current' ? LINUX_FINAL_PREDECESSOR : { ...receipt.artifact, version: intake.version, sourceRevision: intake.sourceRevision };
     const initial = await fingerprintLinuxFinalFile(path), image = await linuxAppImageIdentity(path);
     if (image.sha256 !== expected.sha256 || image.bytes !== expected.bytes || initial.sha256 !== image.sha256) fail('FINAL_BYTES_INVALID');
-    await chmod(path, 0o700);
     const extraction = join(directory, `${role}-inspection`); await mkdir(extraction, { mode: 0o700 });
-    const result = spawnSync(path, ['--appimage-extract'], { cwd: extraction, shell: false, stdio: 'ignore', timeout: 120000 });
-    if (result.error || result.status !== 0 || result.signal) fail('EXTRACTION_FAILED');
+    await extractLinuxFinalImage(path, extraction, { runnerRevision: intake.runnerRevision,
+      expected: role === 'next' ? { asarSha256: intake.asarSha256, executableSha256: intake.executableSha256 } : {} });
     const app = join(extraction, 'squashfs-root');
     const asar = await fingerprintLinuxFinalFile(join(app, 'resources/app.asar'));
     const executable = await fingerprintLinuxFinalFile(join(app, 'tibotattle'));
+    // Check the known final identities before parsing any container-supplied ASAR.
+    if (role === 'next' && (asar.sha256 !== intake.asarSha256 || executable.sha256 !== intake.executableSha256)) fail('ASAR_IDENTITY_INVALID');
     const manifest = await readLinuxPackagedAsarManifest(join(app, 'resources/app.asar'));
     if (manifest.version !== expected.version || manifest.tibotattleDistribution?.sourceRevision !== expected.sourceRevision
       || manifest.tibotattleDistribution?.target !== 'linux-x64' || manifest.tibotattleDistribution?.updateFeed !== LINUX_FINAL_FEED
@@ -186,7 +188,12 @@ export async function prepareLinuxFinalArtifacts(intake, { root = ROOT } = {}) {
 if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
   try {
     const [mode, ...rest] = process.argv.slice(2);
-    if (rest.length || !['--preflight', '--acquire', '--prepare'].includes(mode)) fail('ARGUMENT_INVALID');
+    if (rest.length || !['--preflight', '--acquire', '--prepare', '--cleanup-extraction'].includes(mode)) fail('ARGUMENT_INVALID');
+    if (mode === '--cleanup-extraction') {
+      for (const role of ['current', 'next']) await cleanupLinuxExtraction(join(ROOT, LINUX_FINAL_INPUT, `${role}-inspection`));
+      process.stdout.write('{"status":"extraction_cleanup_complete"}\n');
+      process.exit(0);
+    }
     const intake = preflightLinuxFinalIntake(process.env, { repositoryRoot: ROOT });
     if (mode !== '--preflight' && process.env.SELECTED_MODE !== 'execute') fail('CONFIRMATION_INVALID');
     const result = mode === '--preflight' ? { status: 'admitted', sourceRevision: intake.sourceRevision, runnerRevision: intake.runnerRevision, published: false }
