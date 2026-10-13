@@ -56,8 +56,9 @@ with an existing v1.1 head and READY days beyond that head. It:
 1. Requires current v1.1 authority and enabled processing.
 2. Leaves any participant with v1.2 manifests, a v1.2 head, or active typed
    v1.2 authorization to the successor protocol.
-3. Leaves a participant with a recently minted, unused predecessor to its
-   client. The quiet interval is ten minutes.
+3. Leaves a participant with an unused predecessor minted within the last
+   24 hours to its client. Preview uses the same ownership fence as execution;
+   a predecessor exactly 24 hours old is outside that fence.
 4. Excludes a newer READY replacement of any covered day, including the six
    re-identification heads. It never chooses a smaller replacement or edits a
    head in place.

@@ -1206,8 +1206,52 @@ test("owner adoption previews read-only, activates contiguous new days once, pre
     const expiredCursorTask = createPostgresV11EvidenceAdoption({ pool, schema, cursorSecret, clock: () => Date.now() + 31 * 60_000 });
     await assert.rejects(expiredCursorTask({ body: body(true, firstCursor), identityKey: actor }),
       error => error.status === 400 && error.code === "BODY_INVALID");
+
+    // Exercise both sides of the executor's ownership boundary against real
+    // PostgreSQL timestamps, with the same clock for preview and activation.
+    const beforeBoundary = await task({ body: broadBody(true), identityKey: actor });
+    const boundaryOwners = [];
+    for (const [label, offset] of [["boundary-inside", 1], ["boundary-exact", 0], ["boundary-expired", -1]]) {
+      const target = await setup(label);
+      await emptyDays(modules, pool, target, dayAt(1), dayAt(1), "synthetic-adoption", options);
+      boundaryOwners.push({ ...target, offset });
+    }
+    const boundaryTime = Date.now();
+    for (const target of boundaryOwners) {
+      await domain.createPredecessor(target.principal, boundaryTime - DAY_MS + target.offset);
+      target.bridgeBefore = await bridgeState(pool, schema.primarySchema, target.participantId);
+    }
+    const insidePredecessors = async () => (await pool.query(`SELECT token_hash, created_at, expires_at, consumed_at
+      FROM ${q(schema.primarySchema, "telemetry_v11_domain_predecessors")}
+      WHERE participant_id = $1 ORDER BY token_hash COLLATE "C"`, [boundaryOwners[0].participantId])).rows;
+    const insideBefore = await insidePredecessors();
+    let boundaryActivations = 0;
+    const boundaryTask = createPostgresV11EvidenceAdoption({ pool, schema, cursorSecret, clock: () => boundaryTime,
+      observeActivation: async invoke => { boundaryActivations++; return invoke(); } });
+    const boundaryPreview = await boundaryTask({ body: broadBody(true), identityKey: actor });
+    assert.equal(boundaryPreview.outcomes.client_syncing, beforeBoundary.outcomes.client_syncing + 1);
+    assert.equal(boundaryPreview.outcomes.adoptable, 2, "exactly 24 hours and older are outside client ownership");
+    assert.equal(boundaryPreview.newDays, 2);
+    for (const target of boundaryOwners) {
+      assert.deepEqual(await bridgeState(pool, schema.primarySchema, target.participantId), target.bridgeBefore);
+    }
+    const boundaryResult = await boundaryTask({ body: broadBody(false), identityKey: actor });
+    assert.equal(boundaryActivations, 2, "the still-owned predecessor never reaches activation");
+    assert.equal(boundaryResult.outcomes.adopted, 2);
+    assert.equal(boundaryResult.outcomes.refused, 0);
+    assert.equal(boundaryResult.newDays, 2);
+    assert.deepEqual(await insidePredecessors(), insideBefore);
+    for (const target of boundaryOwners) {
+      const state = await bridgeState(pool, schema.primarySchema, target.participantId);
+      if (target.offset > 0) assert.deepEqual(state, target.bridgeBefore);
+      else {
+        assert.equal(state.receipts.length, target.bridgeBefore.receipts.length + 1);
+        assert.equal(state.journal.length, target.bridgeBefore.journal.length + 1);
+      }
+    }
     const audits = (await pool.query(`SELECT details_json FROM ${q(schema.primarySchema, "admin_action_audit")}`)).rows;
-    for (const privateValue of [owner.participantId, owner.deviceId, actor, cursorSecret, firstCursor]) {
+    for (const privateValue of [owner.participantId, owner.deviceId, actor, cursorSecret, firstCursor,
+      ...boundaryOwners.flatMap(target => [target.participantId, target.deviceId])]) {
       assert.equal(JSON.stringify(audits).includes(privateValue), false);
     }
   } finally { await close(); }
