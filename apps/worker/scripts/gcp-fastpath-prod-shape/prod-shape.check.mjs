@@ -576,6 +576,32 @@ test("matrix adapter shares effective settings with guard and all profiler proje
     "--worker-profile-source", "a".repeat(40)]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
 });
 
+test("local measurement uses the platform time format and preserves resource units and unavailable fields", async () => {
+  const { timeArguments, parseTime } = await import("./measure-local.mjs");
+  assert.deepEqual(timeArguments("darwin"), ["-l"]);
+  assert.deepEqual(timeArguments("linux"), ["-f", "meas-synth-time-v1 %M %e %U %S"]);
+  for (const platform of ["win32", "freebsd", "unknown"]) {
+    assert.throws(() => timeArguments(platform), { code: "MEAS_SYNTH_TIME_PLATFORM_UNSUPPORTED" });
+    assert.throws(() => parseTime("", platform), { code: "MEAS_SYNTH_TIME_PLATFORM_UNSUPPORTED" });
+  }
+  assert.deepEqual(parseTime("  1.25 real  0.50 user  0.25 sys\n  123456 maximum resident set size\n  120000 peak memory footprint\n", "darwin"),
+    { maxResidentSetBytes: 123456, peakMemoryFootprintBytes: 120000, realSeconds: 1.25, userSeconds: 0.5, sysSeconds: 0.25 });
+  assert.deepEqual(parseTime("job output\nmeas-synth-time-v1 123456 3600.25 12.50 1.75\n", "linux"),
+    { maxResidentSetBytes: 126418944, peakMemoryFootprintBytes: null, realSeconds: 3600.25, userSeconds: 12.5, sysSeconds: 1.75 });
+  const unavailable = { maxResidentSetBytes: null, peakMemoryFootprintBytes: null,
+    realSeconds: null, userSeconds: null, sysSeconds: null };
+  for (const platform of ["darwin", "linux"]) assert.deepEqual(parseTime("", platform), unavailable);
+  for (const rss of ["-1", "1.5", "Infinity"]) {
+    assert.deepEqual(parseTime(`meas-synth-time-v1 ${rss} 1.00 0.00 0.00\n`, "linux"), unavailable);
+  }
+  for (const text of ["123 -1 0.00 0.00", "123 NaN 0.00 0.00", "123 0.00 Infinity 0.00", "123 0.00 0.00", "123 0,25 0.00 0.00"]) {
+    assert.deepEqual(parseTime(`meas-synth-time-v1 ${text}\n`, "linux"), unavailable);
+  }
+  assert.equal(parseTime(`meas-synth-time-v1 ${Number.MAX_SAFE_INTEGER} 1.00 0.00 0.00\n`, "linux").maxResidentSetBytes, null);
+  assert.deepEqual(parseTime("meas-synth-time-v1 0 0.00 0.00 0.00\n", "linux"),
+    { maxResidentSetBytes: 0, peakMemoryFootprintBytes: null, realSeconds: 0, userSeconds: 0, sysSeconds: 0 });
+});
+
 test("matrix adapter actual refresh and guard children receive identical matrix settings and resource env", async () => {
   const { parseArguments, runRefresh, guardProbe, refreshMeasurementIdentity } = await import("./measure-local.mjs");
   const dir = mkdtempSync(join(tmpdir(), "matrix-launch-test-"));
@@ -586,7 +612,8 @@ test("matrix adapter actual refresh and guard children receive identical matrix 
     writeFileSync(probe, `#!/usr/bin/env node
 console.log(JSON.stringify({state:"complete",testArguments:process.argv.slice(2).filter(arg=>arg.startsWith("--")),
 budget:process.env.ANALYTICS_V2_MEMORY_BUDGET_MIB,timeout:process.env.ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS,
-nodeOptions:process.env.NODE_OPTIONS??null}));`, { mode: 0o700 });
+nodeOptions:process.env.NODE_OPTIONS??null}));
+console.error("test-locale:"+(process.env.LC_ALL??"null"));`, { mode: 0o700 });
     const options = parseArguments(["--corpus", "/private/tmp/synthetic-corpus", "--out", join(dir, "report.json"),
       "--profile", "dense-workers", "--workers", "7", "--model-block-size", "14", "--model-fanout", "off"]);
     const common = { node22: probe, endpoint: { host: "/private/tmp/tibotattle-pg-synthetic/socket", port: 55544 },
@@ -594,6 +621,14 @@ nodeOptions:process.env.NODE_OPTIONS??null}));`, { mode: 0o700 });
     const refresh = await runRefresh({ ...common, outDir: dir, label: "synthetic-refresh" });
     const guard = await guardProbe({ ...common, waitMs: 5_000 });
     assert.equal(refresh.exitCode, 0, readFileSync(join(dir, "synthetic-refresh.stderr.txt"), "utf8"));
+    assert.match(readFileSync(join(dir, "synthetic-refresh.stderr.txt"), "utf8"), /^test-locale:C$/mu);
+    // These values come from the real platform /usr/bin/time around the real
+    // content-free child above. Parser fixtures cannot substitute for this gate.
+    assert.ok(Number.isSafeInteger(refresh.time.maxResidentSetBytes) && refresh.time.maxResidentSetBytes > 0);
+    for (const field of ["realSeconds", "userSeconds", "sysSeconds"]) {
+      assert.ok(Number.isFinite(refresh.time[field]) && refresh.time[field] >= 0, field);
+    }
+    if (process.platform === "linux") assert.equal(refresh.time.peakMemoryFootprintBytes, null);
     assert.equal(guard.exitCode, 0);
     assert.equal(guard.outcome, "exited");
     assert.deepEqual(refresh.receipt, guard.receipt);

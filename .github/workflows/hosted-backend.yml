@@ -110,6 +110,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The prod-shape checks execute real zsh process-control harnesses
+      # and a local refresh child under GNU /usr/bin/time on this Linux runner.
+      - name: Install and verify measurement check prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zsh time
+          zsh -c 'zmodload zsh/datetime; [[ -n "$EPOCHREALTIME" ]]'
+          test -x /usr/bin/time
+          [[ "$(/usr/bin/time --version)" == *"GNU Time"* ]]
+          /usr/bin/time -f '%e %U %S %M' /bin/true
+
       - name: Install pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

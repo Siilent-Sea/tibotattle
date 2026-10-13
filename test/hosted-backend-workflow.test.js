@@ -339,6 +339,52 @@ test("three jobs run the Worker gate, the Cloud Run check and the routed Postgre
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
 });
 
+function assertMeasurementPrerequisites(workflow) {
+  const steps = workflow.jobs["worker-gate"].steps;
+  const matching = steps.filter(step => step.name === "Install and verify measurement check prerequisites");
+  assert.equal(matching.length, 1, "exactly one measurement prerequisite step");
+  const step = matching[0], index = steps.indexOf(step);
+  assert.equal(step.if, undefined, "measurement prerequisites are unconditional");
+  assert.equal(step["continue-on-error"], undefined, "measurement prerequisite failures block the gate");
+  assert.doesNotMatch(step.run, /\|\|\s*(?:true|:)/u, "measurement failures are never swallowed");
+  for (const command of ["set -euo pipefail", "sudo apt-get update",
+    "sudo apt-get install --yes --no-install-recommends zsh time",
+    `zsh -c 'zmodload zsh/datetime; [[ -n "$EPOCHREALTIME" ]]'`,
+    "test -x /usr/bin/time", '[[ "$(/usr/bin/time --version)" == *"GNU Time"* ]]',
+    "/usr/bin/time -f '%e %U %S %M' /bin/true"]) {
+    assert.ok(step.run.trim().split("\n").includes(command), `${command} is retained`);
+  }
+  const guard = steps.findIndex(candidate => candidate.run?.includes("node --test test/hosted-backend-workflow.test.js"));
+  const gate = steps.findIndex(candidate => candidate.run?.trim() === workerNpm("check"));
+  assert.ok(index >= 0 && index < guard && index < gate, "prerequisites precede contract and Worker gates");
+}
+
+test("the Linux Worker gate provisions and exercises real measurement prerequisites before its gates", async () => {
+  const { workflow } = await loadWorkflow();
+  assertMeasurementPrerequisites(workflow);
+});
+
+test("the measurement prerequisite contract rejects missing, weakened, duplicate or late setup", async () => {
+  const { workflow } = await loadWorkflow();
+  for (const weaken of [
+    steps => steps.splice(steps.findIndex(step => step.name === "Install and verify measurement check prerequisites"), 1),
+    steps => steps.push(structuredClone(steps.find(step => step.name === "Install and verify measurement check prerequisites"))),
+    steps => { const index = steps.findIndex(step => step.name === "Install and verify measurement check prerequisites"); steps.push(...steps.splice(index, 1)); },
+    steps => { steps.find(step => step.name === "Install and verify measurement check prerequisites").if = "false"; },
+    steps => { steps.find(step => step.name === "Install and verify measurement check prerequisites")["continue-on-error"] = true; },
+    steps => { const step = steps.find(candidate => candidate.name === "Install and verify measurement check prerequisites"); step.run += "true || true\n"; },
+    ...["set -euo pipefail", "sudo apt-get update", "zsh time", "zmodload zsh/datetime", "test -x /usr/bin/time",
+      "GNU Time", "/usr/bin/time -f"].map(command => steps => {
+        const step = steps.find(candidate => candidate.name === "Install and verify measurement check prerequisites");
+        step.run = step.run.split("\n").filter(line => !line.includes(command)).join("\n");
+      }),
+  ]) {
+    const changed = structuredClone(workflow);
+    weaken(changed.jobs["worker-gate"].steps);
+    assert.throws(() => assertMeasurementPrerequisites(changed));
+  }
+});
+
 test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only that job does", async () => {
   // Without the pair the journal-transfer spec's TCP tests skip, which the
   // suite reports as SILENTLY_SKIPPED; with a wrong port they fail to connect.
