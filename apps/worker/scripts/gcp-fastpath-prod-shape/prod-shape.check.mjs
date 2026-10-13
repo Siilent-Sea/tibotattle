@@ -325,6 +325,66 @@ test("the production-tier script reaches only its measurement instance, through 
   if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
 });
 
+test("the production-tier child preserves inherited pipes and regular-file redirection", { timeout: 5_000 }, async () => {
+  const prerequisite = spawnSync("zsh", ["-c", "true"]);
+  assert.equal(prerequisite.error === undefined && prerequisite.status === 0, true, "MEAS_LOCAL_ZSH_REQUIRED");
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "run-prodtier-measurement.sh"), "utf8");
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => line.startsWith("child() {"));
+  const end = lines.findIndex((line, index) => index > start && line === "}");
+  assert.ok(start >= 0 && end > start, "the production child definition is present");
+  const child = lines.slice(start, end + 1).join("\n");
+  const dir = mkdtempSync(join(tmpdir(), "prodtier-descriptors-"));
+  const outFile = join(dir, "stdout"), errFile = join(dir, "stderr");
+  try {
+    for (const [scenario, destination, expectedCode] of [
+      ["inherited-pipes", "/dev/stdout /dev/stderr", 0],
+      ["regular-files", `'${outFile}' '${errFile}'`, 0],
+      ["combined-file", `'${outFile}' -`, 0],
+      ["inherited-pipes-failure", "/dev/stdout /dev/stderr", 7],
+    ]) {
+      rmSync(outFile, { force: true }); rmSync(errFile, { force: true });
+      const script = ["set -u", "CHILD=0", child,
+        `D() { print -r -- descriptor-stdout; print -u2 -r -- descriptor-stderr; return ${expectedCode}; }`,
+        `child ${destination} D`].join("\n");
+      // Match the lifecycle harness's real pipe topology, including Linux
+      // socket-backed ends: files as parent stdio would miss the regression.
+      const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "", closed = false;
+      shell.stdout.on("data", (chunk) => { stdout += chunk; });
+      shell.stderr.on("data", (chunk) => { stderr += chunk; });
+      const finished = new Promise((resolveClose, rejectClose) => {
+        shell.once("error", rejectClose);
+        shell.once("close", (code) => { closed = true; resolveClose(code); });
+      });
+      let timer;
+      try {
+        const code = await Promise.race([finished, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${scenario}: descriptor child exceeded 5 seconds`)), 5_000);
+          timer.unref();
+        })]);
+        assert.equal(code, expectedCode, `${scenario}: the waited child status is preserved`);
+        if (scenario.startsWith("inherited-pipes")) {
+          assert.equal(stdout, "descriptor-stdout\n", `${scenario}: stdout stays on the inherited pipe`);
+          assert.equal(stderr, "descriptor-stderr\n", `${scenario}: stderr stays on the inherited pipe`);
+        } else {
+          assert.equal(stdout, "", `${scenario}: stdout is redirected to the owned file`);
+          assert.equal(stderr, "", `${scenario}: stderr is redirected to the owned file`);
+          assert.equal(readFileSync(outFile, "utf8"), scenario === "combined-file"
+            ? "descriptor-stdout\ndescriptor-stderr\n" : "descriptor-stdout\n");
+          if (scenario === "regular-files") assert.equal(readFileSync(errFile, "utf8"), "descriptor-stderr\n");
+        }
+      } finally {
+        clearTimeout(timer);
+        if (!closed && shell.pid) {
+          try { process.kill(-shell.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+        }
+        await finished;
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 // MEAS-SYNTH review (2026-10-03): zsh runs a trap only once a FOREGROUND
 // child exits, so a SIGTERM to the script during the uncapped run (up to the
 // 48 h cap) left the instance running until the child ended. The script's own
@@ -394,10 +454,11 @@ test("the production-tier script's signal handling tears down at once and leaves
   const unrelated = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
   const unrelatedExit = new Promise(resolveExit => unrelated.on("exit", resolveExit));
   try {
-    for (const [signal, script] of [["SIGTERM", harness], ["SIGINT", harness], ["SIGHUP", harness],
-      ["SIGTERM", sampledHarness], ["SIGTERM", racingHarness], [null, finishingHarness],
-      ["SIGTERM", rootResistantHarness], ["SIGTERM", descendantResistantHarness], [null, resistantCompletionHarness],
-      ["SIGTERM", captureFailureHarness], [null, captureCompletionFailureHarness]]) {
+    for (const [scenario, signal, script] of [["term-step", "SIGTERM", harness], ["int-step", "SIGINT", harness], ["hup-step", "SIGHUP", harness],
+      ["term-sampler", "SIGTERM", sampledHarness], ["term-racing-sampler", "SIGTERM", racingHarness], ["normal-completion", null, finishingHarness],
+      ["term-resistant-root", "SIGTERM", rootResistantHarness], ["term-resistant-descendant", "SIGTERM", descendantResistantHarness],
+      ["resistant-sampler-completion", null, resistantCompletionHarness], ["capture-refusal", "SIGTERM", captureFailureHarness],
+      ["capture-refusal-completion", null, captureCompletionFailureHarness]]) {
       rmSync(ownedFile, { force: true });
       rmSync(samplerFile, { force: true });
       const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -412,10 +473,10 @@ test("the production-tier script's signal handling tears down at once and leaves
         const captureFailed = script === captureFailureHarness || script === captureCompletionFailureHarness;
         const minimumPids = script === captureFailureHarness ? 1 : script === captureCompletionFailureHarness ? 2 : 3;
         while (ownedPids().length < minimumPids && Date.now() - started < 5_000) await delay();
-        assert.equal(ownedPids().length >= minimumPids, true, "the exact owned step started");
+        assert.equal(ownedPids().length >= minimumPids, true, `${scenario}: the exact owned step started`);
         if (script === sampledHarness) {
           while (ownedPids().length < 6 && Date.now() - started < 5_000) await delay();
-          assert.equal(ownedPids().length >= 6, true, "the exact owned sampler started");
+          assert.equal(ownedPids().length >= 6, true, `${scenario}: the exact owned sampler started`);
         }
         // A refused ps read must fail this gate, never look like successful
         // cleanup. Prove visibility and group ownership while children live.
