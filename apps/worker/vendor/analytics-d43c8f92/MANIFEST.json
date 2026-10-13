@@ -67,6 +67,18 @@
       "line": 735,
       "symbol": "buildPricingEvent",
       "original": "function buildPricingEvent("
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "line": 464,
+      "symbol": "quotaContext",
+      "original": "async function quotaContext("
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "line": 1249,
+      "symbol": "usageEvent",
+      "original": "async function usageEvent("
     }
   ],
   "sourcePatches": [
@@ -119,8 +131,8 @@
     "web": 2,
     "parity": 6,
     "package": 40,
-    "exportPatched": 6,
-    "exportPatchedFiles": 3,
+    "exportPatched": 8,
+    "exportPatchedFiles": 4,
     "sourcePatched": 7,
     "sourcePatchedFiles": 6,
     "typeStubs": 3,
@@ -396,8 +408,8 @@
     {
       "path": "apps/worker/src/quota-analysis-v11.ts",
       "blob": "a7da16db679a2b309b36121b4bda3239113f8e4c",
-      "sha256": "ef7e782ae824d9ecda74183f33d95abd4d20e249905a4070ce8ba09b670356ad",
-      "patch": "source",
+      "sha256": "a0fe12293c9196ff6c816047c1b62069e90c013a04334dba781810869a0e8ba0",
+      "patch": "export+source",
       "reach": "kernel"
     },
     {

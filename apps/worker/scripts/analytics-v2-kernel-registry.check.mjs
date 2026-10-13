@@ -198,6 +198,7 @@ test("the closure holds every module that decides a stored value and no I/O plum
   for (const decides of [
     "apps/worker/src/analytics-v2/compute.ts", "apps/worker/src/analytics-v2/compute-owner.ts",
     "apps/worker/src/analytics-v2/compute-community.ts", "apps/worker/src/analytics-v2/native-path.ts",
+    "apps/worker/src/analytics-v2/model-era-composition.ts",
     "apps/worker/src/analytics-v2/occurrence-source.ts", "apps/worker/src/analytics-v2/owners.ts",
     "apps/worker/src/analytics-v2/devices.ts", "apps/worker/src/analytics-v2/queued-days.ts",
     "apps/worker/src/analytics-v2/owner-sets.ts",
@@ -242,7 +243,7 @@ test("the allowance projection decides the stored preview: compute class changes
   // live in these modules; each is a compute-closure input of the refresh Job.
   for (const module of ["src/admin-community-allowance.ts", "src/community-allowance.ts",
     "src/public-allowance-breakdowns.ts", "src/analytics-v2/allowance-projection.ts",
-    "src/analytics-v2/public-allowance-breakdowns-v15.ts"]) {
+    "src/analytics-v2/public-allowance-breakdowns-v15.ts", "src/analytics-v2/model-era-composition.ts"]) {
     const target = join(WORKER_ROOT, ...module.split("/"));
     assert.ok(identity.names.includes(`apps/worker/${module}`), `${module} decides the stored preview`);
     const mutated = await identityWith(async (path, ...rest) => {

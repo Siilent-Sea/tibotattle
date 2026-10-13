@@ -137,6 +137,10 @@ export const EXPORT_PATCHES = Object.freeze([
   { path: "apps/worker/src/storage-community-daily.ts", symbol: "publicInputs", declaration: "function" },
   // The per-event pricing projection GCP stores and reprices (engine v2 K-PERCARD/K-REPRICE).
   { path: "apps/worker/src/quota-analysis-v1.ts", symbol: "buildPricingEvent", declaration: "function" },
+  // Era-isolated GCP composition reuses the complete quota context and exact
+  // per-session attribution resolver; the legacy kernel itself is unchanged.
+  { path: "apps/worker/src/quota-analysis-v11.ts", symbol: "quotaContext", declaration: "async function" },
+  { path: "apps/worker/src/quota-analysis-v11.ts", symbol: "usageEvent", declaration: "async function" },
 ].map((patch) => Object.freeze(patch)));
 
 export class VendorError extends Error {
