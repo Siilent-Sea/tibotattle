@@ -734,6 +734,9 @@ PG_TEST_SOCKET=<local PostgreSQL 17 socket> PG_TEST_PORT=<port> \
   postgres-test/edge-origin-e2e.spec.mjs
 ```
 
+The PostgreSQL 17 suite runner (`scripts/ci-postgres-suite.mjs`) runs E12 in
+its EDGE_E2E profile with `EDGE_E2E_NODE` (Node 22.16.0) and
+`EDGE_E2E_GOLDEN`, and adds `--experimental-strip-types` itself.
 `npm run edge:e2e` runs the same two commands with the `node` on PATH, and
 `npm run edge:e2e:check` runs the offline harness and live-check checks (also
 part of `scripts:check`). Set `EDGE_E2E_GOLDEN=analytics-v2-test/golden` to

@@ -377,6 +377,30 @@ storage, commands, or this README:
 npm run docs:check
 ```
 
+### IN-3 legacy admission oracle
+
+`postgres-test/postgres-legacy-contribution-admission.spec.mjs` compares the
+PostgreSQL origin's v1.0 and v0.1 admission with the d43c8f92 Worker's own
+admission on D1. The oracle runs byte-for-byte d43c8f92 copies in
+`postgres-test/fixtures/legacy-contribution-oracle-d43c8f92/` (Worker modules,
+the telemetry-contract and quota-analysis packages, and the six D1 migration
+directories), in a Vite module graph of its own. Later changes to `src/`, the
+D1 directories or the workspace packages therefore never change or break it.
+The reviewed `fixtures/legacy-contribution-oracle-blobs.json` pins, and the
+generated `MANIFEST.json`, must agree with every vendored byte.
+
+The one live module in the oracle is the server pricer (`src/server-pricing.ts`
+and the accounting package). Server repricing is current pricing policy that
+the PostgreSQL admission shares with every other path, not a legacy rule. The
+oracle therefore proves the same rows for the same prices. The spec's last test
+shows that the pricer is the only live code the oracle loads.
+
+The vendored tree is generated, never edited:
+`node scripts/vendor-legacy-contribution-oracle.mjs` writes it, and
+`npm run legacy-oracle:vendor:check` re-derives and compares it. Both need the
+d43c8f92 objects in the local repository. `scripts:check` runs the generator's
+offline tests.
+
 
 ## GCP GitHub distribution snapshots
 
