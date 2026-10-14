@@ -273,8 +273,14 @@ async function admitCase(ctx, input, progress) {
   const actual = await D1.seedCurrentQ1Corpus({ ...ctx, P: ctx.admissionDiagnostic.api,
     admissionDiagnostic: ctx.admissionDiagnostic, progress, objects: D1.createCurrentQ1InertObjectStore(),
     sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, nowMs: Contract.CURRENT_Q1_D7_NOW_MS }, input.corpus.owners);
-  const actualSha256 = jsonSha256(actual);
-  requireFact(actualSha256 === input.admissionSha256 && isDeepStrictEqual(actual, input.admissionIdentities),
+  const orderedActual = [...actual].sort((left, right) => {
+    const a = JSON.stringify([left.participantId, left.format, left.day]);
+    const b = JSON.stringify([right.participantId, right.format, right.day]);
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  const actualSha256 = jsonSha256(orderedActual);
+  requireFact(actualSha256 === input.admissionSha256
+    && isDeepStrictEqual(orderedActual, input.admissionIdentities),
     "CURRENT_Q1_D7_ADMISSION_MISMATCH");
   const invariant = await D1.captureCurrentQ1IngestionInvariantDetails(ctx.ingestion);
   return { actual, sourceInvariant: invariant };

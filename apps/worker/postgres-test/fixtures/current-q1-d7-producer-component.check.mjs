@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createServer } from "vite";
+import { createScanner, LanguageVariant, SyntaxKind } from "typescript/unstable/ast";
 
 import { captureCurrentQ1D7ReferenceBinding, currentQ1D7ViteOptions }
   from "./current-q1-d7-reference.mjs";
@@ -13,10 +15,81 @@ import { invokeCurrentQ1D7Compute } from "./current-q1-d7-native.mjs";
 import { clearCurrentQ1D7PrivateValidatedOracle } from "./current-q1-d7-case-output.mjs";
 import * as Contract from "./current-q1-d7-contract.mjs";
 import * as D1 from "./current-q1-d1-reference.mjs";
+import * as D7 from "./current-q1-d7-recompute.mjs";
+import { buildCurrentCorpus } from "../../scripts/gcp-fastpath-current-corpus.mjs";
 
 const FIXTURE = new URL("./current-q1-d7-reference.mjs", import.meta.url);
 const EXPECTATION_CHECK = new URL("./current-q1-d7-expectation.check.mjs", import.meta.url);
 const D1_FIXTURE = new URL("./current-q1-d1-reference.mjs", import.meta.url);
+
+function extractAdmitCaseDeclaration(source) {
+  const scanner = createScanner(true, LanguageVariant.Standard, source);
+  const start = source.indexOf("async function admitCase(");
+  assert.ok(start >= 0 && source.indexOf("async function admitCase(", start + 1) < 0,
+    "the current producer must retain one private admitCase function");
+  scanner.resetTokenState(start);
+  for (const expected of ["async", "function", "admitCase"]) {
+    const token = scanner.scan();
+    assert.notEqual(token, SyntaxKind.EndOfFile);
+    assert.equal(scanner.getTokenText(), expected);
+  }
+  let token = scanner.scan();
+  while (token !== SyntaxKind.EndOfFile && scanner.getTokenText() !== "{") token = scanner.scan();
+  assert.notEqual(token, SyntaxKind.EndOfFile, "admitCase must have a function body");
+  let depth = 0, end;
+  while (true) {
+    const text = scanner.getTokenText();
+    if (text === "{") depth++;
+    else if (text === "}" && --depth === 0) {
+      end = scanner.getTokenEnd();
+      break;
+    }
+    token = scanner.scan();
+    assert.notEqual(token, SyntaxKind.EndOfFile, "admitCase body must close");
+  }
+  const declaration = source.slice(start, end);
+  assert.match(declaration, /^async function admitCase\(/u);
+  return declaration;
+}
+
+async function extractedAdmitCase(D1Boundary) {
+  const source = await readFile(FIXTURE, "utf8");
+  const declaration = extractAdmitCaseDeclaration(source);
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  return new AsyncFunction("D1", "Contract", "SOURCE_ID", "SOURCE_NAMESPACE", "jsonSha256",
+    "isDeepStrictEqual", "requireFact", `${declaration}\nreturn admitCase;`)(D1Boundary, Contract,
+    "gcp-fastpath-oracle", "gcp-fastpath-oracle", Contract.currentQ1D7JsonSha256, isDeepStrictEqual,
+    (condition, code) => { if (!condition) throw Object.assign(new Error(code), { code }); });
+}
+
+function generatedAdmissionCorpus(caseKey) {
+  const physicalId = caseKey === "conflictPreserving"
+    ? "conflict-preserving-negative-v2" : "conflict-free-positive-v2";
+  const generated = buildCurrentCorpus(physicalId);
+  assert.equal(generated.files[0]?.[0], "corpus.json");
+  const corpus = { ...JSON.parse(generated.files[0][1]), owners: generated.owners };
+  const topology = D7.validateCurrentQ1D7Topology(caseKey, corpus);
+  corpus.expectedDailyDays = [...topology.dailyDays];
+  corpus.conflictDays = [...topology.conflictDays];
+  corpus.window = { fromDay: topology.allDays[0], throughDay: topology.allDays.at(-1) };
+  return corpus;
+}
+
+function seedExecutionOrder(corpus, identities) {
+  const receipts = [];
+  for (const owner of corpus.owners) {
+    const primaryFormat = owner.key === "c" ? "v12" : "v11";
+    const primary = identities.filter((entry) => entry.participantId === owner.participantId
+      && entry.format === primaryFormat);
+    const extras = identities.filter((entry) => entry.participantId === owner.participantId && entry.format === "v1");
+    if (owner.key === "d") receipts.push(...extras);
+    receipts.push(...primary);
+    if (owner.key === "a") receipts.push(...extras);
+  }
+  return receipts;
+}
+
+function changeDigest(value) { return `${value[0] === "a" ? "b" : "a"}${value.slice(1)}`; }
 
 test("static producer capture binds the current runtime, closure, and both corpora", async () => {
   const binding = await captureCurrentQ1D7ReferenceBinding();
@@ -35,6 +108,102 @@ test("static producer capture binds the current runtime, closure, and both corpo
   assert.ok(paths.includes("apps/worker/postgres-test/fixtures/current-q1-d7-diagnostic-guardian.mjs"));
   assert.ok(paths.includes("apps/worker/postgres-test/fixtures/current-q1-d7-diagnostic-child.mjs"));
   assert.ok(paths.includes("apps/worker/postgres-test/fixtures/current-q1-d7-diagnostic.check.mjs"));
+});
+
+test("admitCase accepts execution-order receipts through a sorted copy and refuses identity mutations", async () => {
+  const cacheDir = await mkdtemp(join(tmpdir(), "current-q1-d7-admission-order-vite-"));
+  await chmod(cacheDir, 0o700);
+  let server, pendingReceipts;
+  const seedCalls = [], invariant = { sha256: "a".repeat(64) };
+  let invariantCalls = 0;
+  const D1Boundary = {
+    ...D1,
+    async seedCurrentQ1Corpus(context, owners) {
+      seedCalls.push({ context, owners });
+      return pendingReceipts;
+    },
+    async captureCurrentQ1IngestionInvariantDetails(database) {
+      invariantCalls++;
+      assert.equal(database, seedCalls.at(-1)?.context.ingestion);
+      return invariant;
+    },
+  };
+  try {
+    server = await createServer(currentQ1D7ViteOptions({ cacheDir }));
+    const P = await D1.loadCurrentQ1WorkerModules(server);
+    const admitCase = await extractedAdmitCase(D1Boundary);
+    const mutations = [
+      ["missing", (receipts) => { receipts.pop(); }],
+      ["duplicate", (receipts) => { receipts[receipts.length - 1] = structuredClone(receipts[0]); }],
+      ["foreign identity", (receipts) => { receipts[0].participantId = "participant:foreign-admission"; }],
+      ["altered identity", (receipts) => {
+        const receipt = receipts.find((entry) => entry.format === "v11");
+        assert.ok(receipt);
+        receipt.day = "2027-01-01";
+      }],
+      ["changed manifest digest", (receipts) => {
+        const receipt = receipts.find((entry) => entry.format !== "v1");
+        assert.ok(receipt);
+        receipt.manifestDigest = changeDigest(receipt.manifestDigest);
+      }],
+      ["changed chunk digest", (receipts) => {
+        const receipt = receipts.find((entry) => entry.format !== "v1");
+        assert.ok(receipt?.chunks?.length);
+        receipt.chunks[0].chunkDigest = changeDigest(receipt.chunks[0].chunkDigest);
+      }],
+      ["reversed nested chunk order", (receipts) => {
+        const receipt = receipts.find((entry) => entry.chunks?.length > 1);
+        assert.ok(receipt, "the public corpus builder must include a multi-chunk manifest");
+        receipt.chunks.reverse();
+      }],
+      ["extra field", (receipts) => { receipts[0].unexpected = "synthetic"; }],
+    ];
+    for (const caseKey of ["conflictPreserving", "conflictFreePositive"]) {
+      const corpus = generatedAdmissionCorpus(caseKey);
+      const identities = await D1.buildCurrentQ1AdmissionIdentities(P, corpus);
+      const admissionIdentities = structuredClone(identities);
+      const actual = seedExecutionOrder(corpus, identities);
+      assert.equal(actual.length, identities.length, `${caseKey}: every builder identity has a seed receipt`);
+      assert.notDeepEqual(actual, identities, `${caseKey}: the seed receipts retain execution order`);
+      const input = { corpus, admissionIdentities,
+        admissionSha256: Contract.currentQ1D7JsonSha256(admissionIdentities) };
+      const context = { P, ingestion: {}, admissionDiagnostic: { api: { synthetic: true } } };
+      const progress = { counts() {} };
+      const corpusBefore = structuredClone(corpus);
+      const expectedBefore = structuredClone(admissionIdentities);
+
+      pendingReceipts = actual;
+      const accepted = await admitCase(context, input, progress);
+      assert.equal(accepted.actual, actual, `${caseKey}: preserve the source's returned receipt array`);
+      assert.equal(accepted.sourceInvariant, invariant);
+      assert.deepEqual(actual, seedExecutionOrder(corpus, identities), `${caseKey}: do not reorder source receipts`);
+      assert.deepEqual(corpus, corpusBefore, `${caseKey}: do not change corpus inputs`);
+      assert.deepEqual(admissionIdentities, expectedBefore, `${caseKey}: do not change expected identities`);
+      const seeded = seedCalls.at(-1);
+      assert.equal(seeded.owners, corpus.owners);
+      assert.equal(seeded.context.P, context.admissionDiagnostic.api);
+      assert.equal(seeded.context.sourceId, "gcp-fastpath-oracle");
+      assert.equal(seeded.context.sourceNamespace, "gcp-fastpath-oracle");
+
+      for (const [label, mutate] of mutations) {
+        const candidate = structuredClone(actual);
+        mutate(candidate);
+        const candidateBefore = structuredClone(candidate);
+        const ownerInputBefore = structuredClone(corpus.owners);
+        pendingReceipts = candidate;
+        await assert.rejects(admitCase(context, input, progress),
+          (error) => error?.code === "CURRENT_Q1_D7_ADMISSION_MISMATCH", `${caseKey}: ${label}`);
+        assert.deepEqual(candidate, candidateBefore, `${caseKey}: preserve ${label} receipt input`);
+        assert.deepEqual(corpus.owners, ownerInputBefore, `${caseKey}: preserve owners after ${label}`);
+        assert.deepEqual(admissionIdentities, expectedBefore, `${caseKey}: preserve expectations after ${label}`);
+      }
+    }
+    assert.equal(invariantCalls, 2, "only the two accepted corpora reach invariant capture");
+    assert.equal(seedCalls.length, 2 * (mutations.length + 1));
+  } finally {
+    await server?.close();
+    await rm(cacheDir, { recursive: true, force: true });
+  }
 });
 
 function database() {
