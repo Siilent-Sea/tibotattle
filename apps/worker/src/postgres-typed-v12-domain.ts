@@ -194,22 +194,42 @@ async function assertSameDaySuccessorClosure(
 }
 
 async function stateRow(client: PostgresClient, schema: string, participantId: string): Promise<StateRow> {
-  const result = await client.query<StateRow>(
-    `SELECT v.revision AS input_revision, h.generation_id, d.manifest_digest
+  // Acquire the participant's serialization row before reading the head. A
+  // joined SELECT ... FOR UPDATE can wait on v while retaining the statement's
+  // earlier READ COMMITTED snapshot for h, so a later writer could otherwise
+  // compare against a stale generation and overwrite the head.
+  const version = await client.query<Pick<StateRow, "input_revision">>(
+    `SELECT v.revision AS input_revision
        FROM ${table(schema, "participants")} p
        JOIN ${table(schema, "community_analytical_input_versions")} v
          ON v.participant_id = p.id
-       LEFT JOIN ${table(schema, "telemetry_v12_domain_heads")} h
-         ON h.participant_id = p.id
-       LEFT JOIN ${table(schema, "telemetry_v12_domains")} d ON d.id = h.generation_id
       WHERE p.id = $1 AND p.state = 'active'
       FOR UPDATE OF v`,
     [participantId],
   );
-  const state = result.rows[0];
-  if (!state || result.rows.length !== 1) throw conflict("state");
-  revision(state.input_revision);
-  return state;
+  const locked = version.rows[0];
+  if (!locked || version.rows.length !== 1) throw conflict("state");
+
+  // This separate statement obtains a fresh READ COMMITTED snapshot after the
+  // serialization lock is held. Every predecessor issue and activation reads
+  // the head only after any earlier participant mutation has committed.
+  const head = await client.query<Pick<StateRow, "generation_id" | "manifest_digest">>(
+    `SELECT h.generation_id, d.manifest_digest
+       FROM ${table(schema, "participants")} p
+       LEFT JOIN ${table(schema, "telemetry_v12_domain_heads")} h
+         ON h.participant_id = p.id
+       LEFT JOIN ${table(schema, "telemetry_v12_domains")} d ON d.id = h.generation_id
+      WHERE p.id = $1 AND p.state = 'active'`,
+    [participantId],
+  );
+  const current = head.rows[0];
+  if (!current || head.rows.length !== 1) throw conflict("state");
+  revision(locked.input_revision);
+  return {
+    input_revision: locked.input_revision,
+    generation_id: current.generation_id,
+    manifest_digest: current.manifest_digest,
+  };
 }
 
 async function activeDomainByDigest(
