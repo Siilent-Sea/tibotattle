@@ -2,10 +2,15 @@
 title: R7 admission repair and complete suite verification
 date: 2026-10-14
 type: plan
-status: in_progress
+status: blocked
 ---
 
 # R7 admission repair and complete suite verification
+
+The source repairs and full root validation are complete. R7 receipt freshness
+remains blocked: the available corpus exceeds the unchanged line-admission
+limit, and no complete, unmodified replacement snapshot has been identified.
+The suite is not green.
 
 The owner requested resolution of the remaining R7 blockers and a complete
 green root suite without weakening checks. Work starts from clean
@@ -23,9 +28,9 @@ timeout, partial receipt reuse, or private-input alteration is permitted.
 |---|---|---|
 | R7 admission owner | Classify the refused input; fix the confirmed one-byte under-rejection in both Claude tail readers | Implemented and reviewed in `22bf86eed` |
 | Admission contract reviewer | Independently trace discovery, line admission, interval filtering, source frontiers and integrity contracts | Existing limit refusal confirmed; strengthening correction specified |
-| Benchmark cancellation owner | Propagate cancellation to the owned child without changing workload, timeout or assertions | Implemented; independent review and 121 focused checks passed |
+| Benchmark cancellation owner | Propagate cancellation to the owned child without changing workload, timeout or assertions | Implemented in `9b4bb3d5733151efe62f68b713c306ed7f479312`; independent review and 121 focused checks passed |
 | Snapshot investigator | Inspect documented artifacts and bounded local metadata for an existing complete, unmodified corpus snapshot | No candidate found in the documented locations checked |
-| Coordinator | Integrate reviewed fixes, freeze source, supervise authorized validation and record exact outcomes | Coordinating |
+| Coordinator | Integrate reviewed fixes, freeze source, supervise authorized validation and record exact outcomes | Full root run complete; receipt regeneration blocked pending admissible raw input |
 
 The authorized private-history operation remains local and follows the
 [R7 maintenance runbook](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md).
@@ -38,8 +43,9 @@ outside this request.
 The previous refresh failed before source-plan freeze with
 `operation=create source=claude_transcript reason=export_resource_line_bytes`.
 A bounded local byte-count census now establishes one complete structured line
-above the existing 16 MiB limit and no unfinished tails or observed source
-identity/size changes. No source contents, filenames or identifiers were parsed,
+of 30,678,766 bytes above the existing 16,777,216-byte (16 MiB) limit and no
+unfinished tails or observed source identity/size changes. No source contents,
+filenames or identifiers were parsed,
 copied or emitted. The refusal is required by the current admission contract;
 interval/type eligibility remains unknown and does not bypass the preparse cap.
 The owner was unsure whether a complete unmodified historical snapshot exists.
@@ -89,6 +95,35 @@ three-file lane: 121/121 passed, with no failures, cancellations or skips. Both
 reviewers confirmed that timeout budgets and existing workload assertions remain
 unchanged. Final architecture and all 22 preflight tests passed.
 
-The full root suite will run on the clean integration commit. All ten retained
-R7 receipts remain unchanged; neither a fresh matrix nor a green aggregate
-suite has been established.
+The full root command `pnpm test` completed on clean integration commit
+`9b4bb3d5733151efe62f68b713c306ed7f479312`, using Node.js 26.2.0, normal umask
+022 and permitted local OS inspection. It ran 6,265 tests in 475.766 seconds:
+6,216 passed, two failed, zero cancelled and 47 skipped. The retained platform
+skips were unchanged. The original materialized benchmark passed in 6.774
+seconds, and the real abort-during-final-cleanup regression passed in 7.228
+seconds with the existing 30-second limits.
+
+Both failures are in `test/r7-generated-release-evidence.test.js`: current-code
+receipt revalidation and exact decision rebuilding from the eight runtime
+inputs. Both reject stale `/contractProvenance/workloadCodeSha256` evidence.
+No other failure or cancellation remained in this full run. All ten retained
+R7 receipts are byte-for-byte unchanged from the previous closeout, and no
+regeneration journal, staging or backup artifact remains. No fresh matrix or
+green aggregate suite has been established.
+
+## Required input to resume
+
+The next dependency is an owner-supplied exact location and provenance for an
+existing complete, unmodified raw corpus snapshot suitable under the unchanged
+identity contract and registered 24 June–25 July 2026 interval. That snapshot
+must first pass bounded, owner-only admission and integrity verification. If
+it qualifies, regenerate all ten receipts together on frozen source under both
+pinned runtimes, rerun freshness checks, and rerun the complete root suite.
+Keep any supplied private location out of this document and test artifacts.
+
+The owner is unsure whether such a snapshot exists. No compliant local path to
+green remains with the currently available inputs. A filtered copy that removes
+the oversized record does not preserve the evidence. Changing the admission cap
+or input policy requires a separate explicit product decision outside these
+repairs. Native qualification, signing, release and deployment remain separate
+gates.
