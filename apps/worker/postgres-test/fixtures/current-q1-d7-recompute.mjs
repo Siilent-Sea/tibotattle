@@ -215,6 +215,17 @@ export function assertCurrentQ1D7BootstrapTransition({ beforeInvariant, afterInv
     afterInvariant.sequences.filter((entry) => entry.name !== "community_current_analysis_queue")), invalid);
 
   const oldBootstrap = before.bootstrap, nextBootstrap = after.bootstrap;
+  if (oldBootstrap.completed === 1) {
+    requireFact(oldBootstrap.singleton === 1 && nextBootstrap.singleton === 1
+      && nextBootstrap.completed === 1
+      && typeof oldBootstrap.participant_cursor === "string" && typeof oldBootstrap.source_day_cursor === "string"
+      && typeof nextBootstrap.participant_cursor === "string" && typeof nextBootstrap.source_day_cursor === "string"
+      && isDeepStrictEqual(beforeInvariant, afterInvariant)
+      && isDeepStrictEqual(before, after), invalid);
+    return { beforeSha256: jsonSha256(beforeInvariant), afterSha256: jsonSha256(afterInvariant), bootstrapSteps,
+      domainDayCount: before.domainDays.length, affectedDayCount: 0, queuedParticipantCount: 0,
+      insertedQueueCount: 0, queueSequenceDelta: 0 };
+  }
   requireFact(oldBootstrap.singleton === 1 && nextBootstrap.singleton === 1
     && oldBootstrap.policy_version === nextBootstrap.policy_version
     && oldBootstrap.completed === 0 && nextBootstrap.completed === 1
@@ -226,7 +237,7 @@ export function assertCurrentQ1D7BootstrapTransition({ beforeInvariant, afterInv
     && before.domainDays.length > 0 && before.domainDays.length <= 4 * 170, invalid);
   requireFact(Number.isSafeInteger(before.mutation.mutation_epoch) && before.mutation.mutation_epoch >= 0
     && before.domainDays.every((row) => typeof row.participant_id === "string" && row.participant_id.length > 0
-      && Number.isSafeInteger(row.generation_id) && row.generation_id > 0 && DAY.test(row.day))
+      && typeof row.generation_id === "string" && row.generation_id.length === 36 && DAY.test(row.day))
     && before.dailyRebuilds.every((row) => DAY.test(row.day) && Number.isSafeInteger(row.requested_epoch)
       && row.requested_epoch >= 0 && typeof row.requested_at === "string" && Number.isFinite(Date.parse(row.requested_at)))
     && before.queue.every((row) => Number.isSafeInteger(row.id) && row.id > 0 && typeof row.participant_id === "string"

@@ -7,6 +7,9 @@ import { assertCurrentQ1D7BootstrapTransition } from "./current-q1-d7-recompute.
 
 const day1 = "2026-04-15", day2 = "2026-04-16", day3 = "2026-04-17", unrelated = "2025-01-01";
 const schema = "schema";
+const nonUuidGenerationId = "generation-id-not-a-uuid-00000000001";
+assert.equal(nonUuidGenerationId.length, 36);
+assert.doesNotMatch(nonUuidGenerationId, /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u);
 const invariants = (changed = false) => ({ schemaSha256: schema, sha256: changed ? "after" : "before",
   controls: [{ singleton_id: 1, revision: 0 }], audit: [],
   tables: [
@@ -23,8 +26,9 @@ const before = {
   queueState: { singleton_id: 1, window_generation: 4 },
   queue: [{ id: 1, participant_id: "p1", dirty_generation: 2, window_generation: 4, pending: 0,
     last_served_sequence: 3, completed_day: day1, completed_method: "method" }],
-  domainDays: [{ participant_id: "p1", generation_id: 8, day: day1 },
-    { participant_id: "p1", generation_id: 8, day: day2 }, { participant_id: "p2", generation_id: 9, day: day3 }],
+  domainDays: [{ participant_id: "p1", generation_id: nonUuidGenerationId, day: day1 },
+    { participant_id: "p1", generation_id: nonUuidGenerationId, day: day2 },
+    { participant_id: "p2", generation_id: "00000000-0000-4000-8000-000000000009", day: day3 }],
   sequences: [{ name: "community_current_analysis_queue", seq: 1 }, { name: "other", seq: 7 }],
 };
 const after = {
@@ -39,8 +43,11 @@ const after = {
   sequences: [{ name: "community_current_analysis_queue", seq: 2 }, { name: "other", seq: 7 }],
 };
 
-const proof = assertCurrentQ1D7BootstrapTransition({ beforeInvariant: invariants(), afterInvariant: invariants(true),
-  before, after, bootstrapSteps: 2 });
+const pendingEvidence = { beforeInvariant: invariants(), afterInvariant: invariants(true),
+  before: structuredClone(before), after: structuredClone(after), bootstrapSteps: 2 };
+const pendingInput = structuredClone(pendingEvidence);
+const proof = assertCurrentQ1D7BootstrapTransition(pendingEvidence);
+assert.deepEqual(pendingEvidence, pendingInput);
 assert.deepEqual(proof, { beforeSha256: proof.beforeSha256, afterSha256: proof.afterSha256, bootstrapSteps: 2,
   domainDayCount: 3, affectedDayCount: 3, queuedParticipantCount: 2, insertedQueueCount: 1, queueSequenceDelta: 1 });
 
@@ -61,6 +68,97 @@ expectRejected((candidate) => { candidate.queue.push({ id: 3, participant_id: "u
   window_generation: 4, pending: 1, last_served_sequence: 0, completed_day: null, completed_method: null }); });
 assert.throws(() => assertCurrentQ1D7BootstrapTransition({ beforeInvariant: invariants(),
   afterInvariant: { ...invariants(true), schemaSha256: "changed" }, before, after, bootstrapSteps: 2 }));
+
+const expectEvidenceRejected = (mutate) => {
+  const evidence = { beforeInvariant: invariants(), afterInvariant: invariants(true),
+    before: structuredClone(before), after: structuredClone(after), bootstrapSteps: 2 };
+  mutate(evidence);
+  assert.throws(() => assertCurrentQ1D7BootstrapTransition(evidence));
+};
+for (const generationId of [8, null, "", "too-short", "x".repeat(37)]) {
+  const evidence = { beforeInvariant: invariants(), afterInvariant: invariants(true),
+    before: structuredClone(before), after: structuredClone(after), bootstrapSteps: 2 };
+  evidence.before.domainDays[0].generation_id = generationId;
+  evidence.after.domainDays[0].generation_id = generationId;
+  assert.deepEqual(evidence.before.domainDays, evidence.after.domainDays);
+  assert.throws(() => assertCurrentQ1D7BootstrapTransition(evidence),
+    (error) => error?.code === "CURRENT_Q1_D7_BOOTSTRAP_INVALID");
+}
+expectEvidenceRejected((evidence) => { evidence.before.domainDays[0].participant_id = ""; });
+expectEvidenceRejected((evidence) => { evidence.after.queue[0].participant_id = ""; });
+expectEvidenceRejected((evidence) => { evidence.after.queue[0].id = 0; });
+expectEvidenceRejected((evidence) => { evidence.after.bootstrap.source_day_cursor = "not-a-day"; });
+expectEvidenceRejected((evidence) => {
+  evidence.afterInvariant.tables.find((entry) => entry.table === "accountless_upload_owners").sha256 = "changed";
+});
+
+const completedState = structuredClone(after);
+const completedInvariant = invariants(true);
+const noOpEvidence = { beforeInvariant: structuredClone(completedInvariant),
+  afterInvariant: structuredClone(completedInvariant), before: structuredClone(completedState),
+  after: structuredClone(completedState), bootstrapSteps: 1 };
+const noOpInput = structuredClone(noOpEvidence);
+const noOpProof = assertCurrentQ1D7BootstrapTransition(noOpEvidence);
+assert.deepEqual(noOpEvidence, noOpInput);
+assert.deepEqual(noOpProof, { beforeSha256: noOpProof.beforeSha256, afterSha256: noOpProof.afterSha256,
+  bootstrapSteps: 1, domainDayCount: 3, affectedDayCount: 0, queuedParticipantCount: 0,
+  insertedQueueCount: 0, queueSequenceDelta: 0 });
+
+// Migration 0060 may start with an already-completed cursor and no source rows.
+const emptyCompletedState = {
+  bootstrap: { ...completedState.bootstrap, participant_cursor: "", source_day_cursor: "" },
+  mutation: structuredClone(completedState.mutation), dailyRebuilds: [],
+  queueState: structuredClone(completedState.queueState), queue: [], domainDays: [], sequences: [],
+};
+const emptyCompletedInvariant = structuredClone(completedInvariant);
+emptyCompletedInvariant.sha256 = "empty-source";
+emptyCompletedInvariant.tables = [
+  { table: "accountless_upload_owners", rows: 0, sha256: "empty-owners" },
+  { table: "community_public_source_bootstrap", rows: 1, sha256: "empty-bootstrap" },
+  { table: "community_daily_aggregate_rebuilds", rows: 0, sha256: "empty-daily" },
+  { table: "community_current_analysis_queue", rows: 0, sha256: "empty-queue" },
+];
+emptyCompletedInvariant.sequences = [];
+const emptyNoOpEvidence = { beforeInvariant: structuredClone(emptyCompletedInvariant),
+  afterInvariant: structuredClone(emptyCompletedInvariant), before: structuredClone(emptyCompletedState),
+  after: structuredClone(emptyCompletedState), bootstrapSteps: 1 };
+const emptyNoOpInput = structuredClone(emptyNoOpEvidence);
+const emptyNoOpProof = assertCurrentQ1D7BootstrapTransition(emptyNoOpEvidence);
+assert.deepEqual(emptyNoOpEvidence, emptyNoOpInput);
+assert.deepEqual(emptyNoOpProof, { beforeSha256: emptyNoOpProof.beforeSha256, afterSha256: emptyNoOpProof.afterSha256,
+  bootstrapSteps: 1, domainDayCount: 0, affectedDayCount: 0, queuedParticipantCount: 0,
+  insertedQueueCount: 0, queueSequenceDelta: 0 });
+
+const noOpMutations = [
+  ["schema hash", (evidence) => { evidence.afterInvariant.schemaSha256 = "changed"; }],
+  ["source hash", (evidence) => { evidence.afterInvariant.sha256 = "changed"; }],
+  ["controls", (evidence) => { evidence.afterInvariant.controls[0].revision++; }],
+  ["audit", (evidence) => { evidence.afterInvariant.audit.push({ id: 1 }); }],
+  ["sequence digest", (evidence) => { evidence.afterInvariant.sequences[0].seq++; }],
+  ...completedInvariant.tables.map(({ table }) => [
+    `table digest ${table}`,
+    (evidence) => { evidence.afterInvariant.tables.find((entry) => entry.table === table).sha256 = "changed"; },
+  ]),
+  ["bootstrap singleton", (evidence) => { evidence.after.bootstrap.singleton = 2; }],
+  ["bootstrap policy version", (evidence) => { evidence.after.bootstrap.policy_version = "changed"; }],
+  ["bootstrap cursor", (evidence) => { evidence.after.bootstrap.participant_cursor = "changed"; }],
+  ["bootstrap completion", (evidence) => { evidence.after.bootstrap.completed = 0; }],
+  ["mutation epoch", (evidence) => { evidence.after.mutation.mutation_epoch++; }],
+  ["daily rebuild", (evidence) => { evidence.after.dailyRebuilds[0].requested_epoch++; }],
+  ["queue state", (evidence) => { evidence.after.queueState.window_generation++; }],
+  ["queue row", (evidence) => { evidence.after.queue[0].pending = 0; }],
+  ["generation id", (evidence) => { evidence.after.domainDays[0].generation_id = "changed-generation-id-not-uuid-00001"; }],
+  ["domain day", (evidence) => { evidence.after.domainDays[0].day = day3; }],
+  ["queue sequence", (evidence) => { evidence.after.sequences[0].seq++; }],
+];
+for (const [name, mutate] of noOpMutations) {
+  const evidence = { beforeInvariant: structuredClone(completedInvariant),
+    afterInvariant: structuredClone(completedInvariant), before: structuredClone(completedState),
+    after: structuredClone(completedState), bootstrapSteps: 1 };
+  mutate(evidence);
+  assert.throws(() => assertCurrentQ1D7BootstrapTransition(evidence),
+    (error) => error?.code === "CURRENT_Q1_D7_BOOTSTRAP_INVALID", name);
+}
 await assert.rejects(() => captureCurrentQ1SourceSnapshot([], {}),
   (error) => error?.code === "CURRENT_Q1_INPUT_INVALID");
 await assert.rejects(() => captureCurrentQ1SourceSnapshot([], { validateSourcePath: () => true }),
