@@ -1,13 +1,18 @@
 // Unit checks for the GCP fast-path rehearsal's options and source-dump
 // resolution. Synthetic files only; no database, no network, no refresh.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assertCurrentImageRuntime, assertCurrentRehearsalOutputsNew, currentRehearsalOutputDestinations, parseArguments, rehearsalComparisonGates, resolveRehearsalDump, runRehearsal, syntheticRehearsalFloorDays, verifyCurrentImageRuntimePath } from "./gcp-fastpath-rehearsal.mjs";
+import { assertCurrentD7RehearsalOutputsNew, assertCurrentImageRuntime, assertCurrentRehearsalOutputsNew,
+  awaitCurrentD7OriginReadiness, createCurrentD7DeadlinePool, currentD7RemainingMs, currentD7StatementTimeoutMs,
+  currentD7RehearsalOutputDestinations, currentRehearsalOutputDestinations, parseArguments,
+  rehearsalComparisonGates, resolveRehearsalDump, runRehearsal, syntheticRehearsalFloorDays,
+  validateCurrentD7ControllerQualification, verifyCurrentImageRuntimePath } from "./gcp-fastpath-rehearsal.mjs";
 
 import { assertS9ChildCompleted, boundedS9ChildOutput, captureS9ChildCompletion, createS9Progress, observeS9ChildProgress, ownedKeptRehearsalSchemas, withS9OwnedSchemaCleanup,
   readS9ChildReport, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS } from "./s9-rehearsal-diagnostics.mjs";
@@ -228,6 +233,301 @@ test("current image runtime enforces exact version and verified platform binary 
   }
 });
 
+test("current-worker-d1-d7 selects the closed two-case controller and rejects alternate selections", () => {
+  const base = ["--golden", "/g/golden-q1-node", "--comparison-mode", "current-worker-d1-d7",
+    "--keep-schema", "--out", "/tmp/current-d7-report.json"];
+  assert.equal(parseArguments(base).comparisonMode, "current-worker-d1-d7");
+  for (const extra of [
+    ["--reuse-schema", "typed_legacy_transfer_rehearsal_target_fastpath_0123abcd"],
+    ["--dump", "/tmp/historical-dump.json"], ["--per-date-expected", "/tmp/historical-expectation.json"],
+    ["--owner-reference", "/tmp/historical-owner-reference"], ["--dense"],
+    ["--synthetic-revision-floor"], ["--staged-primary", "0911_analytics_v2_run_stamps.sql"],
+    ["--single-case", "conflictPreserving"], ["--case", "conflictFreePositive"],
+  ]) assert.throws(() => parseArguments([...base, ...extra]), refused("REHEARSAL_ARGUMENT_INVALID"), extra.join(" "));
+  assert.throws(() => parseArguments(["--golden", "/g/golden-q1-node", "--comparison-mode", "current-worker-d1-d7",
+    "--out", "/tmp/current-d7-report.json"]), refused("REHEARSAL_ARGUMENT_INVALID"), "both cases require retained schemas");
+});
+
+test("current D7 owns a fresh eight-file output set under an owner-only parent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "current-d7-output-check-"));
+  try {
+    const out = join(await realpath(directory), "report.json");
+    assert.deepEqual(currentD7RehearsalOutputDestinations(out), [out, `${out}.current-d7-reference.json`,
+      `${out}.current-d7-binding.json`, `${out}.current-d7-producer-acceptance.json`,
+      `${out}.current-d7-conflict-preserving-case.json`, `${out}.current-d7-conflict-free-positive-case.json`,
+      `${out}.current-d7-contract.json`, `${out}.current-d7-input-binding-capture.json`]);
+    assert.equal((await assertCurrentD7RehearsalOutputsNew(out)).length, 8);
+    await writeFile(`${out}.current-d7-reference.json`, "occupied");
+    await assert.rejects(assertCurrentD7RehearsalOutputsNew(out), refused("REHEARSAL_CURRENT_OUTPUT_EXISTS"));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("current D7 controller qualification accepts exactly two retained schema pairs and rejects ambiguous receipts", () => {
+  const digest = "a".repeat(64);
+  const receipt = (caseId, suffix) => ({ caseId, schemaVersion: "current-q1-d7-controller-case-receipt-v1",
+    referenceSha256: digest, expectationSha256: digest, corpusSha256: digest, admissionSha256: digest,
+    sourceInvariantSha256: digest, pgInputSha256: digest, bootstrapPreservationSha256: digest,
+    strictExportSha256: digest, actualResponseSha256: digest, actualPreviewSha256: digest,
+    schema: `typed_legacy_transfer_rehearsal_target_fastpath_${suffix}`,
+    controlSchema: `typed_legacy_transfer_rehearsal_ctl_${suffix}`, currentDay: "2026-10-01", retainedForS9Cleanup: true });
+  const qualification = {
+    schemaVersion: "current-q1-d7-controller-qualification-v1", comparisonMode: "current-worker-d1-d7", decisionId: "D7",
+    caseIds: ["conflictPreserving", "conflictFreePositive"], inputBindingSha256: digest,
+    inputBindingCaptureContentSha256: digest, bindingSha256: digest,
+    referenceContentSha256: digest, producerAcceptanceContentSha256: digest, contractContentSha256: digest,
+    caseReceipts: { conflictPreserving: receipt("conflictPreserving", "0123abcd"),
+      conflictFreePositive: receipt("conflictFreePositive", "89abcdef") },
+    sidecars: { referenceSha256: digest, bindingSha256: digest, producerAcceptanceSha256: digest,
+      conflictPreservingCaseSha256: digest, conflictFreePositiveCaseSha256: digest, contractSha256: digest,
+      inputBindingCaptureSha256: digest },
+    cleanupPending: true, qualifying: false, establishesNativeExecution: false,
+    deadlineMs: S9_REHEARSAL_DEADLINE_MS, elapsedMs: 1000, pgInputSnapshotsRemoved: true,
+  };
+  assert.equal(validateCurrentD7ControllerQualification(qualification), qualification);
+  const mutations = [
+    (value) => { value.caseIds.pop(); },
+    (value) => { value.cleanupPending = false; },
+    (value) => { value.sidecars.caseSidecarSha256 = digest; },
+    (value) => { value.caseReceipts.conflictFreePositive.schema = value.caseReceipts.conflictPreserving.schema; },
+    (value) => { value.caseReceipts.conflictPreserving.retainedForS9Cleanup = false; },
+    (value) => { value.pgInputSnapshotsRemoved = false; },
+    (value) => { value.sidecars.inputBindingCaptureSha256 = "b".repeat(64); },
+    (value) => { value.caseReceipts.conflictFreePositive.currentDay = "2026-09-30"; },
+    (value) => { value.unrecognized = true; },
+  ];
+  for (const mutate of mutations) {
+    const changed = structuredClone(qualification); mutate(changed);
+    assert.throws(() => validateCurrentD7ControllerQualification(changed), refused("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID"));
+  }
+});
+
+test("current D7 uses one non-resetting monotonic deadline and runs both cases before aggregate comparison", async () => {
+  assert.equal(currentD7RemainingMs(10_000, 1_000), 9_000);
+  assert.equal(currentD7StatementTimeoutMs(10_000, 1_000), 8_000);
+  assert.throws(() => currentD7RemainingMs(1_000, 1_000), refused("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED"));
+  const source = await readFile(new URL("./gcp-fastpath-rehearsal.mjs", import.meta.url), "utf8");
+  const driver = source.slice(source.indexOf("async function runCurrentD7Rehearsal(options)"),
+    source.indexOf("/** Direct controller callers retain"));
+  assert.ok(driver.length > 0);
+  const order = [
+    "const startedMonotonicMs = performance.now()",
+    "const deadlineMonotonicMs = startedMonotonicMs + S9_REHEARSAL_DEADLINE_MS",
+    "const capturedInputBinding = await timed(timings, \"current-d7:input-binding\"",
+    "outputSidecars.inputBindingCaptureSha256 = await writeCurrentD7Sidecar(outputPaths[7], inputBindingCapture)",
+    "const producerResult = await timed(timings, \"current-d7:producer\"",
+    "await verifyCurrentD7InputBindingCapture(outputPaths[7], inputBindingCaptureMetadata",
+    "outputSidecars.referenceSha256 = await writeCurrentD7Sidecar",
+    "for (const caseId of CURRENT_D7_CASES)",
+    "const result = await runRehearsal",
+    "const comparatorReport = comparator.compareCurrentQ1D7Contract({",
+    "const pgInputSnapshotsRemoved = await removeCurrentD7PgInputDirectory",
+    "validateCurrentD7ControllerQualification({",
+  ].map((statement) => driver.indexOf(statement));
+  assert.ok(order.every((position) => position >= 0));
+  assert.deepEqual(order, [...order].sort((left, right) => left - right));
+  assert.match(driver, /deadlineMonotonicMs,\s*progress,/u, "both inner case runs share the original deadline and progress journal");
+  assert.match(driver, /inputBinding:\s*producerInputBinding/u, "the producer receives a distinct immutable binding clone");
+});
+
+test("D7 PostgreSQL adapter refreshes server statement timeouts after waits and serializes transactions", async () => {
+  const calls = [];
+  const rawClient = {
+    async query(...args) {
+      calls.push({ type: "query", text: typeof args[0] === "string" ? args[0] : args[0]?.text, args });
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+      return { rows: [] };
+    },
+    release(error) { calls.push({ type: "release", error }); },
+  };
+  const rawPool = {
+    async connect() { await new Promise((resolveDelay) => setTimeout(resolveDelay, 30)); return rawClient; },
+    async end() {},
+  };
+  const deadline = performance.now() + 15_000;
+  const pool = createCurrentD7DeadlinePool(rawPool, deadline);
+  const timeoutBeforeCheckout = currentD7StatementTimeoutMs(deadline);
+  await pool.query("SELECT pool_query");
+  const poolQueries = calls.filter((entry) => entry.type === "query");
+  assert.deepEqual(poolQueries.map(({ text }) => text), [
+    "SELECT set_config('statement_timeout', $1, false)", "SELECT pool_query",
+  ]);
+  assert.ok(Number.parseInt(poolQueries[0].args[1][0], 10) < timeoutBeforeCheckout - 20,
+    "remaining time is sampled after the public pool connect wait");
+
+  calls.length = 0;
+  const client = await pool.connect();
+  const queries = [client.query("BEGIN"), client.query("SELECT first"),
+    client.query({ text: "SELECT $1", values: ["second"] }), client.query("ROLLBACK")];
+  await Promise.all(queries);
+  const observed = calls.filter((entry) => entry.type === "query");
+  assert.deepEqual(observed.map(({ text }) => text), [
+    "SELECT set_config('statement_timeout', $1, false)", "BEGIN",
+    "SELECT set_config('statement_timeout', $1, false)", "SELECT first",
+    "SELECT set_config('statement_timeout', $1, false)", "SELECT $1", "ROLLBACK",
+  ], "each config and target query are adjacent on one serialized client; rollback remains possible");
+  const timeoutValues = observed.filter(({ text }) => text.startsWith("SELECT set_config"))
+    .map(({ args }) => Number.parseInt(args[1][0], 10));
+  assert.ok(timeoutValues.every((value) => Number.isSafeInteger(value) && value > 0));
+  assert.ok(timeoutValues[1] < timeoutValues[0], "later statements receive the shorter remaining timeout");
+  await client.release();
+
+  const perClient = [[], []]; let checkout = 0;
+  const concurrentPool = createCurrentD7DeadlinePool({
+    async connect() {
+      const id = checkout++;
+      return { async query(text) { perClient[id].push(text); await new Promise((resolveDelay) => setTimeout(resolveDelay, 2)); return { rows: [] }; },
+        release() {} };
+    },
+    async end() {},
+  }, performance.now() + 5_000);
+  const [left, right] = await Promise.all([concurrentPool.connect(), concurrentPool.connect()]);
+  await Promise.all([left.query("SELECT left_client"), right.query("SELECT right_client")]);
+  assert.deepEqual(perClient, [
+    ["SELECT set_config('statement_timeout', $1, false)", "SELECT left_client"],
+    ["SELECT set_config('statement_timeout', $1, false)", "SELECT right_client"],
+  ], "concurrent clients configure only their own checked-out PostgreSQL sessions");
+  await Promise.all([left.release(), right.release()]);
+});
+
+test("D7 PostgreSQL adapter bounds a queued checkout and releases a failed raw query client", async () => {
+  let resolveCheckout;
+  const lateClientCalls = [];
+  const lateClient = { async query(...args) { lateClientCalls.push(args); return { rows: [] }; },
+    release(error) { lateClientCalls.push({ release: true, error }); } };
+  const queued = createCurrentD7DeadlinePool({ connect: () => new Promise((resolve) => { resolveCheckout = resolve; }),
+    async end() {} }, performance.now() + 30);
+  await assert.rejects(queued.query("SELECT must_not_run"), refused("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED"));
+  resolveCheckout(lateClient);
+  await new Promise((resolveDelay) => setImmediate(resolveDelay));
+  assert.equal(lateClientCalls.length, 1);
+  assert.equal(lateClientCalls[0].release, true, "a client checked out after expiry is discarded");
+  assert.equal(lateClientCalls[0].error.code, "REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED");
+
+  const targetError = new Error("synthetic query failure");
+  const failedCalls = [];
+  const failedPool = createCurrentD7DeadlinePool({
+    async connect() { return { async query(text) {
+      failedCalls.push(text);
+      if (text === "SELECT target_failure") throw targetError;
+      return { rows: [] };
+    }, release(error) { failedCalls.push({ release: true, error }); } }; },
+    async end() {},
+  }, performance.now() + 5_000);
+  await assert.rejects(failedPool.query("SELECT target_failure"), (error) => error === targetError);
+  assert.deepEqual(failedCalls.slice(0, 2), ["SELECT set_config('statement_timeout', $1, false)", "SELECT target_failure"]);
+  assert.equal(failedCalls[2].release, true);
+  assert.equal(failedCalls[2].error, targetError, "pool.query preserves its original failure while releasing the client");
+
+  const nearDeadlineCalls = [];
+  const nearDeadlinePool = createCurrentD7DeadlinePool({
+    async connect() { return { async query(...args) { nearDeadlineCalls.push(args); return { rows: [] }; },
+      release(error) { nearDeadlineCalls.push({ release: true, error }); } }; },
+    async end() {},
+  }, performance.now() + 500);
+  const nearDeadlineClient = await nearDeadlinePool.connect();
+  await assert.rejects(nearDeadlineClient.query("ROLLBACK"), refused("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED"));
+  const callsBeforeFollowup = nearDeadlineCalls.length;
+  await assert.rejects(nearDeadlineClient.query("SELECT must_not_run_after_expired_cleanup"),
+    refused("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED"));
+  assert.equal(nearDeadlineCalls.length, callsBeforeFollowup,
+    "once an expired cleanup poisons the client, no later target SQL reaches PostgreSQL");
+  await nearDeadlineClient.release();
+  assert.equal(nearDeadlineCalls[0].release, true);
+  assert.equal(nearDeadlineCalls[0].error.code, "REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED",
+    "a refused rollback discards its transaction instead of returning an aborted session to the pool");
+});
+
+test("D7 skips timeout setup only for exact owned rollback cleanup statements", async () => {
+  const calls = [];
+  let aborted = false;
+  const rawClient = {
+    async query(...args) {
+      const text = typeof args[0] === "string" ? args[0] : args[0]?.text;
+      calls.push(text);
+      if (aborted && text.startsWith("SELECT set_config")) throw new Error("synthetic-aborted-transaction");
+      if (text === "SELECT synthetic_failure") {
+        aborted = true;
+        throw new Error("synthetic-target-failure");
+      }
+      if (text === "ROLLBACK TO SAVEPOINT tibotattle_transfer_trigger_policy") aborted = false;
+      if (text === "ROLLBACK") aborted = false;
+      return { rows: [] };
+    },
+    release(error) { calls.push(error ? "release:discard" : "release:reuse"); },
+  };
+  const pool = createCurrentD7DeadlinePool({ async connect() { return rawClient; }, async end() {} }, performance.now() + 5_000);
+  const client = await pool.connect();
+  await client.query("BEGIN");
+  await client.query("SAVEPOINT tibotattle_transfer_trigger_policy");
+  await assert.rejects(client.query("SELECT synthetic_failure"), /synthetic-target-failure/u);
+  await client.query("ROLLBACK TO SAVEPOINT tibotattle_transfer_trigger_policy");
+  await client.query("RELEASE SAVEPOINT tibotattle_transfer_trigger_policy");
+  await client.query("ROLLBACK");
+  assert.deepEqual(calls, [
+    "SELECT set_config('statement_timeout', $1, false)", "BEGIN",
+    "SELECT set_config('statement_timeout', $1, false)", "SAVEPOINT tibotattle_transfer_trigger_policy",
+    "SELECT set_config('statement_timeout', $1, false)", "SELECT synthetic_failure",
+    "ROLLBACK TO SAVEPOINT tibotattle_transfer_trigger_policy",
+    "SELECT set_config('statement_timeout', $1, false)", "RELEASE SAVEPOINT tibotattle_transfer_trigger_policy",
+    "ROLLBACK",
+  ], "the two exact importer-owned cleanups reach an aborted transaction without an illegal setter");
+  await client.release();
+
+  calls.length = 0;
+  const statements = createCurrentD7DeadlinePool({ async connect() { return rawClient; }, async end() {} }, performance.now() + 5_000);
+  await statements.query("ROLLBACK; SELECT must_not_use_cleanup_bypass");
+  await statements.query("ROLLBACK TO SAVEPOINT another_savepoint");
+  assert.deepEqual(calls, [
+    "SELECT set_config('statement_timeout', $1, false)", "ROLLBACK; SELECT must_not_use_cleanup_bypass",
+    "release:reuse", "SELECT set_config('statement_timeout', $1, false)", "ROLLBACK TO SAVEPOINT another_savepoint",
+    "release:reuse",
+  ], "multi-statement and non-owned savepoint text use the regular bounded query path");
+});
+
+test("D7 refuses the target statement if timeout setup consumes the deadline reserve", async () => {
+  const calls = [];
+  const pool = createCurrentD7DeadlinePool({
+    async connect() { return { async query(text) {
+      calls.push(text);
+      if (text.startsWith("SELECT set_config")) await new Promise((resolveDelay) => setTimeout(resolveDelay, 750));
+      return { rows: [] };
+    }, release(error) { calls.push({ release: true, error }); } }; },
+    async end() {},
+  }, performance.now() + 1_700);
+  await assert.rejects(pool.query("SELECT too_late"), refused("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED"));
+  assert.deepEqual(calls.map((entry) => typeof entry === "string" ? entry : "release"), [
+    "SELECT set_config('statement_timeout', $1, false)", "release",
+  ], "the target SQL is not sent after configuration uses the deadline reserve");
+});
+
+test("D7 origin readiness timeout terminates and reaps a child before its late-ready line", async () => {
+  const code = [
+    "process.on('SIGTERM', () => process.exit(0));",
+    "process.stdout.write('armed\\n');",
+    "setTimeout(() => process.stdout.write(JSON.stringify({origin:'http://127.0.0.1:1'}) + '\\n'), 250);",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", code], { stdio: ["ignore", "pipe", "pipe"] });
+  await new Promise((resolveReady, rejectReady) => {
+    child.stdout.once("data", resolveReady);
+    child.once("error", rejectReady);
+  });
+  await assert.rejects(awaitCurrentD7OriginReadiness(child, { readyTimeoutMs: 25 }),
+    refused("REHEARSAL_ORIGIN_START_TIMEOUT"));
+  assert.equal(child.exitCode, 0, "the controller waits for its own SIGTERM-handled child to exit");
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+  assert.equal(child.exitCode, 0, "the delayed readiness output cannot resurrect or orphan the child");
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness rejects an early-exit child without returning a dead handle", async () => {
+  const child = spawn(process.execPath, ["-e", "process.stdout.write(JSON.stringify({origin:'http://127.0.0.1:1'}) + '\\n'); process.exit(7);"],
+    { stdio: ["ignore", "pipe", "pipe"] });
+  await assert.rejects(awaitCurrentD7OriginReadiness(child, { readyTimeoutMs: 500 }),
+    refused("REHEARSAL_ORIGIN_START_FAILED"));
+  assert.equal(child.exitCode, 7);
+  assert.equal(child.signalCode, null);
+});
+
 test("wrong, relative and symlink current image paths refuse before executable or source access", async () => {
   const directory = await mkdtemp(join(tmpdir(), "current-image-pin-negative-"));
   try {
@@ -392,12 +692,29 @@ test("S9 keeps a valid failed report available for exact schema cleanup and refu
       (error) => error.code === "S9_REHEARSAL_REPORT_INVALID" && error.message === error.code);
   }
   const edge = await readFile(new URL("../postgres-test/edge-origin-e2e.spec.mjs", import.meta.url), "utf8");
-  const entry = edge.slice(edge.indexOf('test("S9 golden:'));
-  assert.ok(entry.indexOf("await withS9OwnedSchemaCleanup(rehearsal,")
-    < entry.indexOf("assertS9ChildCompleted(seeded.childCompletion)"));
-  assert.match(entry, /async \(kept\) => \{[\s\S]*?for \(const name of \[\.\.\.kept\]\.reverse\(\)\)/u);
-  assert.doesNotMatch(edge.slice(edge.indexOf("async function seededRehearsal()"), edge.indexOf('test("S9 golden:')),
-    /catch\(\(\) => undefined\)/u);
+  const producerStart = edge.indexOf("async function seededRehearsal()");
+  const producerEnd = edge.indexOf("\nasync function removeCurrentD7PrivateOutput", producerStart);
+  assert.ok(producerStart >= 0 && producerEnd > producerStart, "the S9 producer boundary is present");
+  const producer = edge.slice(producerStart, producerEnd);
+  const readReport = producer.indexOf("const report = await readS9ChildReport(out, completion.metadata);");
+  const validateOwnership = producer.indexOf("if (!CURRENT_D7) ownedKeptRehearsalSchemas(report);");
+  const handoff = producer.indexOf("result = { report, evidence, runtime, imageRuntime, staged, artifactsPreserved,");
+  const returnResult = producer.indexOf("return result;");
+  assert.ok(readReport >= 0 && validateOwnership > readReport && handoff > validateOwnership && returnResult > handoff,
+    "a valid failed-child report reaches the caller with its exact owned schemas before cleanup is decided");
+  assert.doesNotMatch(producer, /catch\(\(\) => undefined\)/u,
+    "report and ownership failures cannot be swallowed before the cleanup boundary");
+  const goldenLabel = edge.indexOf('"S9 golden:');
+  const integrationStart = edge.lastIndexOf("test(CURRENT_D7", goldenLabel);
+  assert.ok(goldenLabel >= 0 && integrationStart >= 0, "the integrated S9 consumer test is present");
+  const integration = edge.slice(integrationStart);
+  const seeded = integration.indexOf("const seeded = await seededRehearsal();");
+  const rehearsal = integration.indexOf("const rehearsal = seeded.report;");
+  const cleanup = integration.indexOf("await withS9OwnedSchemaCleanup(rehearsal, async (kept) => {");
+  const failedChild = integration.indexOf("assertS9ChildCompleted(seeded.childCompletion);");
+  assert.ok(seeded >= 0 && rehearsal > seeded && cleanup > rehearsal && failedChild > cleanup,
+    "the consumer carries the report into exact schema cleanup before rejecting a failed child");
+  assert.match(integration, /async \(kept\) => \{[\s\S]*?for \(const name of \[\.\.\.kept\]\.reverse\(\)/u);
 });
 
 test("S9 private output preserves a bounded exact tail and its truncation fact", () => {
@@ -577,11 +894,27 @@ test("S9 successful cleanup preserves only a bounded exact closed progress journ
   assert.throws(() => validateS9ProgressJournal(Buffer.alloc(S9_DIAGNOSTIC_BYTES + 1),
     { records: 0, bytes: S9_DIAGNOSTIC_BYTES + 1, preserved: true }));
   const edge = await readFile(new URL("../postgres-test/edge-origin-e2e.spec.mjs", import.meta.url), "utf8");
-  const body = edge.slice(edge.indexOf("async function seededRehearsal()"), edge.indexOf('test("S9 golden:'));
-  const completion = body.indexOf('await preserve("s9-child-completion"');
-  const progress = body.indexOf('await preserve("s9-progress"');
-  const discard = body.indexOf('discardDirectory = completion.metadata.state === "completed" && artifactsPreserved');
-  const remove = body.indexOf('await rm(directory,');
-  assert.ok(completion >= 0 && progress > completion && discard > progress && remove > discard,
-    "successful directory deletion occurs only after requested wx diagnostic sidecars are preserved");
+  const producerStart = edge.indexOf("async function seededRehearsal()");
+  const producerEnd = edge.indexOf("\nasync function removeCurrentD7PrivateOutput", producerStart);
+  assert.ok(producerStart >= 0 && producerEnd > producerStart, "the S9 producer boundary is present");
+  const producer = edge.slice(producerStart, producerEnd);
+  const report = producer.indexOf('if (!CURRENT_D7) await preserve("s9-rehearsal", report);');
+  const completion = producer.indexOf('await preserve("s9-child-completion",');
+  const progress = producer.indexOf('await preserve("s9-progress",');
+  const discard = producer.indexOf('discardDirectory = !CURRENT_D7 && completion.metadata.state === "completed" && artifactsPreserved');
+  const guard = producer.indexOf("if (discardDirectory) {", discard);
+  const remove = producer.indexOf('await rm(directory, { recursive: true, force: true });', guard);
+  assert.ok(report >= 0 && completion > report && progress > completion && discard > progress
+    && guard > discard && remove > guard,
+  "report, child-completion and closed progress sidecars are preserved before completed-run directory cleanup");
+  assert.match(producer,
+    /discardDirectory = !CURRENT_D7 && completion.metadata.state === "completed" && artifactsPreserved\s*&& \(!CURRENT_Q1 \|\| evidence !== null\);/u,
+    "directory cleanup requires a completed child, successful preservation and any required current evidence");
+  const preserveStart = edge.indexOf("async function preserveS9Artifact(suffix, value) {");
+  const preserveEnd = edge.indexOf("\n}", preserveStart);
+  assert.ok(preserveStart >= 0 && preserveEnd > preserveStart, "the S9 artifact writer is present");
+  assert.match(edge.slice(preserveStart, preserveEnd), /\{ flag: "wx", mode: 0o600 \}/u,
+    "requested sidecars use exact create-only owner-private writes");
+  assert.match(producer.slice(guard), /if \(discardDirectory\) \{\s*try \{\s*await rm\(directory, \{ recursive: true, force: true \}\);/u,
+    "only the completed-run preservation gate can remove the producer directory");
 });

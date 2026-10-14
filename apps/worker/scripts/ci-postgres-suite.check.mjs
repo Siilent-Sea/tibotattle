@@ -796,7 +796,23 @@ ok 1 - ${name}
 `;
 }
 
-function fakeSuiteRunner({ plan, skipFile = null, prerequisiteExit = 0 }) {
+function tapForStatuses(file, statuses, { reportedTests = statuses.length } = {}) {
+  const counts = { passed: 0, failed: 0, skipped: 0, todo: 0 };
+  const lines = ["TAP version 13", `# Subtest: ${file}`];
+  statuses.forEach((status, index) => {
+    const name = `synthetic case ${index + 1}`;
+    const tapStatus = status === "failed" ? "not ok" : "ok";
+    const directive = status === "skipped" ? " # SKIP" : status === "todo" ? " # TODO" : "";
+    lines.push(`    # Subtest: ${name}`, `    ${tapStatus} ${index + 1} - ${name}${directive}`);
+    counts[status] += 1;
+  });
+  lines.push(`    1..${statuses.length}`, `ok 1 - ${file}`, "1..1", `# tests ${reportedTests}`,
+    "# suites 1", `# pass ${counts.passed}`, `# fail ${counts.failed}`, "# cancelled 0",
+    `# skipped ${counts.skipped}`, `# todo ${counts.todo}`, "");
+  return lines.join("\n");
+}
+
+function fakeSuiteRunner({ plan, skipFile = null, prerequisiteExit = 0, outputsByFile = {} }) {
   const calls = [];
   const run = async (command, args, { cwd, env, captureStdout }) => {
     calls.push({ command, args, cwd, env: { ...env }, captureStdout });
@@ -816,6 +832,7 @@ function fakeSuiteRunner({ plan, skipFile = null, prerequisiteExit = 0 }) {
       return { exitCode: 0, stdout: "" };
     }
     const file = args.at(-1).slice(2);
+    if (outputsByFile[file] !== undefined) return outputsByFile[file];
     if (file === skipFile) {
       return { exitCode: 0, stdout: `TAP version 13
 # Subtest: gated
@@ -903,6 +920,66 @@ test("the runner sends each file to its routed profile and never sets PG_TEST_PA
   }
   assert.equal(summary.passedByPass.EDGE_E2E, 1);
   assert.deepEqual(summary.environmentGaps, []);
+});
+
+test("current D7 requires 20 parsed tests only for its explicit registered EDGE_E2E file", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  const runEdge = async ({ file = EDGE_SPEC, statuses, mode, reportedTests }) => {
+    const selectedPlan = file === EDGE_SPEC ? plan : {
+      failures: [],
+      files: [{ file, profile: PROFILE_EDGE_E2E, runner: "script:edge:e2e", source: "edge:e2e",
+        prerequisites: ["node ./cloud-run/build.mjs"], testFlags: ["--test-concurrency=1"] }],
+    };
+    const tap = tapForStatuses(file, statuses, { reportedTests });
+    const { run } = fakeSuiteRunner({ plan: selectedPlan,
+      outputsByFile: { [file]: { exitCode: statuses.includes("failed") ? 1 : 0, stdout: tap } } });
+    return runPostgresSuite({
+      workerRoot: WORKER_ROOT,
+      environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432",
+        ...(mode === undefined ? {} : { EDGE_E2E_S9_COMPARISON_MODE: mode }) },
+      run,
+      onOutput: () => {},
+      plan: selectedPlan,
+      ...(file === EDGE_SPEC ? { partition: "EDGE_E2E" } : {}),
+      probeEdgeE2e: edgeAvailable,
+    });
+  };
+  const passing = (count) => Array.from({ length: count }, () => "passed");
+
+  for (const count of [19, 21]) {
+    const summary = await runEdge({ statuses: passing(count), mode: "current-worker-d1-d7",
+      reportedTests: count === 19 ? 20 : count });
+    assert.equal(summary.status, "failed", `${count} parsed tests cannot qualify current D7`);
+    assert.deepEqual(summary.failures.filter(({ code }) => code === "TAP_TEST_COUNT_MISMATCH")
+      .map(({ file, pass }) => [file, pass]), [[EDGE_SPEC, PROFILE_EDGE_E2E]]);
+  }
+
+  const accepted = await runEdge({ statuses: passing(20), mode: "current-worker-d1-d7" });
+  assert.deepEqual([accepted.status, accepted.tests, accepted.passedByPass.EDGE_E2E], ["passed", 20, 20]);
+  assert.deepEqual(accepted.failures, []);
+
+  const skipped = await runEdge({ statuses: [...passing(19), "skipped"], mode: "current-worker-d1-d7" });
+  assert.equal(skipped.tests, 20, "the count is based on parsed TAP leaves");
+  assert.equal(skipped.status, "failed");
+  assert.deepEqual(codes(skipped.failures), ["SILENTLY_SKIPPED"]);
+
+  const failed = await runEdge({ statuses: [...passing(19), "failed"], mode: "current-worker-d1-d7" });
+  assert.equal(failed.tests, 20);
+  assert.equal(failed.status, "failed");
+  assert.deepEqual(codes(failed.failures), ["FAILED"]);
+
+  for (const [mode, count] of [["current-worker-d1", 15], ["historical", 15], [undefined, 19]]) {
+    const summary = await runEdge({ statuses: passing(count), mode });
+    assert.equal(summary.status, "passed", `${mode ?? "unset mode"} keeps its existing count behavior`);
+    assert.equal(summary.tests, count);
+    assert.deepEqual(summary.failures, []);
+  }
+
+  const otherRegisteredScriptFile = await runEdge({ file: "postgres-test/synthetic-edge.spec.mjs",
+    statuses: passing(19), mode: "current-worker-d1-d7" });
+  assert.equal(otherRegisteredScriptFile.status, "passed",
+    "the current D7 count belongs only to the canonical registered edge file");
+  assert.equal(otherRegisteredScriptFile.tests, 19);
 });
 
 test("a skip inside the routed pass fails the whole run", async () => {
@@ -1537,6 +1614,11 @@ test("aggregate binds exact source, complete plan, runtimes and provider run att
 
 test("aggregate never qualifies failures, skipped, todo, cancelled, parse failures or empty files", async () => {
   const { plan, receipts } = await mockPartitionReceipts();
+  const countMismatch = structuredClone(receipts);
+  countMismatch.find(({ partition }) => partition === "EDGE_E2E").records[0].parseFailures = ["TAP_TEST_COUNT_MISMATCH"];
+  assert.deepEqual(aggregateMock({ plan, receipts: countMismatch }).failures.map(({ code, file }) => [code, file]), [
+    ["TAP_TEST_COUNT_MISMATCH", EDGE_SPEC],
+  ], "the content-free receipt carries the exact-count parse failure into aggregate refusal");
   for (const field of ["failed", "skipped", "todo"]) {
     const copy = structuredClone(receipts); const file = copy[0].records[0].files[0]; file.passed = 0; file[field] = 1;
     assert.equal(aggregateMock({ plan, receipts: copy }).status, "failed", field);

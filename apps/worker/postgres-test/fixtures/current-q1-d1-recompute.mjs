@@ -39,14 +39,18 @@ const typed = (value) => value === null ? ["null"] : typeof value === "string" ?
  * introduced tables. Typed bytes distinguish NULL, text, integers and BLOBs.
  * Only the two exact control-operation targets are split out for separately
  * checked full-row transitions. Unknown tables remain in the invariant. */
-export async function captureCurrentQ1SourceInvariant(database) {
+/** Capture the canonical source invariant together with the closed table
+ * digest vector needed to explain the D7 bootstrap transition. Raw table rows
+ * and schema SQL remain local to this function; callers receive only the
+ * existing invariant projection, per-table typed digests, and its digest. */
+export async function captureCurrentQ1SourceInvariantDetails(database) {
   const schema = (await database.prepare(`SELECT type,name,tbl_name,sql FROM sqlite_schema
     ORDER BY type,name,tbl_name`).all()).results;
   requireFact(Array.isArray(schema) && schema.length < 10_000);
   const tableNames = schema.filter((row) => row.type === "table").map((row) => row.name).sort();
   requireFact(tableNames.includes("collection_controls") && tableNames.includes("admin_action_audit")
     && tableNames.includes("sqlite_sequence"));
-  const tables = [], special = {};
+  const tables = [], tableDigests = [], special = {};
   for (const table of tableNames) {
     const columns = (await database.prepare(`PRAGMA table_info(${quote(table)})`).all()).results;
     requireFact(Array.isArray(columns) && columns.length > 0 && columns.length <= 256);
@@ -66,22 +70,38 @@ export async function captureCurrentQ1SourceInvariant(database) {
         const line = JSON.stringify(selectedNames.map((name) => typed(row[name])));
         totalBytes += Buffer.byteLength(line); countRows++;
         requireFact(countRows <= 1_000_000 && totalBytes <= 256 * 1024 * 1024);
+        hash.update(digest(line)).update("\n");
         if (["collection_controls", "admin_action_audit", "sqlite_sequence"].includes(table)) {
           const projected = { ...row }; delete projected.rowid; rows.push(projected);
         }
-        else hash.update(digest(line)).update("\n");
       }
       if (page.length < 256) break;
     }
+    const tableDigest = { table, rows: countRows, sha256: hash.digest("hex") };
+    tableDigests.push(tableDigest);
     if (["collection_controls", "admin_action_audit", "sqlite_sequence"].includes(table)) special[table] = rows;
-    else tables.push({ table, rows: countRows, sha256: hash.digest("hex") });
+    else tables.push(tableDigest);
   }
   requireFact(special.collection_controls.length === 1 && special.admin_action_audit.length <= 256);
   special.sqlite_sequence.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
   const otherSequences = special.sqlite_sequence.filter((row) => row.name !== "admin_action_audit");
-  return { sha256: digest({ schema, tables, otherSequences }), schemaSha256: digest(schema),
+  const invariant = { sha256: digest({ schema, tables, otherSequences }), schemaSha256: digest(schema),
     controls: special.collection_controls, audit: special.admin_action_audit,
     sequences: special.sqlite_sequence };
+  // `tables` remains the original invariant vector so its hash and the
+  // public v2 projection stay byte-for-byte compatible. `tableDigests` is a
+  // separate all-table vector for the D7 bootstrap-preservation proof; it
+  // includes controls, audit and sqlite_sequence without retaining row data.
+  const details = { ...invariant, tables, tableDigests };
+  return { ...details, fullSourceCaptureSha256: digest(details) };
+}
+
+/** Keep the existing v2 public return shape exactly stable by projecting the
+ * detail capture through the original invariant fields. */
+export async function captureCurrentQ1SourceInvariant(database) {
+  const details = await captureCurrentQ1SourceInvariantDetails(database);
+  return { sha256: details.sha256, schemaSha256: details.schemaSha256, controls: details.controls,
+    audit: details.audit, sequences: details.sequences };
 }
 
 export function assertCurrentQ1SourceUnchanged(before, after) {

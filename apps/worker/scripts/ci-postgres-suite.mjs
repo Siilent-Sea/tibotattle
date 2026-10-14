@@ -43,7 +43,7 @@
  *   REGISTRATION_DUPLICATE, REGISTRATION_PARSE_FAILED,
  *   PROFILE_ROUTING_AMBIGUOUS, PROFILE_ROUTING_DRIFT, UNPLANNED_SPEC_RESULT,
  *   SUITE_PROCESS_FAILED, PREREQUISITE_FAILED, TAP_INCOMPLETE,
- *   TAP_PARSE_MISMATCH, VITEST_REPORT_INVALID.
+ *   TAP_PARSE_MISMATCH, TAP_TEST_COUNT_MISMATCH, VITEST_REPORT_INVALID.
  * Environment gaps (reported apart from failures): ENVIRONMENT_GAP.
  *
  * An ENV_PROFILE_CONFLICT belongs to the family that owns the named spec. This
@@ -229,6 +229,9 @@ export const EDGE_E2E_NODE_VARIABLE = "EDGE_E2E_NODE";
  */
 export const EDGE_E2E_NODE_FLAGS = Object.freeze(["--experimental-strip-types"]);
 export const EDGE_E2E_GOLDEN_VARIABLE = "EDGE_E2E_GOLDEN";
+const EDGE_E2E_S9_MODE_VARIABLE = "EDGE_E2E_S9_COMPARISON_MODE";
+const CURRENT_D7_S9_MODE = "current-worker-d1-d7";
+const CURRENT_D7_EDGE_E2E_TEST_COUNT = 20;
 
 export function scriptRunner(script) {
   return `script:${script}`;
@@ -826,7 +829,7 @@ function splitTapDescription(description) {
  * tests keyed by their full name; the synthetic point node emits for a file
  * that produced no test (or failed to load) becomes a file-level result.
  */
-export function parseNodeTap(text, { absoluteFile, cwd }) {
+export function parseNodeTap(text, { absoluteFile, cwd, expectedTestCount }) {
   const lines = String(text).split(/\r?\n/u);
   const subtests = [];
   const hasChildren = [];
@@ -921,6 +924,9 @@ export function parseNodeTap(text, { absoluteFile, cwd }) {
         || ((trailer.fail ?? 0) + (trailer.cancelled ?? 0) > 0 && parsedFailures === 0)) {
       parseFailures.push("TAP_PARSE_MISMATCH");
     }
+  }
+  if (expectedTestCount !== undefined && tests.length !== expectedTestCount) {
+    parseFailures.push("TAP_TEST_COUNT_MISMATCH");
   }
   return Object.freeze({
     tests: Object.freeze(tests),
@@ -1346,7 +1352,16 @@ export async function runPostgresSuite({
         "--test-reporter=tap",
         `./${entry.file}`,
       ], { cwd: workerRoot, env: passEnv, captureStdout: true });
-      const parsed = parseNodeTap(stdout, { absoluteFile, cwd: workerRoot });
+      const registeredD7EdgeSpec = entry.file === EDGE_PARTITION_FILES[0]
+        && entry.profile === PROFILE_EDGE_E2E
+        && entry.source === "edge:e2e"
+        && entry.runner === scriptRunner("edge:e2e")
+        && SCRIPT_PROFILES[entry.source] === entry.profile;
+      const expectedTestCount = registeredD7EdgeSpec
+        && environment[EDGE_E2E_S9_MODE_VARIABLE] === CURRENT_D7_S9_MODE
+        ? CURRENT_D7_EDGE_E2E_TEST_COUNT
+        : undefined;
+      const parsed = parseNodeTap(stdout, { absoluteFile, cwd: workerRoot, expectedTestCount });
       progress("completed", PROFILE_EDGE_E2E, entry.runner, [entry.file]);
       onOutput({ file: entry.file, text: stdout, result: parsed });
       records.push({
@@ -1431,7 +1446,7 @@ const SHA256 = /^[a-f0-9]{64}$/u;
 const GIT_HEAD = /^[a-f0-9]{40}$/u;
 const PROVIDER_NUMBER = /^[1-9][0-9]{0,19}$/u;
 const MAX_TESTS_PER_FILE = 100_000;
-const RECEIPT_PARSE_FAILURES = new Set(["TAP_INCOMPLETE", "TAP_PARSE_MISMATCH", "VITEST_REPORT_INVALID", "PREREQUISITE_FAILED"]);
+const RECEIPT_PARSE_FAILURES = new Set(["TAP_INCOMPLETE", "TAP_PARSE_MISMATCH", "TAP_TEST_COUNT_MISMATCH", "VITEST_REPORT_INVALID", "PREREQUISITE_FAILED"]);
 const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");

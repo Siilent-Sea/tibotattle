@@ -49,8 +49,8 @@
 // execution attestation. No saved-reference or injected-producer CLI path exists.
 //
 // Options:
-//   --comparison-mode <mode>    historical (default) or current-worker-d1;
-//                               current mode accepts only immutable Q-1 inputs
+//   --comparison-mode <mode>    historical (default), current-worker-d1, or
+//                               current-worker-d1-d7 (the closed two-case Q1 mode)
 //   --golden <dir>              the oracle golden (required)
 //   --dump <usage-monitor-db.json>
 //                               the golden's source dump when the golden does not
@@ -106,7 +106,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { chmod, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { homedir, tmpdir } from "node:os";
@@ -165,10 +165,11 @@ import {
   runPostgresV12Transfer,
 } from "./postgres-v12-transfer.mjs";
 
-import { createS9Progress } from "./s9-rehearsal-diagnostics.mjs";
+import { createS9Progress, S9_REHEARSAL_DEADLINE_MS } from "./s9-rehearsal-diagnostics.mjs";
 
 export const GCP_FASTPATH_REHEARSAL_REPORT_VERSION = "gcp-fastpath-rehearsal-report-v1";
 export const GCP_FASTPATH_CURRENT_REHEARSAL_REPORT_VERSION = "gcp-fastpath-current-rehearsal-report-v1";
+export const GCP_FASTPATH_CURRENT_D7_REHEARSAL_REPORT_VERSION = "gcp-fastpath-current-d7-rehearsal-report-v1";
 
 const execFileAsync = promisify(execFile);
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -178,6 +179,15 @@ const DIST_SERVER = join(CLOUD_RUN_ROOT, "dist", "server.mjs");
 const DEFAULT_NODE22 = join(homedir(), ".nvm/versions/node/v22.16.0/bin/node");
 const PRIVATE_SOCKET = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const CURRENT_D7_CASES = Object.freeze(["conflictPreserving", "conflictFreePositive"]);
+const CURRENT_D7_CASE_DIRECTORY = Object.freeze({
+  conflictPreserving: "conflictPreserving",
+  conflictFreePositive: "conflictFreePositive",
+});
+const CURRENT_D7_STATEMENT_TIMEOUT_RESERVE_MS = 1_000;
+const CURRENT_D7_ORIGIN_TERM_GRACE_MS = 1_000;
+const CURRENT_D7_ORIGIN_KILL_REAP_MS = 1_000;
+const INTERNAL_CURRENT_D7_CASE = Symbol("internal-current-d7-case");
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
 const DEFAULT_REFRESH_TIMEOUT_MINUTES = 30;
 const MAX_REFRESH_TIMEOUT_MINUTES = 720;
@@ -241,6 +251,39 @@ export async function assertCurrentRehearsalOutputsNew(out) {
   return destinations;
 }
 
+/** Closed sidecar output set for the explicit two-case D7 handoff. */
+export function currentD7RehearsalOutputDestinations(out) {
+  if (typeof out !== "string" || out.length === 0 || out.length > 4_096
+    || /[\u0000-\u001f\u007f]/u.test(out) || !isAbsolute(out)
+    || resolve(out) !== out || dirname(out) === out) {
+    fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--out" });
+  }
+  return [out, `${out}.current-d7-reference.json`, `${out}.current-d7-binding.json`,
+    `${out}.current-d7-producer-acceptance.json`, `${out}.current-d7-conflict-preserving-case.json`,
+    `${out}.current-d7-conflict-free-positive-case.json`, `${out}.current-d7-contract.json`,
+    `${out}.current-d7-input-binding-capture.json`];
+}
+
+/** Preflight the entire v3 handoff without following existing destinations. */
+export async function assertCurrentD7RehearsalOutputsNew(out) {
+  const destinations = currentD7RehearsalOutputDestinations(out);
+  let parent;
+  try { parent = await lstat(dirname(out)); } catch { fail("REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE"); }
+  if (!parent.isDirectory() || parent.isSymbolicLink() || (process.getuid && parent.uid !== process.getuid())
+    || (parent.mode & 0o077) !== 0 || (parent.mode & 0o700) !== 0o700
+    || await realpath(dirname(out)) !== dirname(out)) fail("REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE");
+  for (const [index, path] of destinations.entries()) {
+    try {
+      await lstat(path);
+      fail("REHEARSAL_CURRENT_OUTPUT_EXISTS", { destination: index });
+    } catch (error) {
+      if (error instanceof RehearsalError) throw error;
+      if (error?.code !== "ENOENT") fail("REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE", { destination: index });
+    }
+  }
+  return destinations;
+}
+
 export function parseArguments(argv) {
   const options = {
     golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
@@ -263,7 +306,7 @@ export function parseArguments(argv) {
     else if (argument === "--dense") options.dense = true;
     else if (argument === "--comparison-mode") {
       const mode = valueOf(++index, argument);
-      if (comparisonModeSeen || !["historical", "current-worker-d1"].includes(mode)) {
+      if (comparisonModeSeen || !["historical", "current-worker-d1", "current-worker-d1-d7"].includes(mode)) {
         fail("REHEARSAL_ARGUMENT_INVALID", { argument });
       }
       comparisonModeSeen = true; options.comparisonMode = mode;
@@ -313,6 +356,17 @@ export function parseArguments(argv) {
   if (options.comparisonMode === "current-worker-d1") currentRehearsalOutputDestinations(options.out);
   if (options.comparisonMode === "current-worker-d1" && (options.dense || options.ownerReference !== null)) {
     fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--comparison-mode" });
+  }
+  if (options.comparisonMode === "current-worker-d1-d7") {
+    if (!options.keepSchema) fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--keep-schema" });
+    if (options.reuseSchema !== null) fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--reuse-schema" });
+    if (options.dump !== null) fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--dump" });
+    if (options.perDateExpected !== null) fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--per-date-expected" });
+    if (options.ownerReference !== null || options.dense || options.syntheticRevisionFloor
+      || options.stagedPrimary.length > 0) {
+      fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--comparison-mode" });
+    }
+    currentD7RehearsalOutputDestinations(options.out);
   }
   if (options.dense) {
     // A dense golden carries its own per-date expectation and owner references.
@@ -382,6 +436,111 @@ async function sha256OfFile(path) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest("hex");
+}
+
+function sameD7FileStat(left, right) {
+  return left.isFile() && right.isFile() && !left.isSymbolicLink() && !right.isSymbolicLink()
+    && left.dev === right.dev && left.ino === right.ino && left.uid === right.uid && left.nlink === right.nlink
+    && left.size === right.size && left.mode === right.mode && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+/** Recheck both exact sealed transport files, their ownership and descriptor hashes. */
+async function verifyCurrentD7PgCaseInputFiles({ descriptor, binding, caseId, pgInputDirectory, validateDescriptor }) {
+  validateDescriptor(descriptor, binding, caseId, { expectedDirectory: join(pgInputDirectory, CURRENT_D7_CASE_DIRECTORY[caseId]) });
+  const rootStat = await lstat(pgInputDirectory);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || (process.getuid && rootStat.uid !== process.getuid())
+    || (rootStat.mode & 0o777) !== 0o700 || await realpath(pgInputDirectory) !== pgInputDirectory) {
+    fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+  }
+  const caseDirectory = join(pgInputDirectory, CURRENT_D7_CASE_DIRECTORY[caseId]);
+  const directoryStat = await lstat(caseDirectory);
+  const canonicalDirectory = await realpath(caseDirectory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || canonicalDirectory !== caseDirectory
+    || (process.getuid && directoryStat.uid !== process.getuid()) || (directoryStat.mode & 0o777) !== 0o700) {
+    fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+  }
+  const names = (await readdir(caseDirectory)).sort();
+  if (JSON.stringify(names) !== JSON.stringify(["ingestion.sqlite", "journal.sqlite"])) {
+    fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+  }
+  const observed = {};
+  for (const [kind, name] of [["ingestion", "ingestion.sqlite"], ["journal", "journal.sqlite"]]) {
+    const file = descriptor[kind];
+    const expectedPath = join(caseDirectory, name);
+    if (file.path !== expectedPath) fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+    let before;
+    try { before = await lstat(file.path); } catch { fail("REHEARSAL_CURRENT_D7_INPUT_INVALID"); }
+    if (!before.isFile() || before.isSymbolicLink() || (process.getuid && before.uid !== process.getuid())
+      || before.nlink !== 1 || (before.mode & 0o777) !== 0o444 || before.size !== file.bytes
+      || await realpath(file.path) !== file.path) fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+    const sha256 = await sha256OfFile(file.path);
+    let after;
+    try { after = await lstat(file.path); } catch { fail("REHEARSAL_CURRENT_D7_INPUT_INVALID"); }
+    if (!sameD7FileStat(before, after) || sha256 !== file.sha256) fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+    observed[kind] = { sha256, bytes: before.size, dev: before.dev, ino: before.ino, uid: before.uid,
+      mode: before.mode, nlink: before.nlink, mtimeMs: before.mtimeMs, ctimeMs: before.ctimeMs };
+  }
+  return observed;
+}
+
+async function writeCurrentD7Sidecar(path, value) {
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await writeFile(path, bytes, { flag: "wx", mode: 0o600 });
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (process.getuid && metadata.uid !== process.getuid())
+    || (metadata.mode & 0o777) !== 0o600 || metadata.nlink !== 1 || metadata.size !== bytes.length) {
+    fail("REHEARSAL_CURRENT_D7_OUTPUT_INVALID");
+  }
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function exactCurrentD7Keys(value, keys, code = "REHEARSAL_CURRENT_D7_EVIDENCE_INVALID") {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...keys].sort())) fail(code);
+  return value;
+}
+
+function sameCurrentD7Json(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function currentD7Hash(value) {
+  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+function cloneAndFreezeCurrentD7Json(value) {
+  let clone;
+  try { clone = JSON.parse(JSON.stringify(value)); }
+  catch { fail("REHEARSAL_CURRENT_D7_INPUT_BINDING_INVALID"); }
+  const freeze = (current) => {
+    if (current !== null && typeof current === "object" && !Object.isFrozen(current)) {
+      for (const child of Object.values(current)) freeze(child);
+      Object.freeze(current);
+    }
+    return current;
+  };
+  return freeze(clone);
+}
+
+async function currentD7SidecarMetadata(path) {
+  let metadata;
+  try { metadata = await lstat(path); } catch { fail("REHEARSAL_CURRENT_D7_OUTPUT_INVALID"); }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (process.getuid && metadata.uid !== process.getuid())
+    || (metadata.mode & 0o777) !== 0o600 || metadata.nlink !== 1 || await realpath(path) !== path) {
+    fail("REHEARSAL_CURRENT_D7_OUTPUT_INVALID");
+  }
+  return metadata;
+}
+
+async function verifyCurrentD7InputBindingCapture(path, expectedMetadata, expectedSha256) {
+  const before = await currentD7SidecarMetadata(path);
+  if (!sameD7FileStat(expectedMetadata, before)) fail("REHEARSAL_CURRENT_D7_INPUT_BINDING_CAPTURE_CHANGED");
+  const sha256 = await sha256OfFile(path);
+  const after = await currentD7SidecarMetadata(path);
+  if (!sameD7FileStat(before, after) || sha256 !== expectedSha256) {
+    fail("REHEARSAL_CURRENT_D7_INPUT_BINDING_CAPTURE_CHANGED");
+  }
+  return sha256;
 }
 
 /** Pin the actual PG runner inputs independently of its output. */
@@ -469,7 +628,9 @@ async function localEndpoint(env) {
   return fail("REHEARSAL_DATABASE_UNCONFIGURED");
 }
 
-function poolOptions(endpoint, max, applicationName) {
+function poolOptions(endpoint, max, applicationName, { deadlineMonotonicMs } = {}) {
+  const statementTimeoutMs = deadlineMonotonicMs === undefined ? null
+    : currentD7StatementTimeoutMs(deadlineMonotonicMs);
   return {
     host: endpoint.host,
     port: endpoint.port,
@@ -478,7 +639,8 @@ function poolOptions(endpoint, max, applicationName) {
     ...(process.env.PG_TEST_PASSWORD ? { password: process.env.PG_TEST_PASSWORD } : {}),
     ssl: false,
     max,
-    connectionTimeoutMillis: 10_000,
+    connectionTimeoutMillis: statementTimeoutMs === null ? 10_000 : Math.min(10_000, statementTimeoutMs),
+    ...(statementTimeoutMs === null ? {} : { statement_timeout: statementTimeoutMs }),
     application_name: applicationName,
   };
 }
@@ -497,6 +659,359 @@ async function timed(timings, name, work) {
   }
 }
 
+/** One monotonic deadline is shared by both D7 cases and every child start. */
+export function currentD7RemainingMs(deadlineMonotonicMs, nowMonotonicMs = performance.now()) {
+  if (!Number.isFinite(deadlineMonotonicMs) || !Number.isFinite(nowMonotonicMs)) {
+    fail("REHEARSAL_CURRENT_D7_DEADLINE_INVALID");
+  }
+  const remaining = Math.floor(deadlineMonotonicMs - nowMonotonicMs);
+  if (remaining <= 0) fail("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED");
+  return remaining;
+}
+
+/**
+ * Reserve a short local-connection margin for setting the server timeout before
+ * each D7 statement. PostgreSQL's statement_timeout performs server-side query
+ * cancellation; the parent process deadline remains the absolute 40-minute cap.
+ */
+export function currentD7StatementTimeoutMs(deadlineMonotonicMs, nowMonotonicMs = performance.now()) {
+  const remaining = currentD7RemainingMs(deadlineMonotonicMs, nowMonotonicMs);
+  const statementTimeoutMs = remaining - CURRENT_D7_STATEMENT_TIMEOUT_RESERVE_MS;
+  if (statementTimeoutMs <= 0) fail("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED");
+  return statementTimeoutMs;
+}
+
+function assertCurrentD7PromisePgArguments(args, operation) {
+  if (args.length === 0 || args.some((argument) => typeof argument === "function")) {
+    fail("REHEARSAL_CURRENT_D7_PG_ADAPTER_INVALID", { operation });
+  }
+}
+
+async function checkoutCurrentD7Client(pool, deadlineMonotonicMs) {
+  const remainingMs = currentD7RemainingMs(deadlineMonotonicMs);
+  let timedOut = false;
+  let timer;
+  const timeoutError = new RehearsalError("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED");
+  const pending = Promise.resolve().then(() => pool.connect());
+  pending.then((client) => {
+    if (timedOut) {
+      try { client.release(timeoutError); } catch { /* no query may use a late checkout */ }
+    }
+  }, () => {});
+  const deadline = new Promise((resolveDeadline, rejectDeadline) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      rejectDeadline(timeoutError);
+    }, remainingMs);
+  });
+  let client;
+  try {
+    client = await Promise.race([pending, deadline]);
+    if (timedOut) throw timeoutError;
+    currentD7RemainingMs(deadlineMonotonicMs);
+    return client;
+  } catch (error) {
+    if (client) {
+      try { client.release(error); } catch { /* preserve the acquisition failure */ }
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function currentD7QueryText(args) {
+  const query = args[0];
+  if (typeof query === "string") return query;
+  if (query !== null && typeof query === "object" && typeof query.text === "string") return query.text;
+  return "";
+}
+
+/** Only importer-owned string statements may bypass the per-query setter. */
+function isCurrentD7OwnedRollbackCleanup(args) {
+  if (args.length !== 1 || typeof args[0] !== "string") return false;
+  const text = args[0];
+  const statement = text.trim().replace(/\s+/gu, " ").replace(/;$/u, "").toUpperCase();
+  return statement === "ROLLBACK"
+    || statement === "ROLLBACK TO SAVEPOINT TIBOTATTLE_TRANSFER_TRIGGER_POLICY";
+}
+
+function makeCurrentD7DeadlineClient(client, deadlineMonotonicMs) {
+  let tail = Promise.resolve();
+  let discardError = null;
+  const query = (...args) => {
+    assertCurrentD7PromisePgArguments(args, "query");
+    const operation = tail.then(async () => {
+      if (discardError !== null) throw discardError;
+      try {
+        // An aborted transaction only accepts ROLLBACK. These two exact
+        // importer cleanup statements cannot be preceded by set_config: that
+        // command is itself refused by PostgreSQL in an aborted transaction.
+        // The connection retains the server-side statement_timeout installed
+        // by poolOptions or the last successful D7 statement. The controller's
+        // original absolute child deadline remains the outer bound; refuse
+        // cleanup with less than the setter reserve and discard the session.
+        if (isCurrentD7OwnedRollbackCleanup(args)) {
+          currentD7StatementTimeoutMs(deadlineMonotonicMs);
+          return await client.query(...args);
+        }
+
+        const timeoutMs = currentD7StatementTimeoutMs(deadlineMonotonicMs);
+        await client.query("SELECT set_config('statement_timeout', $1, false)", [`${timeoutMs}ms`]);
+        // Config/target stay adjacent in this per-client queue, and a query that
+        // waited for another operation or for connection acquisition is refused.
+        // The setter itself has a bounded startup/prior-session timeout. If it
+        // consumed the one-second reserve, do not send a target statement whose
+        // server timeout could now outlive this controller's absolute deadline.
+        currentD7StatementTimeoutMs(deadlineMonotonicMs);
+        return await client.query(...args);
+      } catch (error) {
+        if (error?.code === "REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED"
+          || performance.now() >= deadlineMonotonicMs) {
+          // A timed-out owner must not return an open or aborted session to pg's
+          // reusable pool. Do not permit later work after this point either.
+          discardError ??= error;
+        } else if (isCurrentD7OwnedRollbackCleanup(args)) {
+          // A failed rollback leaves transaction state unknown. pg discards the
+          // session when release receives this error.
+          discardError ??= error;
+        }
+        throw error;
+      }
+    });
+    tail = operation.then(() => undefined, () => undefined);
+    return operation;
+  };
+  const release = (...args) => {
+    const releaseAfterPendingQueries = () => client.release(args[0] ?? discardError, ...args.slice(1));
+    return tail.then(releaseAfterPendingQueries, releaseAfterPendingQueries);
+  };
+  return new Proxy(client, {
+    get(target, property) {
+      if (property === "query") return query;
+      if (property === "release") return release;
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/**
+ * D7-only adapter over pg's public Pool/PoolClient query/connect/end surface.
+ * It configures PostgreSQL statement_timeout on the same checked-out client as
+ * each statement, serializing that setup with the statement for transactions.
+ */
+export function createCurrentD7DeadlinePool(pool, deadlineMonotonicMs) {
+  if (pool === null || typeof pool !== "object" || typeof pool.connect !== "function"
+    || typeof pool.end !== "function") fail("REHEARSAL_CURRENT_D7_PG_ADAPTER_INVALID");
+  currentD7RemainingMs(deadlineMonotonicMs);
+  return new Proxy(pool, {
+    get(target, property) {
+      if (property === "connect") return async (...args) => {
+        if (args.length !== 0) fail("REHEARSAL_CURRENT_D7_PG_ADAPTER_INVALID", { operation: "connect" });
+        const client = await checkoutCurrentD7Client(target, deadlineMonotonicMs);
+        return makeCurrentD7DeadlineClient(client, deadlineMonotonicMs);
+      };
+      if (property === "query") return async (...args) => {
+        assertCurrentD7PromisePgArguments(args, "query");
+        const client = await checkoutCurrentD7Client(target, deadlineMonotonicMs);
+        let releaseError;
+        try {
+          return await makeCurrentD7DeadlineClient(client, deadlineMonotonicMs).query(...args);
+        } catch (error) {
+          releaseError = error;
+          throw error;
+        } finally {
+          client.release(releaseError);
+        }
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function waitForCurrentD7OwnedChildExit(exited, timeoutMs) {
+  let timer;
+  return Promise.race([exited, new Promise((resolveExit) => {
+    timer = setTimeout(() => resolveExit(null), timeoutMs);
+  })]).finally(() => clearTimeout(timer));
+}
+
+async function stopCurrentD7OwnedChild(child, exited, spawned) {
+  const running = () => child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+  if (child.pid === undefined && child.exitCode === null && child.signalCode === null) {
+    const didSpawn = await waitForCurrentD7OwnedChildExit(spawned, CURRENT_D7_ORIGIN_TERM_GRACE_MS);
+    if (didSpawn === false) return (await waitForCurrentD7OwnedChildExit(exited, CURRENT_D7_ORIGIN_TERM_GRACE_MS))
+      ?? { spawnError: true };
+    if (didSpawn === null) fail("REHEARSAL_ORIGIN_CHILD_CLEANUP_FAILED");
+  }
+  if (!running()) {
+    const result = await waitForCurrentD7OwnedChildExit(exited, CURRENT_D7_ORIGIN_TERM_GRACE_MS);
+    if (result === null) fail("REHEARSAL_ORIGIN_CHILD_CLEANUP_FAILED");
+    return result;
+  }
+  try { child.kill("SIGTERM"); } catch { /* still wait, then use SIGKILL if the owned child remains */ }
+  let result = await waitForCurrentD7OwnedChildExit(exited, CURRENT_D7_ORIGIN_TERM_GRACE_MS);
+  if (result !== null) return result;
+  if (running()) {
+    try { child.kill("SIGKILL"); } catch { /* the bounded reap below reports failure if it remains */ }
+  }
+  result = await waitForCurrentD7OwnedChildExit(exited, CURRENT_D7_ORIGIN_KILL_REAP_MS);
+  if (result === null) fail("REHEARSAL_ORIGIN_CHILD_CLEANUP_FAILED");
+  return result;
+}
+
+/** Await an already-spawned owned origin child's readiness and reap it on failure. */
+export async function awaitCurrentD7OriginReadiness(child, { readyTimeoutMs }) {
+  if (!child || !child.stdout || !child.stderr || typeof child.kill !== "function"
+    || !Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs < 1) {
+    fail("REHEARSAL_ORIGIN_START_FAILED");
+  }
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4_000); });
+  const spawned = new Promise((resolveSpawned) => {
+    child.once("spawn", () => resolveSpawned(true));
+    child.once("error", () => resolveSpawned(false));
+  });
+  const exited = new Promise((resolveExit) => {
+    child.once("exit", (code, signal) => resolveExit({ code, signal }));
+    child.once("error", () => {
+      if (child.pid === undefined) resolveExit({ spawnError: true });
+    });
+  });
+  try {
+    const ready = await new Promise((resolveReady, reject) => {
+      let buffer = "";
+      let settled = false;
+      const finish = (work, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.stdout.removeListener("data", onData);
+        child.removeListener("error", onError);
+        work(value);
+      };
+      const onData = (chunk) => {
+        buffer += chunk;
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) return;
+        try {
+          const value = JSON.parse(buffer.slice(0, newline));
+          if (value === null || typeof value !== "object" || typeof value.origin !== "string") {
+            throw new Error("invalid readiness record");
+          }
+          finish(resolveReady, value);
+        } catch { finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED")); }
+      };
+      const onError = () => finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
+      const timer = setTimeout(() => finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_TIMEOUT")), readyTimeoutMs);
+      child.stdout.on("data", onData);
+      child.once("error", onError);
+      exited.then((outcome) => {
+        if (outcome !== null) {
+          const last = stderr.trim().split("\n").filter(Boolean).at(-1) ?? "";
+          let childCode = "REHEARSAL_ORIGIN_EXITED";
+          try {
+            const parsedCode = JSON.parse(last).code;
+            if (typeof parsedCode === "string" && /^[A-Z0-9_]{1,80}$/u.test(parsedCode)) childCode = parsedCode;
+          } catch { /* keep the closed child code */ }
+          finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED", { childCode }));
+        }
+      });
+    });
+    const didSpawn = await waitForCurrentD7OwnedChildExit(spawned, Math.min(readyTimeoutMs, CURRENT_D7_ORIGIN_TERM_GRACE_MS));
+    if (didSpawn !== true) throw new RehearsalError("REHEARSAL_ORIGIN_START_FAILED");
+    // A child can print readiness and exit in the same turn. Give queued exit
+    // events a short bounded window before handing a dead origin to the caller.
+    if (await waitForCurrentD7OwnedChildExit(exited, 10) !== null) {
+      throw new RehearsalError("REHEARSAL_ORIGIN_START_FAILED");
+    }
+    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+      throw new RehearsalError("REHEARSAL_ORIGIN_START_FAILED");
+    }
+    return { ready, exited };
+  } catch (error) {
+    await stopCurrentD7OwnedChild(child, exited, spawned);
+    const code = error?.code === "REHEARSAL_ORIGIN_START_TIMEOUT"
+      ? "REHEARSAL_ORIGIN_START_TIMEOUT" : "REHEARSAL_ORIGIN_START_FAILED";
+    throw new RehearsalError(code, code === "REHEARSAL_ORIGIN_START_FAILED" && error?.details?.childCode
+      ? { childCode: error.details.childCode } : {});
+  }
+}
+
+const CURRENT_D7_CASE_RECEIPT_KEYS = Object.freeze([
+  "caseId", "schemaVersion", "referenceSha256", "expectationSha256", "corpusSha256", "admissionSha256",
+  "sourceInvariantSha256", "pgInputSha256", "bootstrapPreservationSha256", "strictExportSha256",
+  "actualResponseSha256", "actualPreviewSha256", "schema", "controlSchema", "currentDay", "retainedForS9Cleanup",
+]);
+const CURRENT_D7_QUALIFICATION_KEYS = Object.freeze([
+  "schemaVersion", "comparisonMode", "decisionId", "caseIds", "inputBindingSha256",
+  "inputBindingCaptureContentSha256", "bindingSha256",
+  "referenceContentSha256", "producerAcceptanceContentSha256", "contractContentSha256", "caseReceipts",
+  "sidecars", "cleanupPending", "qualifying", "establishesNativeExecution", "deadlineMs", "elapsedMs",
+  "pgInputSnapshotsRemoved",
+]);
+const CURRENT_D7_SIDECAR_HASH_KEYS = Object.freeze([
+  "referenceSha256", "bindingSha256", "producerAcceptanceSha256", "conflictPreservingCaseSha256",
+  "conflictFreePositiveCaseSha256", "contractSha256", "inputBindingCaptureSha256",
+]);
+
+/** Validate the only controller handoff S9 may consume: two owned schema pairs,
+ * all original-source and actual-response hashes, and explicit pending cleanup. */
+export function validateCurrentD7ControllerQualification(value) {
+  exactCurrentD7Keys(value, CURRENT_D7_QUALIFICATION_KEYS);
+  if (value.schemaVersion !== "current-q1-d7-controller-qualification-v1"
+    || value.comparisonMode !== "current-worker-d1-d7" || value.decisionId !== "D7"
+    || !sameCurrentD7Json(value.caseIds, CURRENT_D7_CASES)
+    || value.cleanupPending !== true || value.qualifying !== false || value.establishesNativeExecution !== false
+    || value.deadlineMs !== S9_REHEARSAL_DEADLINE_MS || !Number.isSafeInteger(value.elapsedMs)
+    || value.elapsedMs < 0 || value.elapsedMs > S9_REHEARSAL_DEADLINE_MS || value.pgInputSnapshotsRemoved !== true) {
+    fail("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID");
+  }
+  for (const field of ["inputBindingSha256", "inputBindingCaptureContentSha256", "bindingSha256", "referenceContentSha256",
+    "producerAcceptanceContentSha256", "contractContentSha256"]) {
+    if (typeof value[field] !== "string" || !/^[a-f0-9]{64}$/u.test(value[field])) {
+      fail("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID");
+    }
+  }
+  exactCurrentD7Keys(value.sidecars, CURRENT_D7_SIDECAR_HASH_KEYS);
+  for (const digest of Object.values(value.sidecars)) {
+    if (typeof digest !== "string" || !/^[a-f0-9]{64}$/u.test(digest)) fail("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID");
+  }
+  if (value.referenceContentSha256 !== value.sidecars.referenceSha256
+    || value.producerAcceptanceContentSha256 !== value.sidecars.producerAcceptanceSha256
+    || value.contractContentSha256 !== value.sidecars.contractSha256
+    || value.inputBindingCaptureContentSha256 !== value.sidecars.inputBindingCaptureSha256) {
+    fail("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID");
+  }
+  exactCurrentD7Keys(value.caseReceipts, CURRENT_D7_CASES);
+  const suffixes = new Set();
+  const schemas = new Set();
+  const expectedCurrentDay = "2026-10-01";
+  for (const caseId of CURRENT_D7_CASES) {
+    const receipt = exactCurrentD7Keys(value.caseReceipts[caseId], CURRENT_D7_CASE_RECEIPT_KEYS);
+    if (receipt.caseId !== caseId || receipt.schemaVersion !== "current-q1-d7-controller-case-receipt-v1"
+      || receipt.currentDay !== expectedCurrentDay || receipt.retainedForS9Cleanup !== true) {
+      fail("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID");
+    }
+    for (const field of ["referenceSha256", "expectationSha256", "corpusSha256", "admissionSha256",
+      "sourceInvariantSha256", "pgInputSha256", "bootstrapPreservationSha256", "strictExportSha256",
+      "actualResponseSha256", "actualPreviewSha256"]) {
+      if (typeof receipt[field] !== "string" || !/^[a-f0-9]{64}$/u.test(receipt[field])) {
+        fail("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID");
+      }
+    }
+    const match = /^typed_legacy_transfer_rehearsal_target_fastpath_([0-9a-f]{8})$/u.exec(receipt.schema);
+    if (!match || receipt.controlSchema !== `typed_legacy_transfer_rehearsal_ctl_${match[1]}`
+      || suffixes.has(match[1]) || schemas.has(receipt.schema) || schemas.has(receipt.controlSchema)) {
+      fail("REHEARSAL_CURRENT_D7_EVIDENCE_INVALID");
+    }
+    suffixes.add(match[1]); schemas.add(receipt.schema); schemas.add(receipt.controlSchema);
+  }
+  return value;
+}
+
 async function freePort() {
   return new Promise((resolvePort, reject) => {
     const server = createServer();
@@ -508,8 +1023,11 @@ async function freePort() {
   });
 }
 
-async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes, workers = 1, modelBlockSize = 10, modelFanOut = "auto" }) {
+async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes, workers = 1, modelBlockSize = 10,
+  modelFanOut = "auto", deadlineMonotonicMs }) {
   const started = performance.now();
+  const remainingMs = deadlineMonotonicMs === undefined ? null : currentD7RemainingMs(deadlineMonotonicMs);
+  const timeoutMs = remainingMs === null ? timeoutMinutes * 60_000 : Math.min(timeoutMinutes * 60_000, remainingMs);
   let stdout;
   let stderr;
   let exitCode = 0;
@@ -525,7 +1043,7 @@ async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes,
       cwd: CLOUD_RUN_ROOT,
       env: { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1", ...endpointEnv },
       maxBuffer: 64 * 1024 * 1024,
-      timeout: timeoutMinutes * 60_000,
+      timeout: timeoutMs,
     }));
   } catch (error) {
     stdout = error.stdout ?? "";
@@ -635,11 +1153,16 @@ export async function sealFastpathRehearsalSource({ dumpPath, workDirectory }) {
  * the GCP seed leave it at the copies' default.
  */
 export async function loadFastpathRehearsalImporters({
-  pool, schema, controlSchema, suffix, sealedSource, dumpPath, workDirectory, roster, timings = {},
+  pool, schema, controlSchema, suffix, sealedSource, dumpPath, sealedJournalSource = null,
+  workDirectory, roster, timings = {},
   cloudFastpathTarget = false, maxSourceTableRows = undefined,
 }) {
   if (typeof schema !== "string" || !schema.startsWith(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX)) {
     fail("REHEARSAL_TARGET_SCHEMA_INVALID");
+  }
+  if ((sealedJournalSource !== null && (dumpPath !== null && dumpPath !== undefined))
+    || (sealedJournalSource === null && (typeof dumpPath !== "string" || dumpPath.length === 0))) {
+    fail("REHEARSAL_JOURNAL_INPUT_AMBIGUOUS");
   }
   const steps = {};
   const sources = [];
@@ -720,12 +1243,27 @@ export async function loadFastpathRehearsalImporters({
 
     const sourceId = identitySource.database()
       .prepare("SELECT source_id FROM storage_source_state WHERE singleton = 1").get()?.source_id;
-    const journalSealed = await timed(timings, "sqlite:journal", async () =>
-      buildJournalSqlite(dumpPath, join(workDirectory, "storage-ingestion-journal.sqlite")));
-    steps.journalSqlite = { sha256: journalSealed.sha256 };
-    const journalSource = await createSealedSqliteIngestionJournalSource({
-      path: journalSealed.path, expectedSha256: journalSealed.sha256, expectedSourceId: sourceId,
-    });
+    let journalSealed;
+    let journalSource;
+    if (sealedJournalSource !== null) {
+      if (typeof sealedJournalSource !== "object" || Array.isArray(sealedJournalSource)
+        || JSON.stringify(Object.keys(sealedJournalSource).sort()) !== JSON.stringify(["expectedSha256", "expectedSourceId", "path"])
+        || sealedJournalSource.expectedSourceId !== sourceId || typeof sealedJournalSource.path !== "string"
+        || !isAbsolute(sealedJournalSource.path) || !/^[a-f0-9]{64}$/u.test(sealedJournalSource.expectedSha256)) {
+        fail("REHEARSAL_JOURNAL_SOURCE_MISMATCH");
+      }
+      journalSealed = { path: sealedJournalSource.path, sha256: sealedJournalSource.expectedSha256 };
+      steps.journalSqlite = { sha256: journalSealed.sha256 };
+      journalSource = await timed(timings, "sqlite:journal", async () =>
+        createSealedSqliteIngestionJournalSource({ ...sealedJournalSource }));
+    } else {
+      journalSealed = await timed(timings, "sqlite:journal", async () =>
+        buildJournalSqlite(dumpPath, join(workDirectory, "storage-ingestion-journal.sqlite")));
+      steps.journalSqlite = { sha256: journalSealed.sha256 };
+      journalSource = await createSealedSqliteIngestionJournalSource({
+        path: journalSealed.path, expectedSha256: journalSealed.sha256, expectedSourceId: sourceId,
+      });
+    }
     sources.push(journalSource);
     steps.ingestionJournal = await timed(timings, "importer:ingestion-journal", async () => {
       const receipt = await transferPostgresIngestionJournal({
@@ -860,7 +1398,7 @@ async function tableCounts(pool, schema, tables) {
   return counts;
 }
 
-async function startOrigin({ endpoint, schema, nowMs }) {
+async function startOrigin({ endpoint, schema, nowMs, deadlineMonotonicMs }) {
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
   const bucket = "synthetic-fastpath-rehearsal-bucket";
@@ -891,10 +1429,11 @@ async function startOrigin({ endpoint, schema, nowMs }) {
     ...server.originCompositionDependencies(process.env),
     createConnector() { return { close() {} }; },
     async createIamPool(options) {
-      const created = new pg.Pool(poolOptions(endpoint, options.max ?? 3, `gcp-fastpath-origin-${options.role}`));
+      const created = new pg.Pool(poolOptions(endpoint, options.max ?? 3, "gcp-fastpath-origin-" + options.role,
+        { deadlineMonotonicMs }));
       created.on("error", () => {});
       pools.push(created);
-      return created;
+      return deadlineMonotonicMs === undefined ? created : createCurrentD7DeadlinePool(created, deadlineMonotonicMs);
     },
     async createGoogleAccessTokenProvider() { return refuse("google access token"); },
     createGcsQuarantineObjectStore() { return { put: refuse("objectStore.put"), delete: refuse("objectStore.delete") }; },
@@ -913,12 +1452,22 @@ async function originChild() {
   const config = JSON.parse(process.env.GCP_FASTPATH_REHEARSAL_ORIGIN ?? "null");
   if (config === null || typeof config !== "object") fail("REHEARSAL_ORIGIN_CONFIG_INVALID");
   delete process.env.GCP_FASTPATH_REHEARSAL_ORIGIN;
-  const started = await startOrigin(config);
+  let deadlineMonotonicMs;
+  if (config.deadlineDurationMs !== undefined) {
+    if (!Number.isSafeInteger(config.deadlineDurationMs) || config.deadlineDurationMs < 1
+      || config.deadlineDurationMs > S9_REHEARSAL_DEADLINE_MS) fail("REHEARSAL_ORIGIN_CONFIG_INVALID");
+    deadlineMonotonicMs = performance.now() + config.deadlineDurationMs;
+  }
+  const started = await startOrigin({ endpoint: config.endpoint, schema: config.schema, nowMs: config.nowMs,
+    deadlineMonotonicMs });
   process.stdout.write(`${JSON.stringify({ origin: started.origin, mode: started.mode, node: process.version })}\n`);
 }
 
 /** Start the origin child under `node`, and resolve once it is listening. */
-async function spawnOrigin({ node, endpoint, schema, nowMs }) {
+async function spawnOrigin({ node, endpoint, schema, nowMs, deadlineMonotonicMs }) {
+  const readyTimeoutMs = deadlineMonotonicMs === undefined ? 60_000
+    : Math.min(60_000, currentD7RemainingMs(deadlineMonotonicMs));
+  const deadlineDurationMs = deadlineMonotonicMs === undefined ? undefined : currentD7RemainingMs(deadlineMonotonicMs);
   const child = spawn(node, [fileURLToPath(import.meta.url), "--origin-child"], {
     cwd: CLOUD_RUN_ROOT,
     env: {
@@ -926,16 +1475,27 @@ async function spawnOrigin({ node, endpoint, schema, nowMs }) {
       HOME: process.env.HOME,
       ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
       ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}),
-      GCP_FASTPATH_REHEARSAL_ORIGIN: JSON.stringify({ endpoint, schema, nowMs }),
+      GCP_FASTPATH_REHEARSAL_ORIGIN: JSON.stringify({ endpoint, schema, nowMs,
+        ...(deadlineDurationMs === undefined ? {} : { deadlineDurationMs }) }),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (deadlineMonotonicMs !== undefined) {
+    const { ready, exited } = await awaitCurrentD7OriginReadiness(child, { readyTimeoutMs });
+    return {
+      ...ready,
+      async close() {
+        // The process has already reached spawn by the time it emitted readiness.
+        return stopCurrentD7OwnedChild(child, exited, Promise.resolve(true));
+      },
+    };
+  }
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4_000); });
   const exited = new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
   const ready = await new Promise((resolveReady, reject) => {
     let buffer = "";
-    const timer = setTimeout(() => reject(new RehearsalError("REHEARSAL_ORIGIN_START_TIMEOUT")), 60_000);
+    const timer = setTimeout(() => reject(new RehearsalError("REHEARSAL_ORIGIN_START_TIMEOUT")), readyTimeoutMs);
     child.stdout.on("data", (chunk) => {
       buffer += chunk;
       const newline = buffer.indexOf("\n");
@@ -961,9 +1521,598 @@ async function spawnOrigin({ node, endpoint, schema, nowMs }) {
   };
 }
 
+function currentD7Day(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+  const time = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === value;
+}
+
+function currentD7CaseWindow(reference) {
+  const body = reference?.snapshot?.publicResponse?.body;
+  if (!body || !currentD7Day(body.from) || !currentD7Day(body.to) || body.from > body.to) {
+    fail("REHEARSAL_CURRENT_D7_REFERENCE_INVALID");
+  }
+  return { fromDay: body.from, throughDay: body.to };
+}
+
+function validateCurrentD7ProducerResult(result, { inputBinding, contract, currentPostgresInputs }) {
+  const { currentQ1D7JsonSha256, validateCurrentQ1D7Binding, validateCurrentQ1D7InputBinding,
+    validateCurrentQ1D7PerDateExpectation, validateCurrentQ1D7CaseReference, validateCurrentQ1D7PgCaseInput,
+    assessCurrentQ1D7Qualification, validateCurrentQ1D7ProducerAcceptance } = contract;
+  exactCurrentD7Keys(result, ["reference", "binding", "acceptance", "cases", "expectations", "expectationSha256",
+    "pgInputs", "expectedController"]);
+  validateCurrentQ1D7InputBinding(inputBinding);
+  validateCurrentQ1D7Binding(result.binding, inputBinding);
+  exactCurrentD7Keys(result.cases, CURRENT_D7_CASES);
+  exactCurrentD7Keys(result.expectations, CURRENT_D7_CASES);
+  exactCurrentD7Keys(result.expectationSha256, CURRENT_D7_CASES);
+  exactCurrentD7Keys(result.pgInputs, CURRENT_D7_CASES);
+  const controllerPin = result.binding.source.files.find((entry) => entry.path === "apps/worker/scripts/gcp-fastpath-rehearsal.mjs");
+  if (!controllerPin || currentD7Hash(controllerPin) !== currentD7Hash(currentPostgresInputs.controller)
+    || !sameCurrentD7Json(result.expectedController, controllerPin)) fail("REHEARSAL_CURRENT_D7_CONTROLLER_PIN_INVALID");
+
+  exactCurrentD7Keys(result.reference, ["schemaVersion", "synthetic", "qualification", "decisionId", "sourceId",
+    "sourceNamespace", "bounds", "provenance", "cases", "expectationSha256"]);
+  if (result.reference.schemaVersion !== "current-q1-d7-reference-v4" || result.reference.synthetic !== true
+    || result.reference.qualification !== "structurally_complete" || result.reference.decisionId !== "D7"
+    || result.reference.sourceId !== result.binding.sourceId || result.reference.sourceNamespace !== result.binding.sourceNamespace
+    || !sameCurrentD7Json(result.reference.bounds, result.binding.bounds)
+    || !sameCurrentD7Json(result.reference.cases, result.cases)
+    || !sameCurrentD7Json(result.reference.expectationSha256, result.expectationSha256)) {
+    fail("REHEARSAL_CURRENT_D7_REFERENCE_INVALID");
+  }
+  exactCurrentD7Keys(result.reference.provenance, ["source", "runtime", "migrationSha256"]);
+  if (!sameCurrentD7Json(result.reference.provenance.source, result.binding.source)
+    || !sameCurrentD7Json(result.reference.provenance.runtime, result.binding.runtime)
+    || result.reference.provenance.migrationSha256 !== result.binding.migrationSha256) {
+    fail("REHEARSAL_CURRENT_D7_REFERENCE_INVALID");
+  }
+  for (const caseId of CURRENT_D7_CASES) {
+    const expectedSha256 = result.expectationSha256[caseId];
+    if (typeof expectedSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(expectedSha256)) {
+      fail("REHEARSAL_CURRENT_D7_EXPECTATION_INVALID");
+    }
+    validateCurrentQ1D7PerDateExpectation(result.expectations[caseId], result.binding, { expectedSha256 });
+    validateCurrentQ1D7CaseReference(result.cases[caseId], result.binding, {
+      expectation: result.expectations[caseId], expectedExpectationSha256: expectedSha256,
+    });
+    if (result.cases[caseId].pgInputSha256 !== currentQ1D7JsonSha256(result.pgInputs[caseId])) {
+      fail("REHEARSAL_CURRENT_D7_REFERENCE_INVALID");
+    }
+    validateCurrentQ1D7PgCaseInput(result.pgInputs[caseId], result.binding, caseId);
+  }
+  const caseMap = result.cases;
+  const assessment = assessCurrentQ1D7Qualification({ binding: result.binding, cases: caseMap,
+    expectations: result.expectations, expectationSha256: result.expectationSha256, pgInputs: result.pgInputs });
+  if (assessment.state !== "structurally_complete" || assessment.establishesNativeExecution !== false) {
+    fail("REHEARSAL_CURRENT_D7_EVIDENCE_INCOMPLETE");
+  }
+  const acceptanceResult = validateCurrentQ1D7ProducerAcceptance(result.acceptance, {
+    inputBinding, binding: result.binding, cases: caseMap, expectations: result.expectations,
+    expectationSha256: result.expectationSha256, pgInputs: result.pgInputs, expectedController: controllerPin,
+  });
+  if (acceptanceResult.establishesNativeExecution !== false) fail("REHEARSAL_CURRENT_D7_EVIDENCE_INCOMPLETE");
+  return { ...result, controllerPin, assessment };
+}
+
+async function assertCurrentD7PgInputRoot({ pgInputs, binding, pgInputDirectory, validateDescriptor }) {
+  const root = await lstat(pgInputDirectory);
+  if (!root.isDirectory() || root.isSymbolicLink() || (process.getuid && root.uid !== process.getuid())
+    || (root.mode & 0o777) !== 0o700 || await realpath(pgInputDirectory) !== pgInputDirectory) {
+    fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+  }
+  const childNames = (await readdir(pgInputDirectory)).sort();
+  if (!sameCurrentD7Json(childNames, ["conflictFreePositive", "conflictPreserving"])) {
+    fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+  }
+  const snapshots = {};
+  for (const caseId of CURRENT_D7_CASES) snapshots[caseId] = await verifyCurrentD7PgCaseInputFiles({
+    descriptor: pgInputs[caseId], binding, caseId, pgInputDirectory, validateDescriptor,
+  });
+  return { root: { dev: root.dev, ino: root.ino, uid: root.uid, mode: root.mode }, cases: snapshots };
+}
+
+async function cleanupCurrentD7OwnedSchemas(results, deadlineMonotonicMs) {
+  const owned = [];
+  for (const result of results) {
+    if (!result?.schema || !result?.controlSchema || result.report?.reusedSchema !== false) continue;
+    const { suffix, schema, controlSchema } = fastpathRehearsalSchemas(result.suffix);
+    if (schema !== result.schema || controlSchema !== result.controlSchema) fail("REHEARSAL_CURRENT_D7_SCHEMA_OWNERSHIP_INVALID");
+    const kept = result.report?.keptSchemas;
+    if (!Array.isArray(kept) || kept.some((name) => name !== schema && name !== controlSchema)) {
+      fail("REHEARSAL_CURRENT_D7_SCHEMA_OWNERSHIP_INVALID");
+    }
+    for (const name of kept) owned.push({ suffix, name });
+  }
+  if (owned.length === 0) return [];
+  if (new Set(owned.map(({ name }) => name)).size !== owned.length) fail("REHEARSAL_CURRENT_D7_SCHEMA_OWNERSHIP_INVALID");
+  const endpoint = await localEndpoint(process.env);
+  let cleanupDeadline = deadlineMonotonicMs;
+  try { currentD7RemainingMs(cleanupDeadline); } catch (error) {
+    if (error?.code !== "REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED") throw error;
+    cleanupDeadline = undefined;
+  }
+  const poolOptionsForCleanup = poolOptions(endpoint, 2, "gcp-fastpath-d7-cleanup",
+    cleanupDeadline === undefined ? {} : { deadlineMonotonicMs: cleanupDeadline });
+  if (cleanupDeadline === undefined) {
+    poolOptionsForCleanup.connectionTimeoutMillis = 5_000;
+    poolOptionsForCleanup.statement_timeout = 5_000;
+  }
+  const pgPool = new pg.Pool(poolOptionsForCleanup);
+  pgPool.on("error", () => {});
+  const pool = cleanupDeadline === undefined ? pgPool : createCurrentD7DeadlinePool(pgPool, cleanupDeadline);
+  try {
+    const names = owned.map(({ name }) => name);
+    const present = await pool.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1) ORDER BY nspname", [names]);
+    if (!sameCurrentD7Json(present.rows.map((row) => row.nspname), [...names].sort())) {
+      fail("REHEARSAL_CURRENT_D7_SCHEMA_OWNERSHIP_INVALID");
+    }
+    for (const { name } of [...owned].reverse()) await pool.query(`DROP SCHEMA ${quoteIdentifier(name)} CASCADE`);
+    const remaining = await pool.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1)", [names]);
+    if (remaining.rows.length !== 0) fail("REHEARSAL_CURRENT_D7_SCHEMA_CLEANUP_FAILED");
+    return [];
+  } finally { await pool.end().catch(() => {}); }
+}
+
+function assertCurrentD7ContractAccepted(report, { binding, acceptance, cases, expectationSha256 }) {
+  const currentDay = new Date(binding.runtime.pinnedNowMs).toISOString().slice(0, 10);
+  if (report.schemaVersion !== "analytics-v2-current-d7-contract-report-v3"
+    || report.comparisonMode !== "current-worker-d1-d7" || report.evidenceScope !== "saved-comparison-only"
+    || report.decisionId !== "D7" || report.establishesNativeExecution !== false || report.accepted !== true
+    || !sameCurrentD7Json(report.acceptedCaseIds, CURRENT_D7_CASES) || report.bindingSha256 !== currentD7Hash(binding)
+    || report.producerAcceptanceSha256 !== currentD7Hash(acceptance)
+    || report.currentDay !== currentDay || report.strictUnaffectedEqual !== true || report.exactPerDateEqual !== true
+    || report.positive70DateEqual !== true || report.unresolved.length !== 0 || report.unexpectedDiffs !== 0
+    || !Array.isArray(report.perCase) || report.perCase.length !== CURRENT_D7_CASES.length
+    || !sameCurrentD7Json(report.perCase.map((entry) => entry.caseId), CURRENT_D7_CASES)) {
+    fail("REHEARSAL_CURRENT_D7_CONTRACT_NOT_ACCEPTED");
+  }
+  const withheld = cases.conflictPreserving.publicationInventory.filter((entry) => entry.state === "withheld")
+    .map((entry) => entry.day).sort();
+  if (!sameCurrentD7Json(report.acceptedD7DateSet, withheld) || withheld.length === 0
+    || cases.conflictFreePositive.publicationInventory.some((entry) => entry.state !== "published")) {
+    fail("REHEARSAL_CURRENT_D7_CONTRACT_NOT_ACCEPTED");
+  }
+  for (const [index, caseId] of CURRENT_D7_CASES.entries()) {
+    const entry = report.perCase[index];
+    if (entry.equal !== true || entry.strictUnaffectedEqual !== true || entry.exactPerDateEqual !== true
+      || entry.expectationSha256 !== expectationSha256[caseId]
+      || (caseId === "conflictFreePositive" && entry.comparedDates !== 70)) {
+      fail("REHEARSAL_CURRENT_D7_CONTRACT_NOT_ACCEPTED");
+    }
+  }
+}
+
+function validateCurrentD7DirectOptions(options) {
+  const keys = ["golden", "keepSchema", "out", "node22", "dump", "perDateExpected", "ownerReference", "dense",
+    "comparisonMode", "refreshTimeoutMinutes", "reuseSchema", "stagedPrimary", "refreshWorkers",
+    "refreshModelBlockSize", "refreshModelFanOut", "syntheticRevisionFloor"];
+  if (options === null || typeof options !== "object" || Array.isArray(options)
+    || ![Object.prototype, null].includes(Object.getPrototypeOf(options))) fail("REHEARSAL_ARGUMENT_INVALID");
+  const descriptors = Object.getOwnPropertyDescriptors(options);
+  if (Object.values(descriptors).some((entry) => entry.get || entry.set)
+    || Object.getOwnPropertySymbols(options).length > 0) fail("REHEARSAL_ARGUMENT_INVALID");
+  exactCurrentD7Keys(options, keys, "REHEARSAL_ARGUMENT_INVALID");
+  if (options.comparisonMode !== "current-worker-d1-d7" || options.keepSchema !== true || options.reuseSchema !== null
+    || options.dump !== null || options.perDateExpected !== null || options.ownerReference !== null || options.dense !== false
+    || options.syntheticRevisionFloor !== false || !Array.isArray(options.stagedPrimary) || options.stagedPrimary.length !== 0
+    || typeof options.golden !== "string" || !isAbsolute(options.golden) || resolve(options.golden) !== options.golden
+    || typeof options.out !== "string" || !isAbsolute(options.out) || resolve(options.out) !== options.out
+    || typeof options.node22 !== "string" || !isAbsolute(options.node22) || resolve(options.node22) !== options.node22
+    || !Number.isSafeInteger(options.refreshTimeoutMinutes) || options.refreshTimeoutMinutes < 1
+    || options.refreshTimeoutMinutes > MAX_REFRESH_TIMEOUT_MINUTES || !Number.isSafeInteger(options.refreshWorkers)
+    || options.refreshWorkers < 1 || options.refreshWorkers > 16 || !Number.isSafeInteger(options.refreshModelBlockSize)
+    || options.refreshModelBlockSize < 1 || options.refreshModelBlockSize > 70
+    || !["auto", "all", "off"].includes(options.refreshModelFanOut)) fail("REHEARSAL_ARGUMENT_INVALID");
+  currentD7RehearsalOutputDestinations(options.out);
+}
+
+async function removeCurrentD7PgInputDirectory(path, expectedIdentity) {
+  if (path === null) return true;
+  let metadata;
+  try { metadata = await lstat(path); } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    fail("REHEARSAL_CURRENT_D7_INPUT_CLEANUP_FAILED");
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || (process.getuid && metadata.uid !== process.getuid())
+    || (metadata.mode & 0o777) !== 0o700 || await realpath(path) !== path
+    || (expectedIdentity && (metadata.dev !== expectedIdentity.dev || metadata.ino !== expectedIdentity.ino))) {
+    fail("REHEARSAL_CURRENT_D7_INPUT_CLEANUP_FAILED");
+  }
+  await rm(path, { recursive: true, force: false });
+  try { await lstat(path); fail("REHEARSAL_CURRENT_D7_INPUT_CLEANUP_FAILED"); }
+  catch (error) { if (error instanceof RehearsalError) throw error; if (error?.code !== "ENOENT") throw error; }
+  return true;
+}
+
+async function runCurrentD7Rehearsal(options) {
+  // The 40-minute budget starts before any source, runtime, or producer binding.
+  const startedMonotonicMs = performance.now();
+  const deadlineMonotonicMs = startedMonotonicMs + S9_REHEARSAL_DEADLINE_MS;
+  const startedAt = new Date().toISOString();
+  const timings = {};
+  let progress = null;
+  let outputPreflighted = false;
+  let reportWritten = false;
+  let pgInputDirectory = null;
+  let pgInputIdentity = null;
+  let pgInputSnapshotsRemoved = false;
+  let candidateResults = [];
+  let outputSidecars = {};
+  let failure = null;
+  let handoffComplete = false;
+  let schemaCleanupComplete = true;
+  const report = {
+    schemaVersion: GCP_FASTPATH_CURRENT_D7_REHEARSAL_REPORT_VERSION,
+    comparisonMode: "current-worker-d1-d7",
+    decisionId: "D7",
+    startedAt,
+    reusedSchema: false,
+    qualifying: false,
+    establishesNativeExecution: false,
+    keptSchemaPairs: [],
+    keptSchemas: [],
+    timingsMs: timings,
+  };
+
+  try {
+    validateCurrentD7DirectOptions(options);
+    await assertCurrentD7RehearsalOutputsNew(options.out);
+    outputPreflighted = true;
+    if (process.version !== "v26.2.0") fail("REHEARSAL_CURRENT_REFERENCE_RUNTIME_INVALID");
+    if (performance.now() >= deadlineMonotonicMs) fail("REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED");
+    progress = createS9Progress("controller");
+    progress.phase("input_binding");
+
+    const [major, minor] = process.versions.node.split(".").map(Number);
+    if (major < 22 || (major === 22 && minor < 13)) fail("REHEARSAL_NODE_UNSUPPORTED");
+    const retainedNode22 = await verifyCurrentImageRuntimePath(options.node22);
+    const node22Version = (await execFileAsync(options.node22, ["--version"], {
+      timeout: Math.min(10_000, currentD7RemainingMs(deadlineMonotonicMs)),
+    })).stdout.trim();
+    if (node22Version !== retainedNode22.version
+      || JSON.stringify(await verifyCurrentImageRuntimePath(options.node22)) !== JSON.stringify(retainedNode22)) {
+      fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
+    }
+    for (const path of [DIST_REFRESH, DIST_SERVER]) if (!existsSync(path)) fail("REHEARSAL_DIST_MISSING");
+
+    const goldenPath = await realpath(options.golden);
+    const expectedGoldenPath = await realpath(join(WORKER_ROOT, "analytics-v2-test/golden-q1-node"));
+    if (options.golden !== expectedGoldenPath || goldenPath !== expectedGoldenPath) {
+      fail("REHEARSAL_CURRENT_D7_GOLDEN_INVALID");
+    }
+    const manifest = JSON.parse(await readFile(join(goldenPath, "manifest.json"), "utf8"));
+    if (manifest?.schemaVersion !== "gcp-fastpath-dense-oracle-manifest-v1"
+      || manifest.nowMs !== 1_790_856_000_000 || manifest.now !== "2026-10-01T12:00:00.000Z"
+      || manifest.pinnedNow !== manifest.now) fail("REHEARSAL_CURRENT_D7_GOLDEN_INVALID");
+
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const currentPostgresInputs = await currentPostgresInputBinding({ node22: options.node22, node22Version,
+      stagedPrimary: options.stagedPrimary });
+    const producerModule = await import("../postgres-test/fixtures/current-q1-d7-reference.mjs");
+    const contract = await import("../postgres-test/fixtures/current-q1-d7-contract.mjs");
+    if (typeof producerModule.captureCurrentQ1D7ReferenceBinding !== "function"
+      || typeof producerModule.runCurrentQ1D7Reference !== "function") fail("REHEARSAL_CURRENT_D7_PRODUCER_UNAVAILABLE");
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const capturedInputBinding = await timed(timings, "current-d7:input-binding", producerModule.captureCurrentQ1D7ReferenceBinding);
+    currentD7RemainingMs(deadlineMonotonicMs);
+    contract.validateCurrentQ1D7InputBinding(capturedInputBinding);
+    const inputBinding = cloneAndFreezeCurrentD7Json(capturedInputBinding);
+    const producerInputBinding = cloneAndFreezeCurrentD7Json(inputBinding);
+    if (inputBinding === producerInputBinding || !Object.isFrozen(inputBinding) || !Object.isFrozen(producerInputBinding)
+      || !sameCurrentD7Json(inputBinding, producerInputBinding)) fail("REHEARSAL_CURRENT_D7_INPUT_BINDING_INVALID");
+    const negativeCorpusSha256 = inputBinding.cases.conflictPreserving.corpusSha256;
+    if (manifest.corpus?.q1?.sha256 !== negativeCorpusSha256) fail("REHEARSAL_CURRENT_D7_GOLDEN_INVALID");
+
+    const outputPaths = currentD7RehearsalOutputDestinations(options.out);
+    const inputBindingSha256 = contract.currentQ1D7JsonSha256(inputBinding);
+    const inputBindingCapture = {
+      schemaVersion: "current-q1-d7-input-binding-capture-v1",
+      capturedBeforeProducer: true,
+      captureOrdinal: 1,
+      inputBindingSha256,
+      inputBinding,
+    };
+    outputSidecars.inputBindingCaptureSha256 = await writeCurrentD7Sidecar(outputPaths[7], inputBindingCapture);
+    const inputBindingCaptureMetadata = await currentD7SidecarMetadata(outputPaths[7]);
+    const pgInputPrefix = await realpath(dirname(options.out));
+    if (pgInputPrefix !== dirname(options.out)) fail("REHEARSAL_CURRENT_D7_OUTPUT_INVALID");
+    pgInputDirectory = await mkdtemp(join(pgInputPrefix, ".current-d7-pg-input-"));
+    await chmod(pgInputDirectory, 0o700);
+    pgInputDirectory = await realpath(pgInputDirectory);
+    pgInputIdentity = await lstat(pgInputDirectory);
+    if (!pgInputIdentity.isDirectory() || pgInputIdentity.isSymbolicLink()
+      || (process.getuid && pgInputIdentity.uid !== process.getuid()) || (pgInputIdentity.mode & 0o777) !== 0o700) {
+      fail("REHEARSAL_CURRENT_D7_INPUT_INVALID");
+    }
+
+    progress.phase("current_d1_replay");
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const producerResult = await timed(timings, "current-d7:producer", () => producerModule.runCurrentQ1D7Reference({
+      inputBinding: producerInputBinding, deadlineMonotonicMs, pgInputDirectory,
+    }));
+    currentD7RemainingMs(deadlineMonotonicMs);
+    await verifyCurrentD7InputBindingCapture(outputPaths[7], inputBindingCaptureMetadata,
+      outputSidecars.inputBindingCaptureSha256);
+    if (!sameCurrentD7Json(producerInputBinding, inputBinding)) {
+      fail("REHEARSAL_CURRENT_D7_INPUT_BINDING_CAPTURE_CHANGED");
+    }
+    const acceptedProducer = validateCurrentD7ProducerResult(producerResult, { inputBinding, contract,
+      currentPostgresInputs });
+    if (contract.CURRENT_Q1_D7_BOUNDS?.s9DeadlineMs !== S9_REHEARSAL_DEADLINE_MS) {
+      fail("REHEARSAL_CURRENT_D7_DEADLINE_INVALID");
+    }
+    if (manifest.corpus.q1.sha256 !== acceptedProducer.binding.cases.conflictPreserving.corpusSha256) {
+      fail("REHEARSAL_CURRENT_D7_GOLDEN_INVALID");
+    }
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const afterProducerBinding = await producerModule.captureCurrentQ1D7ReferenceBinding();
+    contract.validateCurrentQ1D7Binding(acceptedProducer.binding, afterProducerBinding);
+    if (!sameCurrentD7Json(afterProducerBinding, inputBinding)
+      || !sameCurrentD7Json(await currentPostgresInputBinding({ node22: options.node22, node22Version,
+        stagedPrimary: options.stagedPrimary }), currentPostgresInputs)) {
+      fail("REHEARSAL_CURRENT_CANDIDATE_INPUTS_CHANGED");
+    }
+
+    const initialSnapshots = await assertCurrentD7PgInputRoot({ pgInputs: acceptedProducer.pgInputs,
+      binding: acceptedProducer.binding, pgInputDirectory, validateDescriptor: contract.validateCurrentQ1D7PgCaseInput });
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const referenceEnvelope = {
+      schemaVersion: "current-q1-d7-controller-reference-v1",
+      inputBinding,
+      reference: acceptedProducer.reference,
+      binding: acceptedProducer.binding,
+      acceptance: acceptedProducer.acceptance,
+      cases: acceptedProducer.cases,
+      expectations: acceptedProducer.expectations,
+      expectationSha256: acceptedProducer.expectationSha256,
+      pgInputs: acceptedProducer.pgInputs,
+    };
+    outputSidecars.bindingSha256 = await writeCurrentD7Sidecar(outputPaths[2], acceptedProducer.binding);
+    outputSidecars.producerAcceptanceSha256 = await writeCurrentD7Sidecar(outputPaths[3], acceptedProducer.acceptance);
+    outputSidecars.referenceSha256 = await writeCurrentD7Sidecar(outputPaths[1], referenceEnvelope);
+
+    const currentDay = new Date(acceptedProducer.binding.runtime.pinnedNowMs).toISOString().slice(0, 10);
+    const windows = Object.fromEntries(CURRENT_D7_CASES.map((caseId) => [caseId, currentD7CaseWindow(acceptedProducer.cases[caseId])]));
+    if (!sameCurrentD7Json(windows.conflictPreserving, windows.conflictFreePositive)
+      || windows.conflictPreserving.throughDay !== currentDay) fail("REHEARSAL_CURRENT_D7_REFERENCE_INVALID");
+
+    progress.phase("postgres");
+    const seenSuffixes = new Set();
+    for (const caseId of CURRENT_D7_CASES) {
+      currentD7RemainingMs(deadlineMonotonicMs);
+      const pgInput = acceptedProducer.pgInputs[caseId];
+      const result = await runRehearsal({ ...options, [INTERNAL_CURRENT_D7_CASE]: {
+        caseId,
+        fromDay: windows[caseId].fromDay,
+        throughDay: windows[caseId].throughDay,
+        nowMs: acceptedProducer.binding.runtime.pinnedNowMs,
+        deadlineMonotonicMs,
+        progress,
+        inputBinding,
+        binding: acceptedProducer.binding,
+        pgInput,
+        pgInputDirectory,
+        currentPostgresInputs,
+        referenceSha256: contract.currentQ1D7JsonSha256(acceptedProducer.cases[caseId]),
+        expectationSha256: acceptedProducer.expectationSha256[caseId],
+        pgInputSha256: contract.currentQ1D7JsonSha256(pgInput),
+      } });
+      candidateResults.push(result);
+      const gates = result.report?.gates;
+      const suffix = result.suffix;
+      const expectedPair = fastpathRehearsalSchemas(suffix);
+      if (result.caseId !== caseId || result.report?.status !== "pass" || result.report?.reusedSchema !== false
+        || result.schema !== expectedPair.schema || result.controlSchema !== expectedPair.controlSchema
+        || seenSuffixes.has(suffix) || !Array.isArray(result.report.keptSchemas)
+        || !sameCurrentD7Json(result.report.keptSchemas, [result.schema, result.controlSchema])
+        || !gates || !Object.values(gates).every(Boolean) || !result.actualResponse || !result.actualPreview
+        || !sameCurrentD7Json(result.currentPostgresInputs, currentPostgresInputs)) {
+        fail("REHEARSAL_CURRENT_D7_CASE_INCOMPLETE");
+      }
+      seenSuffixes.add(suffix);
+    }
+    if (candidateResults.length !== CURRENT_D7_CASES.length || seenSuffixes.size !== 2) {
+      fail("REHEARSAL_CURRENT_D7_CASE_SET_INVALID");
+    }
+
+    progress.phase("source_recheck");
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const afterBinding = await producerModule.captureCurrentQ1D7ReferenceBinding();
+    contract.validateCurrentQ1D7Binding(acceptedProducer.binding, afterBinding);
+    if (!sameCurrentD7Json(afterBinding, inputBinding)
+      || !sameCurrentD7Json(await currentPostgresInputBinding({ node22: options.node22, node22Version,
+        stagedPrimary: options.stagedPrimary }), currentPostgresInputs)) {
+      fail("REHEARSAL_CURRENT_CANDIDATE_INPUTS_CHANGED");
+    }
+    const finalSnapshots = await assertCurrentD7PgInputRoot({ pgInputs: acceptedProducer.pgInputs,
+      binding: acceptedProducer.binding, pgInputDirectory, validateDescriptor: contract.validateCurrentQ1D7PgCaseInput });
+    currentD7RemainingMs(deadlineMonotonicMs);
+    if (!sameCurrentD7Json(initialSnapshots, finalSnapshots)
+      || finalSnapshots.root.dev !== pgInputIdentity.dev || finalSnapshots.root.ino !== pgInputIdentity.ino) {
+      fail("REHEARSAL_CURRENT_D7_INPUT_CHANGED");
+    }
+
+    const comparator = await import("./analytics-v2-current-d7-compare.mjs");
+    if (typeof comparator.compareCurrentQ1D7Contract !== "function") fail("REHEARSAL_CURRENT_D7_COMPARATOR_UNAVAILABLE");
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const comparatorReport = comparator.compareCurrentQ1D7Contract({
+      inputBinding,
+      binding: acceptedProducer.binding,
+      cases: candidateResults.map((result) => ({ caseId: result.caseId,
+        reference: acceptedProducer.cases[result.caseId], expectation: acceptedProducer.expectations[result.caseId],
+        actualResponse: result.actualResponse, actualPreview: result.actualPreview, currentDay })),
+      expectations: acceptedProducer.expectations,
+      expectationSha256: acceptedProducer.expectationSha256,
+      pgInputs: acceptedProducer.pgInputs,
+      producerAcceptance: acceptedProducer.acceptance,
+      expectedController: acceptedProducer.controllerPin,
+    });
+    assertCurrentD7ContractAccepted(comparatorReport, { binding: acceptedProducer.binding,
+      acceptance: acceptedProducer.acceptance, cases: acceptedProducer.cases,
+      expectationSha256: acceptedProducer.expectationSha256 });
+    currentD7RemainingMs(deadlineMonotonicMs);
+    outputSidecars.contractSha256 = await writeCurrentD7Sidecar(outputPaths[6], comparatorReport);
+
+    const caseReceipts = {};
+    for (const result of candidateResults) {
+      const caseId = result.caseId;
+      const caseReference = acceptedProducer.cases[caseId];
+      const expectation = acceptedProducer.expectations[caseId];
+      caseReceipts[caseId] = {
+        caseId,
+        schemaVersion: "current-q1-d7-controller-case-receipt-v1",
+        referenceSha256: contract.currentQ1D7JsonSha256(caseReference),
+        expectationSha256: acceptedProducer.expectationSha256[caseId],
+        corpusSha256: acceptedProducer.binding.cases[caseId].corpusSha256,
+        admissionSha256: acceptedProducer.binding.cases[caseId].admissionSha256,
+        sourceInvariantSha256: acceptedProducer.binding.cases[caseId].sourceInvariantSha256,
+        pgInputSha256: contract.currentQ1D7JsonSha256(acceptedProducer.pgInputs[caseId]),
+        bootstrapPreservationSha256: contract.currentQ1D7JsonSha256(caseReference.bootstrapPreservation),
+        strictExportSha256: contract.currentQ1D7JsonSha256(caseReference.strictExport),
+        actualResponseSha256: contract.currentQ1D7JsonSha256(result.actualResponse),
+        actualPreviewSha256: contract.currentQ1D7JsonSha256(result.actualPreview),
+        schema: result.schema,
+        controlSchema: result.controlSchema,
+        currentDay,
+        retainedForS9Cleanup: true,
+      };
+      const sidecarPath = caseId === "conflictPreserving" ? outputPaths[4] : outputPaths[5];
+      outputSidecars[caseId === "conflictPreserving" ? "conflictPreservingCaseSha256" : "conflictFreePositiveCaseSha256"] =
+        await writeCurrentD7Sidecar(sidecarPath, {
+          schemaVersion: "current-q1-d7-controller-case-output-v1",
+          caseId,
+          reference: caseReference,
+          expectation,
+          actualResponse: result.actualResponse,
+          actualPreview: result.actualPreview,
+          currentDay,
+          controllerReceipt: caseReceipts[caseId],
+        });
+    }
+
+    const pgInputSnapshotsRemoved = await removeCurrentD7PgInputDirectory(pgInputDirectory,
+      { dev: pgInputIdentity.dev, ino: pgInputIdentity.ino });
+    pgInputSnapshotsRemoved &&= !(await existsLstat(pgInputDirectory));
+    if (!pgInputSnapshotsRemoved) fail("REHEARSAL_CURRENT_D7_INPUT_CLEANUP_FAILED");
+    pgInputDirectory = null;
+    report.keptSchemaPairs = candidateResults.map((result) => ({ caseId: result.caseId,
+      schema: result.schema, controlSchema: result.controlSchema }));
+    report.keptSchemas = report.keptSchemaPairs.flatMap(({ schema, controlSchema }) => [schema, controlSchema]);
+    if (new Set(report.keptSchemas).size !== 4 || new Set(report.keptSchemaPairs.map((entry) => entry.schema)).size !== 2) {
+      fail("REHEARSAL_CURRENT_D7_SCHEMA_OWNERSHIP_INVALID");
+    }
+    const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMonotonicMs));
+    currentD7RemainingMs(deadlineMonotonicMs);
+    const qualification = validateCurrentD7ControllerQualification({
+      schemaVersion: "current-q1-d7-controller-qualification-v1",
+      comparisonMode: "current-worker-d1-d7",
+      decisionId: "D7",
+      caseIds: [...CURRENT_D7_CASES],
+      inputBindingSha256,
+      inputBindingCaptureContentSha256: outputSidecars.inputBindingCaptureSha256,
+      bindingSha256: contract.currentQ1D7JsonSha256(acceptedProducer.binding),
+      referenceContentSha256: outputSidecars.referenceSha256,
+      producerAcceptanceContentSha256: outputSidecars.producerAcceptanceSha256,
+      contractContentSha256: outputSidecars.contractSha256,
+      caseReceipts,
+      sidecars: outputSidecars,
+      cleanupPending: true,
+      qualifying: false,
+      establishesNativeExecution: false,
+      deadlineMs: S9_REHEARSAL_DEADLINE_MS,
+      elapsedMs,
+      pgInputSnapshotsRemoved,
+    });
+    report.status = "cleanup_pending";
+    report.qualifying = false;
+    report.establishesNativeExecution = false;
+    report.finishedAt = new Date().toISOString();
+    report.currentD7Qualification = qualification;
+    report.gates = {
+      producerAcceptanceComplete: true,
+      bothPostgresCasesComplete: true,
+      exactCurrentContractAccepted: true,
+      sourceAndInputsUnchanged: true,
+      pgInputSnapshotsRemoved: true,
+      s9OwnedSchemaCleanupPending: true,
+    };
+    report.timingsMs.total = Math.round(performance.now() - startedMonotonicMs);
+    progress.phase("report");
+    await writeCurrentD7Sidecar(options.out, report);
+    reportWritten = true;
+    handoffComplete = true;
+  } catch (error) {
+    failure = error;
+  } finally {
+    if (progress !== null) {
+      try { progress.phase("cleanup"); } catch { /* phase reporting cannot alter cleanup */ }
+    }
+    if (!handoffComplete && pgInputDirectory !== null) {
+      try {
+        pgInputSnapshotsRemoved = await removeCurrentD7PgInputDirectory(pgInputDirectory,
+          pgInputIdentity ? { dev: pgInputIdentity.dev, ino: pgInputIdentity.ino } : null);
+        if (pgInputSnapshotsRemoved) pgInputDirectory = null;
+      } catch (error) { failure ??= error; }
+    }
+    if (!handoffComplete && candidateResults.length > 0) {
+      try { await cleanupCurrentD7OwnedSchemas(candidateResults, deadlineMonotonicMs); }
+      catch (error) { schemaCleanupComplete = false; failure ??= error; }
+    }
+    progress?.close();
+  }
+
+  if (!handoffComplete) {
+    const code = typeof failure?.code === "string" && /^[A-Z0-9_]{1,80}$/u.test(failure.code)
+      ? failure.code : "REHEARSAL_CURRENT_D7_FAILED";
+    report.status = "error";
+    report.finishedAt = new Date().toISOString();
+    report.qualifying = false;
+    report.establishesNativeExecution = false;
+    report.error = { code };
+    report.pgInputSnapshotsRemoved = pgInputSnapshotsRemoved;
+    report.schemaCleanupComplete = schemaCleanupComplete;
+    report.cleanupPending = !schemaCleanupComplete || !pgInputSnapshotsRemoved;
+    if (schemaCleanupComplete) {
+      report.keptSchemaPairs = [];
+      report.keptSchemas = [];
+    } else {
+      report.keptSchemaPairs = candidateResults.filter((result) => result.report?.keptSchemas?.length > 0)
+        .map((result) => ({ caseId: result.caseId, schema: result.schema, controlSchema: result.controlSchema }));
+      report.keptSchemas = candidateResults.flatMap((result) => result.report?.keptSchemas ?? []);
+    }
+    report.timingsMs.total = Math.round(performance.now() - startedMonotonicMs);
+    if (outputPreflighted && !reportWritten) {
+      try {
+        const text = `${JSON.stringify(report, null, 2)}\n`;
+        await writeCurrentD7Sidecar(options.out, report);
+        reportWritten = true;
+        process.stdout.write(text);
+      } catch { /* The original sanitized failure remains authoritative. */ }
+    }
+    progress?.close();
+    process.exitCode = 2;
+    if (!outputPreflighted) throw new RehearsalError(code);
+    return report;
+  }
+
+  const text = `${JSON.stringify(report, null, 2)}\n`;
+  process.stdout.write(text);
+  process.exitCode = 0;
+  return report;
+}
+
+async function existsLstat(path) {
+  try { await lstat(path); return true; } catch (error) { if (error?.code === "ENOENT") return false; throw error; }
+}
+
 /** Direct controller callers retain the same fresh-import boundary as CLI.
  * Refuse current schema reuse before any runtime, file, binding or PG access. */
 export async function runRehearsal(options) {
+  const currentD7Case = options?.[INTERNAL_CURRENT_D7_CASE] ?? null;
+  if (options?.comparisonMode === "current-worker-d1-d7" && currentD7Case === null) {
+    return runCurrentD7Rehearsal(options);
+  }
   if (options.comparisonMode === "current-worker-d1" && options.reuseSchema !== null) {
     fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--reuse-schema" });
   }
@@ -974,9 +2123,13 @@ export async function runRehearsal(options) {
   const [major, minor] = process.versions.node.split(".").map(Number);
   if (major < 22 || (major === 22 && minor < 13)) fail("REHEARSAL_NODE_UNSUPPORTED");
   let node22Version;
-  if (options.comparisonMode === "current-worker-d1") {
+  if (options.comparisonMode === "current-worker-d1" || options.comparisonMode === "current-worker-d1-d7") {
     const retained = await verifyCurrentImageRuntimePath(options.node22);
-    node22Version = (await execFileAsync(options.node22, ["--version"])).stdout.trim();
+    const node22VersionResult = currentD7Case === null
+      ? await execFileAsync(options.node22, ["--version"])
+      : await execFileAsync(options.node22, ["--version"], { timeout: currentD7RemainingMs(deadlineMonotonicMs) });
+    node22Version = node22VersionResult.stdout.trim();
+    if (currentD7Case !== null) currentD7RemainingMs(deadlineMonotonicMs);
     if (node22Version !== retained.version
       || JSON.stringify(await verifyCurrentImageRuntimePath(options.node22)) !== JSON.stringify(retained)) {
       fail("REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID");
@@ -988,10 +2141,13 @@ export async function runRehearsal(options) {
   }
   for (const path of [DIST_REFRESH, DIST_SERVER]) if (!existsSync(path)) fail("REHEARSAL_DIST_MISSING", { path });
 
-  const golden = JSON.parse(await readFile(join(options.golden, "community-daily-response.json"), "utf8"));
-  const goldenPreview = JSON.parse(await readFile(join(options.golden, "preview.json"), "utf8"));
+  const golden = currentD7Case === null
+    ? JSON.parse(await readFile(join(options.golden, "community-daily-response.json"), "utf8"))
+    : { from: currentD7Case.fromDay, to: currentD7Case.throughDay };
+  const goldenPreview = currentD7Case === null
+    ? JSON.parse(await readFile(join(options.golden, "preview.json"), "utf8")) : null;
   const manifest = JSON.parse(await readFile(join(options.golden, "manifest.json"), "utf8"));
-  const withheldModelDates = withheldModelDatesOf(manifest);
+  const withheldModelDates = currentD7Case === null ? withheldModelDatesOf(manifest) : [];
   let perDateExpected = null;
   if (options.perDateExpected !== null) {
     try {
@@ -1005,13 +2161,15 @@ export async function runRehearsal(options) {
     cacheReference: JSON.parse(await readFile(join(options.ownerReference, "cache-reference.json"), "utf8")),
     conflict: (JSON.parse(await readFile(join(options.ownerReference, "manifest.json"), "utf8"))).conflict ?? null,
   };
-  const dump = options.reuseSchema === null
+  const dump = currentD7Case !== null ? null : options.reuseSchema === null
     ? await resolveRehearsalDump({ golden: options.golden, dump: options.dump, manifest }) : null;
   const dumpPath = dump?.path ?? null;
-  const nowMs = manifest.nowMs;
+  const nowMs = currentD7Case?.nowMs ?? manifest.nowMs;
   const nowIso = new Date(nowMs).toISOString();
   if (!Number.isSafeInteger(nowMs) || nowIso !== manifest.now) fail("REHEARSAL_GOLDEN_CLOCK_INVALID");
 
+  const deadlineMonotonicMs = currentD7Case?.deadlineMonotonicMs;
+  if (deadlineMonotonicMs !== undefined) currentD7RemainingMs(deadlineMonotonicMs);
   const endpoint = await localEndpoint(process.env);
   const endpointEnv = {
     ...(process.env.PG_TEST_SOCKET ? { PG_TEST_SOCKET: process.env.PG_TEST_SOCKET } : {}),
@@ -1027,7 +2185,8 @@ export async function runRehearsal(options) {
   const timings = {};
   const report = {
     schemaVersion: options.comparisonMode === "historical" ? GCP_FASTPATH_REHEARSAL_REPORT_VERSION
-      : GCP_FASTPATH_CURRENT_REHEARSAL_REPORT_VERSION,
+      : options.comparisonMode === "current-worker-d1-d7" ? GCP_FASTPATH_CURRENT_D7_REHEARSAL_REPORT_VERSION
+        : GCP_FASTPATH_CURRENT_REHEARSAL_REPORT_VERSION,
     ...(options.comparisonMode === "historical" ? {} : { comparisonMode: options.comparisonMode }),
     startedAt: new Date().toISOString(),
     node: { rehearsal: process.version, analyticsRefresh: node22Version },
@@ -1041,13 +2200,16 @@ export async function runRehearsal(options) {
     gates: {},
     timingsMs: timings,
   };
-  const progress = createS9Progress("controller");
-  const pool = new pg.Pool(poolOptions(endpoint, 6, "gcp-fastpath-rehearsal"));
-  pool.on("error", () => {});
+  const ownsProgress = currentD7Case?.progress === undefined;
+  const progress = currentD7Case?.progress ?? createS9Progress("controller");
+  const pgPool = new pg.Pool(poolOptions(endpoint, 6, "gcp-fastpath-rehearsal", { deadlineMonotonicMs }));
+  pgPool.on("error", () => {});
+  const pool = deadlineMonotonicMs === undefined ? pgPool : createCurrentD7DeadlinePool(pgPool, deadlineMonotonicMs);
   let origin = null;
   let workDirectory = null;
   let currentReference = null, currentReferenceBinding = null, currentReferenceSha256 = null;
   let currentReferenceCapture = null, currentPostgresInputs = null, currentProducerAcceptance = null;
+  let currentD7ActualResponse = null, currentD7ActualPreview = null, currentD7ResponseTextSha256 = null;
   try {
     if (options.comparisonMode === "current-worker-d1") {
       // Capture the candidate's input closure before D1 execution, and before
@@ -1103,6 +2265,13 @@ export async function runRehearsal(options) {
         await writeFile(`${options.out}.current-reference-acceptance.json`, `${JSON.stringify(currentProducerAcceptance, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       }
       if (currentReference.qualification !== "complete") fail("REHEARSAL_CURRENT_REFERENCE_INCOMPLETE");
+    } else if (currentD7Case !== null) {
+      currentPostgresInputs = currentD7Case.currentPostgresInputs;
+      report.currentPostgresInputs = currentPostgresInputs;
+      report.currentD7Case = { caseId: currentD7Case.caseId,
+        referenceSha256: currentD7Case.referenceSha256,
+        expectationSha256: currentD7Case.expectationSha256,
+        pgInputSha256: currentD7Case.pgInputSha256 };
     }
     progress.phase("postgres");
     const version = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
@@ -1147,14 +2316,27 @@ export async function runRehearsal(options) {
       // 2. The sealed SQLite rebuild of the oracle's USAGE_MONITOR_DB dump.
       progress.phase("sqlite");
       workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-rehearsal-")));
-      const sealed = await timed(timings, "sqlite", async () => sealFastpathRehearsalSource({ dumpPath, workDirectory }));
-      report.steps.sqlite = sealed.report;
+      let sealed;
+      if (currentD7Case === null) {
+        sealed = await timed(timings, "sqlite", async () => sealFastpathRehearsalSource({ dumpPath, workDirectory }));
+        report.steps.sqlite = sealed.report;
+      } else {
+        const input = currentD7Case.pgInput;
+        sealed = { sealedSource: { path: input.ingestion.path, expectedSha256: input.ingestion.sha256 },
+          report: { sha256: input.ingestion.sha256, bytes: input.ingestion.bytes, producerSealed: true } };
+        report.steps.sqlite = sealed.report;
+      }
 
       // 3. Importers, in the plan's order (shared with the GCP seed).
       progress.phase("importers");
       Object.assign(report.steps, await loadFastpathRehearsalImporters({
-        pool, schema, controlSchema, suffix, sealedSource: sealed.sealedSource, dumpPath, workDirectory,
-        roster: manifest.owners, timings,
+        pool, schema, controlSchema, suffix, sealedSource: sealed.sealedSource,
+        dumpPath: currentD7Case === null ? dumpPath : null,
+        sealedJournalSource: currentD7Case === null ? null : {
+          path: currentD7Case.pgInput.journal.path, expectedSha256: currentD7Case.pgInput.journal.sha256,
+          expectedSourceId: currentD7Case.pgInput.sourceId,
+        },
+        workDirectory, roster: manifest.owners, timings,
       }));
     }
 
@@ -1170,7 +2352,8 @@ export async function runRehearsal(options) {
     progress.phase("refresh_first");
     const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
       timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers,
-      modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut });
+      modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut,
+      deadlineMonotonicMs });
     timings["refresh:first"] = first.wallMs;
     report.steps.refreshFirst = { exitCode: first.exitCode, receipt: first.receipt, error: first.error };
     if (first.exitCode !== 0) fail("REHEARSAL_REFRESH_FAILED", { error: first.error });
@@ -1191,11 +2374,12 @@ export async function runRehearsal(options) {
     // 5-6. The fastpath-test origin and the public read.
     progress.phase("origin");
     origin = await timed(timings, "origin:start", async () => spawnOrigin({
-      node: options.node22, endpoint, schema, nowMs,
+      node: options.node22, endpoint, schema, nowMs, deadlineMonotonicMs,
     }));
     const url = `${origin.origin}${COMMUNITY_DAILY_PATH}?from=${golden.from}&to=${golden.to}`;
     const response = await timed(timings, "origin:get", async () => {
-      const result = await fetch(url);
+      const result = await fetch(url, deadlineMonotonicMs === undefined ? undefined
+        : { signal: AbortSignal.timeout(currentD7RemainingMs(deadlineMonotonicMs)) });
       return { status: result.status, cacheControl: result.headers.get("cache-control"), text: await result.text() };
     });
     report.steps.read = { status: response.status, cacheControl: response.cacheControl, bytes: response.text.length,
@@ -1203,7 +2387,11 @@ export async function runRehearsal(options) {
     if (response.status !== 200) fail("REHEARSAL_READ_FAILED", { status: response.status, body: response.text.slice(0, 300) });
     const actual = JSON.parse(response.text);
     const actualPreview = await storedPreview(pool, schema);
-    if (options.out !== null) {
+    if (currentD7Case !== null) {
+      currentD7ActualResponse = actual;
+      currentD7ActualPreview = actualPreview;
+      currentD7ResponseTextSha256 = createHash("sha256").update(response.text).digest("hex");
+    } else if (options.out !== null) {
       await writeFile(`${options.out}.response.json`, `${response.text}\n`, { flag: "wx" });
       await writeFile(`${options.out}.preview.json`, `${JSON.stringify(actualPreview)}\n`, { flag: "wx" });
     }
@@ -1243,7 +2431,8 @@ export async function runRehearsal(options) {
     progress.phase("refresh_second");
     const second = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
       timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers,
-      modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut });
+      modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut,
+      ...(deadlineMonotonicMs === undefined ? {} : { deadlineMonotonicMs }) });
     timings["refresh:second"] = second.wallMs;
     report.steps.refreshSecond = { exitCode: second.exitCode, receipt: second.receipt, error: second.error };
     report.measurement.refreshSecond = refreshMeasurement(second);
@@ -1263,7 +2452,23 @@ export async function runRehearsal(options) {
     // probe evidence is not a matching PG kernel refusal protocol.
     report.runs = await refusalSummary(pool, schema);
     progress.phase("source_recheck");
-    if (currentReferenceCapture !== null) {
+    if (currentD7Case !== null) {
+      const { captureCurrentQ1D7ReferenceBinding, validateCurrentQ1D7InputBinding,
+        validateCurrentQ1D7Binding, validateCurrentQ1D7PgCaseInput } =
+        await import("../postgres-test/fixtures/current-q1-d7-reference.mjs");
+      const after = await captureCurrentQ1D7ReferenceBinding();
+      validateCurrentQ1D7InputBinding(after);
+      validateCurrentQ1D7Binding(currentD7Case.binding, after);
+      if (JSON.stringify(after) !== JSON.stringify(currentD7Case.inputBinding)
+        || JSON.stringify(await currentPostgresInputBinding({ node22: options.node22, node22Version,
+          stagedPrimary: options.stagedPrimary })) !== JSON.stringify(currentPostgresInputs)) {
+        fail("REHEARSAL_CURRENT_CANDIDATE_INPUTS_CHANGED");
+      }
+      await verifyCurrentD7PgCaseInputFiles({ descriptor: currentD7Case.pgInput, binding: currentD7Case.binding,
+        caseId: currentD7Case.caseId, pgInputDirectory: currentD7Case.pgInputDirectory,
+        validateDescriptor: validateCurrentQ1D7PgCaseInput });
+      report.currentCandidateInputsUnchanged = true;
+    } else if (currentReferenceCapture !== null) {
       const { validateCurrentQ1ReferenceBinding } = await import("../postgres-test/fixtures/current-q1-d1-reference.mjs");
       const after = await currentReferenceCapture();
       validateCurrentQ1ReferenceBinding({ reference: currentReference, expected: after });
@@ -1275,19 +2480,31 @@ export async function runRehearsal(options) {
       report.currentCandidateInputsUnchanged = true;
     }
 
-    report.gates = {
-      importersCompleted: true,
-      refreshFirstComplete: first.exitCode === 0,
-      readStatus200: response.status === 200,
-      secondRunZeroNewRevisions: second.exitCode === 0 && second.receipt?.state === "complete" && changed.length === 0,
-      ...(options.comparisonMode === "historical" ? {} : { currentCandidateInputsUnchanged: report.currentCandidateInputsUnchanged === true }),
-      ...rehearsalComparisonGates({ comparisonMode: options.comparisonMode, parity: report.parity,
-        currentContractParity: report.currentContractParity, hasAllowanceBreakdowns: actual.allowanceBreakdowns !== undefined,
-        perDate: report.perDate, producerAcceptance: currentProducerAcceptance }),
-      ...(report.ownerParity === undefined ? {} : { ownerParityZeroUnexpected: report.ownerParity.unexpectedDiffs === 0 }),
-      ...(syntheticFloor === null ? {} : { revisionFloorRespected: report.steps.revisionFloor.offFloorDays === 0
-        && report.steps.revisionFloor.flooredDays > 0 && report.steps.revisionFloor.receipt?.present === true }),
-    };
+    if (currentD7Case !== null) {
+      report.gates = {
+        importersCompleted: report.steps.importVerification?.ownerRoster?.equal === true
+          && report.steps.importVerification?.publicSourceOwners?.equal === true
+          && report.steps.importVerification?.ownerRevisions?.equal === true,
+        refreshFirstComplete: first.exitCode === 0 && first.receipt?.state === "complete",
+        readStatus200: response.status === 200,
+        secondRunZeroNewRevisions: second.exitCode === 0 && second.receipt?.state === "complete" && changed.length === 0,
+        currentCandidateInputsUnchanged: report.currentCandidateInputsUnchanged === true,
+      };
+    } else {
+      report.gates = {
+        importersCompleted: true,
+        refreshFirstComplete: first.exitCode === 0,
+        readStatus200: response.status === 200,
+        secondRunZeroNewRevisions: second.exitCode === 0 && second.receipt?.state === "complete" && changed.length === 0,
+        ...(options.comparisonMode === "historical" ? {} : { currentCandidateInputsUnchanged: report.currentCandidateInputsUnchanged === true }),
+        ...rehearsalComparisonGates({ comparisonMode: options.comparisonMode, parity: report.parity,
+          currentContractParity: report.currentContractParity, hasAllowanceBreakdowns: actual.allowanceBreakdowns !== undefined,
+          perDate: report.perDate, producerAcceptance: currentProducerAcceptance }),
+        ...(report.ownerParity === undefined ? {} : { ownerParityZeroUnexpected: report.ownerParity.unexpectedDiffs === 0 }),
+        ...(syntheticFloor === null ? {} : { revisionFloorRespected: report.steps.revisionFloor.offFloorDays === 0
+          && report.steps.revisionFloor.flooredDays > 0 && report.steps.revisionFloor.receipt?.present === true }),
+      };
+    }
     report.status = Object.values(report.gates).every(Boolean) ? "pass" : "gate_failed";
   } catch (error) {
     report.status = "error";
@@ -1321,9 +2538,14 @@ export async function runRehearsal(options) {
       }
       await pool.end().catch(() => {});
       report.finishedAt = new Date().toISOString();
-    } finally { progress.close(); }
+    } finally { if (ownsProgress) progress.close(); }
   }
   const text = `${JSON.stringify(report, null, 2)}\n`;
+  if (currentD7Case !== null) {
+    return { report, caseId: currentD7Case.caseId, schema, controlSchema, suffix,
+      actualResponse: currentD7ActualResponse, actualPreview: currentD7ActualPreview,
+      responseTextSha256: currentD7ResponseTextSha256, currentPostgresInputs };
+  }
   if (options.comparisonMode === "current-worker-d1") {
     // Do not emit a qualifying report until the final wx report is preserved.
     await writeFile(options.out, text, { flag: "wx", mode: 0o600 });

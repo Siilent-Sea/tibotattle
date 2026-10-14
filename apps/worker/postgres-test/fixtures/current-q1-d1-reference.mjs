@@ -23,6 +23,7 @@ import { promisify } from "node:util";
 
 import {
   advanceCurrentQ1CachePass, assertCurrentQ1ControlTransition, assertCurrentQ1SourceUnchanged, captureCurrentQ1SourceInvariant,
+  captureCurrentQ1SourceInvariantDetails,
   proveCurrentQ1StrictExportRefusal, runCurrentQ1DailyConvergence, runCurrentQ1Recomputation,
   validateCurrentQ1CorpusConvergence, validateCurrentQ1Recomputation, validateCurrentQ1StrictExportRefusal,
 } from "./current-q1-d1-recompute.mjs";
@@ -167,28 +168,117 @@ async function runtimeBinarySha256(path) {
 
 /** Exact current source bytes, copied workspace packages and dependency locks.
  * No database, environment file or private corpus can enter this closure. */
-async function sourceSnapshot() {
+async function sourceSnapshot(additionalWorkerPaths = [], { validateSourcePath, strictPublicPackageRoots = false } = {}) {
+  const rootFiles = new Set(["package.json", "pnpm-lock.yaml"]);
+  const copiedPackages = new Set(["accounting", "quota-analysis", "telemetry-contract"]);
+  const validAdditionalPath = (path) => {
+    if (typeof path !== "string" || path.length < 1 || path.length > 1024
+      || /[\\\0\r\n]/u.test(path)) return false;
+    if (rootFiles.has(path)) return true;
+    const parts = path.split("/");
+    if (parts.some((part) => part === "" || part === "." || part === ".."
+      || [".git", ".private", ".cache", ".codex", "secrets", "generated-inputs", "private-generated", "raw-history"]
+        .includes(part)
+      || /^\.(?:env(?:\.|$)|dev\.vars(?:\.|$)|envrc$|npmrc$|yarnrc(?:\.|$))/u.test(part))) return false;
+    if (parts.includes("node_modules")) return parts.filter((part) => part === "node_modules").length === 1
+      && parts.slice(0, 4).join("/") === "apps/worker/node_modules/@app-usagemonitor"
+      && copiedPackages.has(parts[4]) && parts.length >= 6
+      && parts.slice(5).every((part) => /^[A-Za-z0-9._-]+$/u.test(part));
+    return ["apps", "packages", "scripts", "src"].includes(parts[0]) && parts.length >= 2
+      && parts.every((part) => /^[A-Za-z0-9._-]+$/u.test(part));
+  };
+  requireFact(Array.isArray(additionalWorkerPaths) && additionalWorkerPaths.length <= 64
+    && additionalWorkerPaths.every(validAdditionalPath), "CURRENT_Q1_INPUT_INVALID");
+  requireFact(validateSourcePath === undefined || typeof validateSourcePath === "function",
+    "CURRENT_Q1_INPUT_INVALID");
+  requireFact(typeof strictPublicPackageRoots === "boolean", "CURRENT_Q1_INPUT_INVALID");
   const paths = [];
+  const assertCanonicalPath = async (path) => {
+    const relativePath = relative(REPOSITORY_ROOT, path);
+    requireFact(relativePath && relativePath !== ".." && !relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)
+      && !isAbsolute(relativePath) && await realpath(REPOSITORY_ROOT) === REPOSITORY_ROOT,
+    "CURRENT_Q1_INPUT_INVALID");
+    let current = REPOSITORY_ROOT;
+    for (const segment of relativePath.split("/")) {
+      current = join(current, segment);
+      const metadata = await lstat(current);
+      requireFact(!metadata.isSymbolicLink(), "CURRENT_Q1_INPUT_INVALID");
+    }
+    requireFact(await realpath(path) === path, "CURRENT_Q1_INPUT_INVALID");
+  };
   const collect = async (path) => {
     const metadata = await lstat(path);
     requireFact(!metadata.isSymbolicLink(), "CURRENT_Q1_INPUT_INVALID");
     if (metadata.isDirectory()) {
       for (const name of (await readdir(path)).sort()) await collect(join(path, name));
     } else {
-      requireFact(metadata.isFile() && paths.length < 10_000, "CURRENT_Q1_INPUT_INVALID");
+      const relativePath = relative(REPOSITORY_ROOT, path);
+      requireFact(metadata.isFile() && paths.length < 10_000
+        && (validateSourcePath === undefined || validateSourcePath(relativePath)), "CURRENT_Q1_INPUT_INVALID");
       paths.push(path);
     }
   };
-  for (const path of ["src", "node_modules/@app-usagemonitor", "test/helpers/telemetry-v11.ts",
+  const publicPackageRoots = strictPublicPackageRoots
+    ? ["node_modules/@app-usagemonitor/accounting", "node_modules/@app-usagemonitor/quota-analysis",
+      "node_modules/@app-usagemonitor/telemetry-contract"]
+    : ["node_modules/@app-usagemonitor"];
+  for (const path of ["src", ...publicPackageRoots, "test/helpers/telemetry-v11.ts",
     "package.json", "package-lock.json", "wrangler.jsonc", "cloud-run/sealed-sqlite-d1-adapter.mjs",
     "postgres-test/fixtures/current-q1-d1-reference.mjs", "postgres-test/fixtures/current-q1-d1-recompute.mjs", "scripts/s9-rehearsal-diagnostics.mjs", ...INGESTION_MIGRATIONS,
-    "analytics-migrations", "deletion-ledger-migrations"]) await collect(join(WORKER_ROOT, path));
+    "analytics-migrations", "deletion-ledger-migrations"]) {
+    const absolute = join(WORKER_ROOT, path);
+    if (strictPublicPackageRoots) await assertCanonicalPath(absolute);
+    await collect(absolute);
+  }
+  if (strictPublicPackageRoots) {
+    // D7 pins the canonical public package code alongside the exact installed
+    // copies. Do not walk package documentation or generated artifacts: only
+    // the published entrypoints and reviewed source roots are part of this
+    // runtime closure.
+    for (const packageName of ["accounting", "quota-analysis", "telemetry-contract"]) {
+      const packageRoot = join(REPOSITORY_ROOT, "packages", packageName);
+      for (const entry of ["package.json", "index.js", "index.d.ts"]) {
+        const path = join(packageRoot, entry);
+        try { await lstat(path); } catch (error) { if (error?.code === "ENOENT") continue; throw error; }
+        await assertCanonicalPath(path);
+        await collect(path);
+      }
+      for (const directory of ["src", "scripts", "schemas"]) {
+        const path = join(packageRoot, directory);
+        try { await lstat(path); } catch (error) { if (error?.code === "ENOENT") continue; throw error; }
+        await assertCanonicalPath(path);
+        await collect(path);
+      }
+    }
+  }
+  for (const path of additionalWorkerPaths) {
+    const absolute = join(REPOSITORY_ROOT, path);
+    if (validateSourcePath !== undefined) {
+      requireFact(validateSourcePath(path) && relative(REPOSITORY_ROOT, absolute) === path,
+        "CURRENT_Q1_INPUT_INVALID");
+      await assertCanonicalPath(absolute);
+    }
+    await collect(absolute);
+  }
   const files = [];
-  for (const path of paths.sort()) files.push({ path: relative(REPOSITORY_ROOT, path), sha256: sha(await boundedFile(path)) });
+  for (const path of paths.sort()) {
+    const relativePath = relative(REPOSITORY_ROOT, path);
+    requireFact(validateSourcePath === undefined || validateSourcePath(relativePath), "CURRENT_Q1_INPUT_INVALID");
+    requireFact(validateSourcePath === undefined || await realpath(path) === path,
+      "CURRENT_Q1_INPUT_INVALID");
+    files.push({ path: relativePath, sha256: sha(await boundedFile(path)) });
+  }
   const { stdout } = await promisify(execFile)("git", ["--no-optional-locks", "-C", REPOSITORY_ROOT, "rev-parse", "HEAD"],
     { timeout: 10_000, maxBuffer: 1_024, env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" } });
   requireFact(/^[a-f0-9]{40}\n$/u.test(stdout), "CURRENT_Q1_INPUT_INVALID");
   return { head: stdout.trim(), files, sha256: jsonSha(files) };
+}
+
+/** Public read-only provenance seam shared by the versioned D7 producer. */
+export async function captureCurrentQ1SourceSnapshot(additionalWorkerPaths = [], options = {}) {
+  requireFact(typeof options?.validateSourcePath === "function" && options.strictPublicPackageRoots === true,
+    "CURRENT_Q1_INPUT_INVALID");
+  return sourceSnapshot(additionalWorkerPaths, options);
 }
 
 async function corpusInput(P) {
@@ -366,6 +456,11 @@ function orderedMigrationInputs(sourceFiles) {
     .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
+/** Expose the existing migration ordering to the versioned D7 binder. */
+export function orderedCurrentQ1MigrationInputs(sourceFiles) {
+  return orderedMigrationInputs(sourceFiles);
+}
+
 async function measuredRuntime() {
   requireFact(process.version === "v26.2.0" && Object.hasOwn(TRUSTED_NODE_BINARIES, `${process.platform}/${process.arch}`),
     "CURRENT_Q1_RUNTIME_UNSUPPORTED");
@@ -374,6 +469,11 @@ async function measuredRuntime() {
     pinnedNowMs: CURRENT_Q1_REFERENCE_NOW_MS, randomSeed: "current-q1-reference", sqliteVersion: process.versions.sqlite };
   assertCurrentQ1TrustedRuntime(runtime);
   return runtime;
+}
+
+/** Reuse the current producer's independently measured runtime pin. */
+export async function measureCurrentQ1Runtime() {
+  return measuredRuntime();
 }
 
 function freezeTree(value) {
@@ -608,6 +708,11 @@ function pinRuntime(DatabaseSync) {
   };
 }
 
+/** Reuse only the existing reversible synthetic runtime adapter. */
+export function pinCurrentQ1Runtime(DatabaseSync) {
+  return pinRuntime(DatabaseSync);
+}
+
 function validateCorpusRecord(parser, stream, record) {
   const candidate = structuredClone(record), before = jsonSha(candidate);
   parser(stream, candidate);
@@ -641,6 +746,11 @@ async function loadCurrent(vite) {
       .every((method) => typeof method === "string" && P.STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS.includes(method)),
   "CURRENT_Q1_INPUT_INVALID");
   return P;
+}
+
+/** Load the same reviewed current production facades as the D1 producer. */
+export async function loadCurrentQ1WorkerModules(vite) {
+  return loadCurrent(vite);
 }
 
 /** Diagnostics retain only closed operation names and bounded ordinals/counts.
@@ -681,6 +791,12 @@ function admissionDiagnostic(P) {
   return { api, run, progress, snapshot };
 }
 
+/** Reuse the existing closed admission-operation diagnostics for another
+ * current-source synthetic producer without changing the D1 runner policy. */
+export function createCurrentQ1AdmissionDiagnostic(P) {
+  return admissionDiagnostic(P);
+}
+
 function inertObjectStore() {
   const objects = new Map();
   return {
@@ -690,6 +806,12 @@ function inertObjectStore() {
     async get() { return null; },
     async list() { return { objects: [], truncated: false }; },
   };
+}
+
+/** Reuse the content-free in-memory quarantine adapter for versioned current
+ * producers. The returned map remains scoped to the caller's fresh case. */
+export function createCurrentQ1InertObjectStore() {
+  return inertObjectStore();
 }
 
 async function applyMigrations(database, directory, provenance) {
@@ -708,6 +830,11 @@ async function applyMigrations(database, directory, provenance) {
     }
     provenance.push({ path: `apps/worker/${directory}/${name}`, sha256: sha(bytes) });
   }
+}
+
+/** Apply a current Worker migration set and retain its existing provenance. */
+export async function applyCurrentQ1Migrations(database, directory, provenance) {
+  return applyMigrations(database, directory, provenance);
 }
 
 async function seedCorpus(ctx, owners) {
@@ -852,8 +979,35 @@ async function seedCorpus(ctx, owners) {
   return admissions;
 }
 
+/** Seed a separately generated current corpus through the same public routes. */
+export async function seedCurrentQ1Corpus(ctx, owners) {
+  return seedCorpus(ctx, owners);
+}
+
+/** Public source-invariant seams for independent current-source qualification. */
+export async function captureCurrentQ1IngestionInvariant(database) {
+  return captureCurrentQ1SourceInvariant(database);
+}
+export async function captureCurrentQ1IngestionInvariantDetails(database) {
+  return captureCurrentQ1SourceInvariantDetails(database);
+}
+
+export function assertCurrentQ1IngestionInvariantUnchanged(before, after) {
+  return assertCurrentQ1SourceUnchanged(before, after);
+}
+
+/** Keep the exact existing negative strict-export proof available to v3. */
+export async function proveCurrentQ1ExportConflictRefusal(ctx, moduleDigest) {
+  return proveCurrentQ1StrictExportRefusal(ctx, moduleDigest);
+}
+
 const bindings = (ctx) => ({ source: ctx.ingestion, target: ctx.analytics,
   sourceId: CURRENT_Q1_REFERENCE_SOURCE_ID, sourceNamespace: NAMESPACE });
+
+/** Construct the current D1 bindings without exposing a mutable policy knob. */
+export function currentQ1DatabaseBindings(ctx) {
+  return bindings(ctx);
+}
 
 async function settle(ctx, corpus) {
   ctx.progress.phase("settle_bootstrap");
@@ -914,6 +1068,11 @@ async function conflictEvidence(ctx, corpus) {
     evidence.push({ day, rows, conflictRows, sha256: hash.digest("hex") });
   }
   return evidence;
+}
+
+/** Capture current canonical effective-reader conflict evidence for v3. */
+export async function captureCurrentQ1ConflictEvidence(ctx, corpus) {
+  return conflictEvidence(ctx, corpus);
 }
 
 async function convergenceSnapshot(ctx, corpus, dailyPasses, admissions) {
@@ -1339,15 +1498,8 @@ export function assessCurrentQ1ReferenceReadiness({ P, snapshot, corpus, current
 }
 
 async function responseDTO(ctx, corpus) {
+  const snapshot = await readCurrentQ1ResponseSnapshot(ctx, corpus.window);
   const window = corpus.window;
-  const allow = { limit: async () => ({ success: true }) };
-  const env = { USAGE_MONITOR_DB: ctx.ingestion, ANALYTICS_DB: ctx.analytics, DELETION_LEDGER: ctx.ledger,
-    ENVIRONMENT: "synthetic-development", PUBLIC_ANALYTICS_MODE: "enabled", TELEMETRY_STORAGE_MODE: "typed",
-    TELEMETRY_STORAGE_NAMESPACE: NAMESPACE, PUBLIC_READ_RATE_LIMIT: allow };
-  const response = await ctx.P.handleRequest(new Request(`https://oracle.example.test/api/v1/community/daily?from=${window.fromDay}&to=${window.throughDay}`), env);
-  const publicResponse = await response.json();
-  const adminPreview = await ctx.P.readPublishedStorageCommunityAdminPreview(bindings(ctx), CURRENT_Q1_REFERENCE_NOW_MS);
-  const snapshot = { publicResponse: { status: response.status, body: publicResponse }, adminPreview };
   const read = await ctx.P.readPublishedStorageCommunityDaily({ ...bindings(ctx), fromDay: window.fromDay, throughDay: window.throughDay });
   const previewRow = await ctx.P.readPublishedStorageCommunityGraph(bindings(ctx), CURRENT_Q1_REFERENCE_NOW_MS);
   const currentCache = await ctx.P.readCacheRetentionCommunitySeries({ target: ctx.analytics,
@@ -1356,10 +1508,33 @@ async function responseDTO(ctx, corpus) {
     currentDailyRows: read.rows, previewRow, currentCache }) };
 }
 
+/** Read only the actual current public/admin DTOs for a supplied closed range.
+ * This reusable seam intentionally does not assess or rewrite D1 readiness. */
+export async function readCurrentQ1ResponseSnapshot(ctx, window) {
+  requireFact(object(window) && exactKeys(window, ["fromDay", "throughDay"])
+    && DAY.test(window.fromDay) && DAY.test(window.throughDay) && window.fromDay <= window.throughDay
+    && typeof ctx?.P?.handleRequest === "function"
+    && typeof ctx.P.readPublishedStorageCommunityAdminPreview === "function",
+  "CURRENT_Q1_INPUT_INVALID");
+  const allow = { limit: async () => ({ success: true }) };
+  const env = { USAGE_MONITOR_DB: ctx.ingestion, ANALYTICS_DB: ctx.analytics, DELETION_LEDGER: ctx.ledger,
+    ENVIRONMENT: "synthetic-development", PUBLIC_ANALYTICS_MODE: "enabled", TELEMETRY_STORAGE_MODE: "typed",
+    TELEMETRY_STORAGE_NAMESPACE: NAMESPACE, PUBLIC_READ_RATE_LIMIT: allow };
+  const response = await ctx.P.handleRequest(new Request(`https://oracle.example.test/api/v1/community/daily?from=${window.fromDay}&to=${window.throughDay}`), env);
+  const publicResponse = await response.json();
+  const adminPreview = await ctx.P.readPublishedStorageCommunityAdminPreview(bindings(ctx), CURRENT_Q1_REFERENCE_NOW_MS);
+  return { publicResponse: { status: response.status, body: publicResponse }, adminPreview };
+}
+
+/** Read the current DTOs and existing readiness assessment without rewriting it. */
+export async function readCurrentQ1ResponseDTO(ctx, corpus) {
+  return responseDTO(ctx, corpus);
+}
+
 /** Probe only graph scopes that ordinary current recomputation did not publish.
  * Default production query/deadline limits are retained. A deferred result is
  * never promoted into a completed or native-refused result. */
-async function nativeCheckpointProgress(ctx, scope) {
+export async function nativeCheckpointProgress(ctx, scope) {
   const P = ctx.P;
   let method, dependencyDigest;
   if (scope.source === "v1.1") {

@@ -379,7 +379,7 @@ function workerStageFailures(workflow, workerPackage) {
     }
     if (job.steps.some((step) => WORKER_STAGE_PLAN.some((other) => other.script !== script
       && step.run?.trim() === workerNpm(other.script)))) failures.push(`${id} runs a different Worker stage`);
-    if (job.steps.some((step) => /\bEDGE_E2E_(?:NODE|GOLDEN|REHEARSAL_NODE)\b|POSTGRES_V12_TRANSFER_Q1_DUMP|22\.16/u.test(`${step.run ?? ""}${step.with?.["node-version"] ?? ""}`))) {
+    if (job.steps.some((step) => /\bEDGE_E2E_(?:NODE|GOLDEN|REHEARSAL_NODE|S9_COMPARISON_MODE)\b|POSTGRES_V12_TRANSFER_Q1_DUMP|22\.16/u.test(`${step.run ?? ""}${step.with?.["node-version"] ?? ""}`))) {
       failures.push(`${id} carries PostgreSQL edge-runtime inputs outside the routed PostgreSQL producer`);
     }
     const stageOwners = Object.entries(workflow.jobs)
@@ -923,6 +923,9 @@ function edgeRuntimeFailures(workflow, { suite, spec, transferSpec, goldenFiles 
   if (!declared("EDGE_E2E_GOLDEN_VARIABLE", "EDGE_E2E_GOLDEN")) failures.push("the suite no longer reads EDGE_E2E_GOLDEN");
   if (!/process\.env\.EDGE_E2E_REHEARSAL_NODE\b/u.test(spec)) failures.push("the edge spec no longer reads EDGE_E2E_REHEARSAL_NODE");
   if (!/process\.env\.EDGE_E2E_GOLDEN\b/u.test(spec)) failures.push("the edge spec no longer reads EDGE_E2E_GOLDEN");
+  if (!/process\.env\.EDGE_E2E_S9_COMPARISON_MODE\b/u.test(spec)) {
+    failures.push("the edge spec no longer reads the explicit D7 S9 comparison mode");
+  }
   if (!/process\.env\.POSTGRES_V12_TRANSFER_Q1_DUMP\b/u.test(transferSpec)) {
     failures.push("the transfer spec no longer reads POSTGRES_V12_TRANSFER_Q1_DUMP");
   }
@@ -932,7 +935,7 @@ function edgeRuntimeFailures(workflow, { suite, spec, transferSpec, goldenFiles 
   for (const [id, job] of Object.entries(workflow.jobs)) {
     if (id === "postgres-17-core-a" || id === "postgres-17-core-b") continue;
     if (id !== "postgres-17-edge-e2e") {
-      if (job.steps.some((step) => /\bEDGE_E2E_(?:NODE|GOLDEN|REHEARSAL_NODE)\b|POSTGRES_V12_TRANSFER_Q1_DUMP|22\.16/u.test(`${step.run ?? ""}${step.with?.["node-version"] ?? ""}`))) {
+      if (job.steps.some((step) => /\bEDGE_E2E_(?:NODE|GOLDEN|REHEARSAL_NODE|S9_COMPARISON_MODE)\b|POSTGRES_V12_TRANSFER_Q1_DUMP|22\.16/u.test(`${step.run ?? ""}${step.with?.["node-version"] ?? ""}`))) {
         failures.push(`${id} names the edge runtime; only postgres-17-edge-e2e runs the edge spec`);
       }
       continue;
@@ -959,6 +962,12 @@ function edgeRuntimeFailures(workflow, { suite, spec, transferSpec, goldenFiles 
     if (!naming.includes("test -f \"$golden/dump/usage-monitor-db.json\"")
         || !/printf 'POSTGRES_V12_TRANSFER_Q1_DUMP=%s\\n' "\$golden\/dump\/usage-monitor-db\.json"/u.test(naming)) {
       failures.push("POSTGRES_V12_TRANSFER_Q1_DUMP is not the committed golden's dump/usage-monitor-db.json");
+    }
+    if (!naming.includes("printf 'EDGE_E2E_S9_COMPARISON_MODE=%s\\n' 'current-worker-d1-d7'")) {
+      failures.push("the edge S9 mode is not explicitly current-worker-d1-d7");
+    }
+    if (Object.hasOwn(job.env ?? {}, "EDGE_E2E_S9_COMPARISON_MODE")) {
+      failures.push("the edge S9 mode is a job literal; it must be set by the checked static step");
     }
     if (!/>> "\$GITHUB_ENV"/u.test(naming) || /\$\{\{/u.test(naming)) {
       failures.push("the edge runtime is not exported through GITHUB_ENV from static shell");
@@ -1212,6 +1221,18 @@ test("hosted CI contract: an edge runtime that is unnamed, misplaced, drifted or
     job.env.EDGE_E2E_GOLDEN = "analytics-v2-test/golden";
   }).some((failure) => failure.includes("job literal")), "relative job literal");
 
+  assert.ok(mutate((job) => {
+    const at = stepAt(job, runMatches(/EDGE_E2E_NODE=/u));
+    job.steps[at].run = job.steps[at].run.replace(/printf 'EDGE_E2E_S9_COMPARISON_MODE[^\n]*\n/u, "");
+  }).some((failure) => failure.includes("not explicitly current-worker-d1-d7")), "missing versioned S9 mode");
+  assert.ok(mutate((job) => {
+    const at = stepAt(job, runMatches(/EDGE_E2E_NODE=/u));
+    job.steps[at].run = job.steps[at].run.replace("current-worker-d1-d7", "current-worker-d1");
+  }).some((failure) => failure.includes("not explicitly current-worker-d1-d7")), "silent v2 fallback");
+  assert.ok(mutate((job) => {
+    job.env.EDGE_E2E_S9_COMPARISON_MODE = "current-worker-d1-d7";
+  }).some((failure) => failure.includes("mode is a job literal")), "unchecked mode literal");
+
   // Order: the toolchain must be installed last so it is first on PATH.
   assert.ok(mutate((job) => {
     const [tool] = job.steps.splice(stepAt(job, isSetupNode(TOOLCHAIN_NODE)), 1);
@@ -1238,6 +1259,15 @@ test("hosted CI contract: an edge runtime that is unnamed, misplaced, drifted or
     leaked.jobs[id].steps.splice(1, 0, { name: "leak", run: "printf 'EDGE_E2E_NODE=x\\n' >> \"$GITHUB_ENV\"" });
     assert.deepEqual(edgeRuntimeFailures(leaked, inputs), [`${id} names the edge runtime; only postgres-17-edge-e2e runs the edge spec`]);
   }
+
+  for (const id of [...WORKER_STAGE_IDS, "worker-gate", "cloud-run-check"]) {
+    const leaked = structuredClone(workflow);
+    leaked.jobs[id].steps.splice(1, 0, { name: "mode leak", run: "printf 'EDGE_E2E_S9_COMPARISON_MODE=current-worker-d1-d7\\n' >> \"$GITHUB_ENV\"" });
+    assert.deepEqual(edgeRuntimeFailures(leaked, inputs), [`${id} names the edge runtime; only postgres-17-edge-e2e runs the edge spec`]);
+  }
+  assert.deepEqual(edgeRuntimeFailures(workflow, { ...inputs,
+    spec: inputs.spec.replaceAll("EDGE_E2E_S9_COMPARISON_MODE", "MODE_REMOVED") }),
+  ["the edge spec no longer reads the explicit D7 S9 comparison mode"]);
 
   // The names and the version are pinned to the suite and the spec.
   assert.deepEqual(edgeRuntimeFailures(workflow, { ...inputs, suite: inputs.suite.replace(`"v${IMAGE_NODE}"`, '"v22.17.0"') }),

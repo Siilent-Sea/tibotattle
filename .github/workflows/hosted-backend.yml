@@ -690,7 +690,9 @@ jobs:
 
       # EDGE_E2E_NODE must be an absolute path to the Node.js 22.16.0 binary and
       # EDGE_E2E_GOLDEN an absolute path to the committed Q-1 golden; without
-      # them the suite reports an EDGE_E2E environment gap and fails.
+      # them the suite reports an EDGE_E2E environment gap and fails. This
+      # hosted gate explicitly selects the current two-case D7 v3 qualification;
+      # the canonical corpus path never selects v2 or historical mode by itself.
       # POSTGRES_V12_TRANSFER_Q1_DUMP names the same golden's dump for the
       # transfer spec's Q-1 case, which the suite reports as silently skipped
       # without it. Every value comes from the runner and the checkout, never
@@ -705,6 +707,7 @@ jobs:
           {
             printf 'EDGE_E2E_NODE=%s\n' "$(command -v node)"
             printf 'EDGE_E2E_GOLDEN=%s\n' "$golden"
+            printf 'EDGE_E2E_S9_COMPARISON_MODE=%s\n' 'current-worker-d1-d7'
             printf 'POSTGRES_V12_TRANSFER_Q1_DUMP=%s\n' "$golden/dump/usage-monitor-db.json"
           } >> "$GITHUB_ENV"
 
