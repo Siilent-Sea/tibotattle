@@ -181,6 +181,15 @@
       "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
       "priceRegistryVersion": "app-official-api-prices-v0.9",
       "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 21,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "17fac1235531ce50a09c24fd5304e6e9fcd4a91a9783eae4954d2730b525421c",
+      "computeClosureSha256": "b1b0a51d04a92fbbb36c93b16d09714c0ae1d5d9db7ede04a15a6ea337412ca8",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
     }
   ]
 }

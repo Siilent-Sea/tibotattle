@@ -129,6 +129,18 @@
       "id": "daily-values-ordered-closed-shape",
       "hunks": 10,
       "sha256": "a00c3e6109b305a2f10d14b08dc3cdd78f14075a30b3eaeb7dd93a2547810d16"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v1.ts",
+      "id": "price-parsed-chunk-record",
+      "hunks": 1,
+      "sha256": "b95f6a57f3249400af86f3593c7ff3ea594962babb2ebc1fd380db95dc3e5b9e"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "id": "synchronous-model-era-usage-event",
+      "hunks": 2,
+      "sha256": "a5be59166fff45fe2a25c6f6be2686d205d311a0bd35afb5e121881a3c039be2"
     }
   ],
   "counts": {
@@ -139,8 +151,8 @@
     "package": 40,
     "exportPatched": 8,
     "exportPatchedFiles": 4,
-    "sourcePatched": 8,
-    "sourcePatchedFiles": 6,
+    "sourcePatched": 10,
+    "sourcePatchedFiles": 7,
     "typeStubs": 3,
     "parityTests": 10
   },
@@ -393,8 +405,8 @@
     {
       "path": "apps/worker/src/quota-analysis-v1.ts",
       "blob": "fd0240f1dece5e7826b9065af2fca3a2ca9ad471",
-      "sha256": "d8ca925613e1040f3430fc89cf6fa758da4cbdc270e0933e86bca612a94e845e",
-      "patch": "export",
+      "sha256": "906b8e0486f7f9662be6b36c33c6685cdb2bc776670f9a14e0d1619cdd96775d",
+      "patch": "export+source",
       "reach": "kernel"
     },
     {
@@ -414,7 +426,7 @@
     {
       "path": "apps/worker/src/quota-analysis-v11.ts",
       "blob": "a7da16db679a2b309b36121b4bda3239113f8e4c",
-      "sha256": "a0fe12293c9196ff6c816047c1b62069e90c013a04334dba781810869a0e8ba0",
+      "sha256": "01c5d79e43d7b9b96f5e65b2e6a6ba4bcf8dbfde1458e5cf4fb90a5ec8741638",
       "patch": "export+source",
       "reach": "kernel"
     },

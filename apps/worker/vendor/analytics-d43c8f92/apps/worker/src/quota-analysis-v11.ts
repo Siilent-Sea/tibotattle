@@ -29,6 +29,7 @@ import {
   MAX_WINDOWED_USAGE_ROWS,
   V1_ANALYSIS_WINDOW_DAYS,
   priceChunkUsageRecord,
+  priceParsedChunkUsageRecord,
 } from "./quota-analysis-v1";
 import type { V1ModelCompositionResult } from "./quota-analysis-v1";
 import {
@@ -1429,6 +1430,60 @@ export async function usageEvent(context: Context, previous: Map<string, { time:
   if (evidence === null) return null;
   if ("status" in evidence) return evidence;
   const { attribution, scope, end, priced } = evidence;
+  const accountBreak = prior !== undefined && prior.scope !== scope;
+  return { provider: row.provider, scope, accountBreak,
+    eraKey: v11UsageEventEra(context.index, { provider: row.provider, accountScopeId: scope,
+      planBasis: attribution.planBasis, planType: attribution.planType, planEraId: attribution.planEraId,
+      observedAtMs: end, accountBreak, ...(prior ? { priorObservedAtMs: prior.time } : {}) }),
+    interval: { start: prior?.time ?? end, end }, priced };
+}
+
+/** Synchronous model-era row path. It preserves the generic row memo, eager
+ * pricing, session-before-price order, DROP behavior, and refusal contract. */
+export function usageEventSync(context: Context, previous: Map<string, { time: number; scope: string | null }>,
+  row: UsageRow): UsageEvidence | Refusal | null {
+  if (!TOKEN.test(row.provider)) return null;
+  const known = usageRowEvidenceMemos.get(row);
+  let record: Record<string, unknown> | null | undefined;
+  let memo: UsageRowEvidenceMemo;
+  if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) {
+    memo = known;
+  } else {
+    record = parseStoredRecordJson(row.record_json);
+    let attribution: TelemetryV11Attribution | null = null;
+    if (record) {
+      try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+      catch { attribution = null; }
+    }
+    if (attribution !== null) {
+      attribution = internUsageRowValue(usageRowAttributions, JSON.stringify([attribution.accountBasis,
+        attribution.accountTrackId, attribution.planBasis, attribution.planType, attribution.planEraId]), attribution);
+    }
+    memo = { recordJson: row.record_json, observedAt: row.observed_at, attribution, priced: undefined };
+    usageRowEvidenceMemos.set(row, memo);
+  }
+  if (memo.attribution === null) return refused("invalid_attribution_record");
+  const attribution = memo.attribution;
+  const scope = attribution.accountBasis === "same_source" ? attribution.accountTrackId : null;
+  const end = Date.parse(row.observed_at);
+  if (!Number.isSafeInteger(end)) return refused("invalid_attribution_record");
+  const session = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
+  let prior: { time: number; scope: string | null } | undefined;
+  if (session !== null) {
+    prior = previous.get(session);
+    if (!previous.has(session) && previous.size >= MAX_SESSIONS) {
+      return refused("session_interval_scope_limit_exceeded");
+    }
+    previous.set(session, { time: end, scope });
+  }
+  if (memo.priced === undefined) {
+    if (record === undefined) record = parseStoredRecordJson(row.record_json);
+    const parsedPrice = record === null ? null : priceParsedChunkUsageRecord(record, row.observed_at);
+    memo.priced = parsedPrice === null || parsedPrice.modelId === null ? parsedPrice
+      : { ...parsedPrice, modelId: internUsageRowValue(usageRowModels, parsedPrice.modelId, parsedPrice.modelId) };
+  }
+  const priced = memo.priced;
+  if (priced === null) return null;
   const accountBreak = prior !== undefined && prior.scope !== scope;
   return { provider: row.provider, scope, accountBreak,
     eraKey: v11UsageEventEra(context.index, { provider: row.provider, accountScopeId: scope,

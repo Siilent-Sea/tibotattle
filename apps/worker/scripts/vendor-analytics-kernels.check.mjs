@@ -87,6 +87,10 @@ const PINNED_SOURCE_PATCHES = [
     "4ff0cd7345ad201938d0196e3a2571ff522b3458fd89811ebf362649073c3c06"],
   ["apps/worker/src/v11-daily-projection-values.ts", "daily-values-ordered-closed-shape", 10,
     "a00c3e6109b305a2f10d14b08dc3cdd78f14075a30b3eaeb7dd93a2547810d16"],
+  ["apps/worker/src/quota-analysis-v1.ts", "price-parsed-chunk-record", 1,
+    "b95f6a57f3249400af86f3593c7ff3ea594962babb2ebc1fd380db95dc3e5b9e"],
+  ["apps/worker/src/quota-analysis-v11.ts", "synchronous-model-era-usage-event", 2,
+    "a5be59166fff45fe2a25c6f6be2686d205d311a0bd35afb5e121881a3c039be2"],
 ].map(([path, id, hunks, sha256]) => ({ path, id, hunks, sha256 }));
 const PACKAGE_FILE = /^packages\/([a-z-]+)\/(package\.json|index\.js|index\.d\.ts|src\/.+)$/;
 

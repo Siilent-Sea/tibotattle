@@ -20,6 +20,9 @@ import {
   createV11QuotaAcquisitionIdentity,
   foldEffectiveQuotaDays,
   mapEffectiveUsagePageRow,
+  quotaContext,
+  usageEvent,
+  usageEventSync,
   MAX_WINDOWED_USAGE_ROWS,
   modelHistoryWindow,
   type EffectiveTelemetryOccurrence,
@@ -48,6 +51,7 @@ const WINDOW_LENGTH = 101;
 const GPT_MODELS = ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] as const;
 const CLAUDE_MODELS = ["claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-opus-5"] as const;
 const VERSION = "analytics-v2-plan-era-composition-v1";
+const NO_DB = {} as never;
 
 type PlanType = "pro" | "plus";
 type Track = {
@@ -273,6 +277,12 @@ async function prepareBlockInput(owner: ReturnType<typeof syntheticOwner>, facts
   };
 }
 
+function withUsageRecord(row: UsageRow, update: (record: Record<string, unknown>) => void): UsageRow {
+  const record = JSON.parse(row.record_json) as Record<string, unknown>;
+  update(record);
+  return { ...row, record_json: JSON.stringify(record) };
+}
+
 function completedAcquisition(input: WindowInput): V11CompletedQuotaAcquisition {
   const nowMs = Date.parse(modelHistoryWindow(input.day).fixedNow);
   const identity = createV11QuotaAcquisitionIdentity(input.pin, nowMs);
@@ -310,6 +320,125 @@ let transitionWindow: Promise<WindowInput> | undefined;
 const preparedTransitionWindow = () => transitionWindow ??= prepareWindow(transitionsOwner, transitionFacts);
 
 describe("GCP model-era composition fallback", () => {
+  it("keeps synchronous model-era evidence, eager pricing, and session ordering equivalent", async () => {
+    const input = await preparedTransitionWindow();
+    const context = await quotaContext(NO_DB, input.pin, {
+      nowMs: Date.parse(modelHistoryWindow(input.day).fixedNow),
+      quotaAcquisition: completedAcquisition(input),
+    });
+    if ("status" in context) throw new Error("synthetic quota context refused: " + context.reason);
+    const row = input.days.at(-1)!.usageRows[0]!;
+    const compare = async (candidate: UsageRow) => {
+      const asyncPrevious = new Map<string, { time: number; scope: string | null }>();
+      const syncPrevious = new Map<string, { time: number; scope: string | null }>();
+      const generic = await usageEvent(context, asyncPrevious, { ...candidate });
+      const synchronous = usageEventSync(context, syncPrevious, { ...candidate });
+      expect(synchronous).toEqual(generic);
+      expect([...syncPrevious]).toEqual([...asyncPrevious]);
+      return { result: synchronous, previous: syncPrevious };
+    };
+
+    const ordinary = await compare(row);
+    expect(ordinary.result).not.toBeNull();
+
+    const repeatedRow = { ...row };
+    const firstPrevious = new Map<string, { time: number; scope: string | null }>();
+    const secondPrevious = new Map<string, { time: number; scope: string | null }>();
+    const firstSync = usageEventSync(context, firstPrevious, repeatedRow);
+    const secondSync = usageEventSync(context, secondPrevious, repeatedRow);
+    expect(secondSync).toEqual(firstSync);
+    expect([...secondPrevious]).toEqual([...firstPrevious]);
+
+    // Keep separate row identities alive across calls so each existing WeakMap
+    // memo must invalidate when record_json or observed_at changes. Run sync
+    // first on every stage so generic usageEvent cannot prewarm the sync row.
+    const pricedRecord = withUsageRecord(row, (record) => { record.modelId = "gpt-6.1-sol"; });
+    const persistentSyncRow = { ...row, record_json: pricedRecord.record_json };
+    const persistentGenericRow = { ...row, record_json: pricedRecord.record_json };
+    const comparePersistentRows = async () => {
+      const asyncPrevious = new Map<string, { time: number; scope: string | null }>();
+      const syncPrevious = new Map<string, { time: number; scope: string | null }>();
+      const synchronous = usageEventSync(context, syncPrevious, persistentSyncRow);
+      const generic = await usageEvent(context, asyncPrevious, persistentGenericRow);
+      expect(synchronous).toEqual(generic);
+      expect([...syncPrevious]).toEqual([...asyncPrevious]);
+      return { result: synchronous, previous: syncPrevious };
+    };
+    const warmedMemo = await comparePersistentRows();
+    expect(warmedMemo.result).toMatchObject({ priced: { pricingStatus: "fully_priced" } });
+
+    const changedRecord = withUsageRecord(pricedRecord, (record) => { record.modelId = "unknown"; });
+    persistentSyncRow.record_json = changedRecord.record_json;
+    persistentGenericRow.record_json = changedRecord.record_json;
+    const changedRecordResult = await comparePersistentRows();
+    expect(changedRecordResult.result).toMatchObject({ priced: { pricingStatus: "unpriced" } });
+    expect(changedRecordResult.result).not.toEqual(warmedMemo.result);
+
+    persistentSyncRow.record_json = pricedRecord.record_json;
+    persistentGenericRow.record_json = pricedRecord.record_json;
+    const restoredRecordResult = await comparePersistentRows();
+    expect(restoredRecordResult.result).toMatchObject({ priced: { pricingStatus: "fully_priced" } });
+
+    const preEffectiveDate = "2026-09-28T12:00:00.000Z";
+    persistentSyncRow.observed_at = preEffectiveDate;
+    persistentGenericRow.observed_at = preEffectiveDate;
+    const changedObservedAtResult = await comparePersistentRows();
+    expect(changedObservedAtResult.result).toMatchObject({
+      interval: { end: Date.parse(preEffectiveDate) },
+      priced: { pricingStatus: "unpriced" },
+    });
+    expect(changedObservedAtResult.result).not.toEqual(restoredRecordResult.result);
+
+    const unknownModel = withUsageRecord(row, (record) => { record.modelId = "unknown"; });
+    const unknown = await compare(unknownModel);
+    expect(unknown.result).toMatchObject({ priced: { pricingStatus: "unpriced" } });
+
+    const outsideEra = withUsageRecord(row, (record) => {
+      (record.accountPlanAttribution as Record<string, unknown>).planEraId = "plan-era:v1:" + "f".repeat(64);
+    });
+    const excluded = await compare(outsideEra);
+    expect(excluded.result).toMatchObject({ eraKey: null });
+
+    const noMeasurements = withUsageRecord(row, (record) => {
+      const components = record.components as Record<string, unknown>;
+      for (const key of ["inputUncachedTokens", "inputCacheReadTokens", "inputCacheWriteTokens",
+        "outputTextTokens", "outputReasoningTokens", "outputCombinedTokens"]) components[key] = null;
+    });
+    const dropped = await compare(noMeasurements);
+    expect(dropped.result).toBeNull();
+    expect(dropped.previous.size).toBe(1);
+
+    const invalidAttribution = withUsageRecord(row, (record) => { record.accountPlanAttribution = {}; });
+    const refused = await compare(invalidAttribution);
+    expect(refused.result).toMatchObject({ status: "not_testable", reason: "invalid_attribution_record" });
+    expect(refused.previous.size).toBe(0);
+
+    const malformedJson = { ...row, record_json: "{" };
+    const malformed = await compare(malformedJson);
+    expect(malformed.result).toMatchObject({ status: "not_testable", reason: "invalid_attribution_record" });
+    expect(malformed.previous.size).toBe(0);
+
+    const invalidPrice = withUsageRecord(row, (record) => {
+      (record.components as Record<string, unknown>).inputUncachedTokens = "not-a-decimal";
+    });
+    const asyncPrevious = new Map<string, { time: number; scope: string | null }>();
+    const syncPrevious = new Map<string, { time: number; scope: string | null }>();
+    await expect(usageEvent(context, asyncPrevious, { ...invalidPrice })).rejects.toThrow();
+    expect(() => usageEventSync(context, syncPrevious, { ...invalidPrice })).toThrow();
+    expect(asyncPrevious.size).toBe(1);
+    expect([...syncPrevious]).toEqual([...asyncPrevious]);
+
+    const invalidPriceOutsideEra = withUsageRecord(outsideEra, (record) => {
+      (record.components as Record<string, unknown>).inputUncachedTokens = "not-a-decimal";
+    });
+    const excludedAsyncPrevious = new Map<string, { time: number; scope: string | null }>();
+    const excludedSyncPrevious = new Map<string, { time: number; scope: string | null }>();
+    await expect(usageEvent(context, excludedAsyncPrevious, { ...invalidPriceOutsideEra })).rejects.toThrow();
+    expect(() => usageEventSync(context, excludedSyncPrevious, { ...invalidPriceOutsideEra })).toThrow();
+    expect(excludedAsyncPrevious.size).toBe(1);
+    expect([...excludedSyncPrevious]).toEqual([...excludedAsyncPrevious]);
+  });
+
   it("partitions Pro to Plus to Pro into three candidates and drops transition-crossing bins", async () => {
     const input = await preparedTransitionWindow();
     expect(input.days).toHaveLength(WINDOW_LENGTH);
@@ -673,6 +802,9 @@ describe("GCP model-era composition fallback", () => {
       ...base,
       session_uuid: index.toString().padStart(6, "0"),
     }));
+    sessionRows[sessionRows.length - 1] = withUsageRecord(sessionRows.at(-1)!, (record) => {
+      (record.components as Record<string, unknown>).inputUncachedTokens = "not-a-decimal";
+    });
     const rows = input.days.map((day) => ({ day: day.day,
       usageRows: day.day === TARGET_DAY ? sessionRows : [] }));
     const result = await evaluateAnalyticsV2PlanEraComposition({

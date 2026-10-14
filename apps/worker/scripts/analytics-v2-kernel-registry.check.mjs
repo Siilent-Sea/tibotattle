@@ -109,6 +109,8 @@ const REGISTRY_PINS = Object.freeze([
   "e27e4b4f0f3d6f24a9ce2e85bc3bb90424465ec06c555830b0236d46fe935bfb",
   // Kernel 20: ordered closed-shape validation; model-era composition retained.
   "77b04b9418e2c84672eda34e44de82923511029693c96fe6615e635dace07041",
+  // Kernel 21: synchronous parse-once model-era usage; eager pricing retained.
+  "ed9a5e20c341629c46e300eea7739bc0b71a47befca56492ff97ba1dfae303b5",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

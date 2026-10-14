@@ -12,7 +12,7 @@ import {
   MODEL_COMPOSITION_POLICY,
   quotaContext,
   reduceV11UsageModelEvent,
-  usageEvent,
+  usageEventSync,
   v11ModelCompositionFromModelHalf,
   v11UsageModelHalf,
   type UsageRow,
@@ -164,7 +164,7 @@ export async function evaluateAnalyticsV2PlanEraComposition(input: {
   let stateBytes = candidates.size * 2_048;
   let cells = 0;
   for (const day of input.days) for (const row of day.usageRows) {
-    const event = await usageEvent(context, previous, row);
+    const event = usageEventSync(context, previous, row);
     if (event !== null && "status" in event) return event;
     if (event !== null) {
       const scopes = candidateScopes.get(event.provider);

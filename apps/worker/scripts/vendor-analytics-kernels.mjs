@@ -843,6 +843,128 @@ const PRIVATE_CLOSED_SIGNATURES = Object.fromEntries(Object.entries(PRIVATE_CLOS
         replace: `closed(value,PRIVATE_CLOSED_KEYS.legacy,PRIVATE_CLOSED_SIGNATURES.legacy)` },
     ],
   },
+
+  {
+    id: "price-parsed-chunk-record",
+    path: "apps/worker/src/quota-analysis-v1.ts",
+    hunks: [
+      { find: `export function priceChunkUsageRecord(
+  recordJson: string,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
+  const rec = parseStoredRecordJson(recordJson);
+  if (rec === null) return null;
+  const pricingEvent = buildPricingEvent(rec, observedAt);
+  if (pricingEvent === null) return null;
+  const priced = priceTelemetryUsageEvent(pricingEvent);
+  return {
+    costNanousd: priced.costNanousd,
+    pricingStatus: priced.coverageStatus as PricingStatus,
+    modelId: typeof rec.modelId === "string" && SAFE_TOKEN.test(rec.modelId)
+      ? rec.modelId
+      : null,
+  };
+}`,
+        replace: `export function priceParsedChunkUsageRecord(
+  rec: Record<string, unknown>,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
+  const pricingEvent = buildPricingEvent(rec, observedAt);
+  if (pricingEvent === null) return null;
+  const priced = priceTelemetryUsageEvent(pricingEvent);
+  return {
+    costNanousd: priced.costNanousd,
+    pricingStatus: priced.coverageStatus as PricingStatus,
+    modelId: typeof rec.modelId === "string" && SAFE_TOKEN.test(rec.modelId)
+      ? rec.modelId
+      : null,
+  };
+}
+
+export function priceChunkUsageRecord(
+  recordJson: string,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
+  const rec = parseStoredRecordJson(recordJson);
+  if (rec === null) return null;
+  return priceParsedChunkUsageRecord(rec, observedAt);
+}` },
+    ],
+  },
+  {
+    id: "synchronous-model-era-usage-event",
+    path: "apps/worker/src/quota-analysis-v11.ts",
+    // Keep usage-row-evidence-memo's reviewed helper replacements byte-identical.
+    // The sync path uses the same WeakMap and intern tables, but builds a memo
+    // from its stack-local parsed record without changing those earlier anchors.
+    hunks: [
+      { find: `  V1_ANALYSIS_WINDOW_DAYS,
+  priceChunkUsageRecord,
+} from "./quota-analysis-v1";`,
+        replace: `  V1_ANALYSIS_WINDOW_DAYS,
+  priceChunkUsageRecord,
+  priceParsedChunkUsageRecord,
+} from "./quota-analysis-v1";` },
+      { find: `    interval: { start: prior?.time ?? end, end }, priced };
+}`,
+        replace: `    interval: { start: prior?.time ?? end, end }, priced };
+}
+
+/** Synchronous model-era row path. It preserves the generic row memo, eager
+ * pricing, session-before-price order, DROP behavior, and refusal contract. */
+export function usageEventSync(context: Context, previous: Map<string, { time: number; scope: string | null }>,
+  row: UsageRow): UsageEvidence | Refusal | null {
+  if (!TOKEN.test(row.provider)) return null;
+  const known = usageRowEvidenceMemos.get(row);
+  let record: Record<string, unknown> | null | undefined;
+  let memo: UsageRowEvidenceMemo;
+  if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) {
+    memo = known;
+  } else {
+    record = parseStoredRecordJson(row.record_json);
+    let attribution: TelemetryV11Attribution | null = null;
+    if (record) {
+      try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+      catch { attribution = null; }
+    }
+    if (attribution !== null) {
+      attribution = internUsageRowValue(usageRowAttributions, JSON.stringify([attribution.accountBasis,
+        attribution.accountTrackId, attribution.planBasis, attribution.planType, attribution.planEraId]), attribution);
+    }
+    memo = { recordJson: row.record_json, observedAt: row.observed_at, attribution, priced: undefined };
+    usageRowEvidenceMemos.set(row, memo);
+  }
+  if (memo.attribution === null) return refused("invalid_attribution_record");
+  const attribution = memo.attribution;
+  const scope = attribution.accountBasis === "same_source" ? attribution.accountTrackId : null;
+  const end = Date.parse(row.observed_at);
+  if (!Number.isSafeInteger(end)) return refused("invalid_attribution_record");
+  const session = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
+  let prior: { time: number; scope: string | null } | undefined;
+  if (session !== null) {
+    prior = previous.get(session);
+    if (!previous.has(session) && previous.size >= MAX_SESSIONS) {
+      return refused("session_interval_scope_limit_exceeded");
+    }
+    previous.set(session, { time: end, scope });
+  }
+  if (memo.priced === undefined) {
+    if (record === undefined) record = parseStoredRecordJson(row.record_json);
+    const parsedPrice = record === null ? null : priceParsedChunkUsageRecord(record, row.observed_at);
+    memo.priced = parsedPrice === null || parsedPrice.modelId === null ? parsedPrice
+      : { ...parsedPrice, modelId: internUsageRowValue(usageRowModels, parsedPrice.modelId, parsedPrice.modelId) };
+  }
+  const priced = memo.priced;
+  if (priced === null) return null;
+  const accountBreak = prior !== undefined && prior.scope !== scope;
+  return { provider: row.provider, scope, accountBreak,
+    eraKey: v11UsageEventEra(context.index, { provider: row.provider, accountScopeId: scope,
+      planBasis: attribution.planBasis, planType: attribution.planType, planEraId: attribution.planEraId,
+      observedAtMs: end, accountBreak, ...(prior ? { priorObservedAtMs: prior.time } : {}) }),
+    interval: { start: prior?.time ?? end, end }, priced };
+}` },
+    ],
+  },
 ].map((patch) => Object.freeze({ ...patch, hunks: Object.freeze(patch.hunks.map((hunk) => Object.freeze({ ...hunk }))) })));
 
 const SOURCE_PATCH_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;

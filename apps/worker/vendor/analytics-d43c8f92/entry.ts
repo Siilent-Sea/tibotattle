@@ -67,6 +67,7 @@ export {
   foldV11UsageModelReduction,
   quotaContext,
   usageEvent,
+  usageEventSync,
   createV11UsageModelState,
   reduceV11UsageModelEvent,
   v11UsageModelHalf,
