@@ -127,6 +127,15 @@ status and an allowlisted code. No principal, device, generation, token,
 request identifier, body, provider message or SQL is logged. A broken log sink
 cannot change activation. These observations support aggregate latency and
 refusal analysis; they do not identify which historical device failed.
+The source candidate also records `refusalPhase` for v1.2 refusals: `state`
+for explicit predecessor, input-revision and head checks; `rekey` for a newly
+introduced duplicate identity; `classification` for the classification-pair
+proof; `session_closure` for session classification closure; and `closure`
+for same-day successor closure. Only the corresponding intentional refusal
+boundary supplies a phase. Successes, storage failures and unclassified
+refusals retain `null`; v1.1 remains unclassified. The phase is private log
+metadata and does not alter the public status, error body or headers. Its
+presence in source does not establish deployment or identify an earlier failure.
 `telemetry_request_completed` adds counts, status, duration and timestamp for
 allowlisted sync, authorization, manifest, contribution and domain operations
 after the edge admission boundary. It records successes as well as refusals and

@@ -1,4 +1,6 @@
-import { preparePostgresClassificationActivation } from "./postgres-classification-activation";
+import {
+  preparePostgresClassificationActivation, PostgresClassificationActivationRefusalError,
+} from "./postgres-classification-activation";
 import { postgresClassificationLinkPredicate } from "./postgres-classification-links";
 import { PostgresClassificationCorrectionError } from "./postgres-classification-correction";
 import {
@@ -27,6 +29,9 @@ import {
   classifyPostgresTelemetryV12StorageError,
   postgresTelemetryV12StorageFailure,
 } from "./postgres-telemetry-v12-storage-refusal";
+import {
+  markTelemetryActivationRefusalPhase, type TelemetryActivationRefusalPhase,
+} from "./telemetry-activation-observation";
 import type {
   TelemetryV12DomainActivation as TelemetryV12DomainActivationBase,
   TelemetryV12DomainPredecessor,
@@ -118,8 +123,9 @@ function preserveSafeError(error: unknown): Error | null {
   return classifyPostgresTelemetryV12StorageError(error);
 }
 
-function conflict(): ApiError {
-  return new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+function conflict(phase?: TelemetryActivationRefusalPhase): ApiError {
+  const error = new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+  return phase ? markTelemetryActivationRefusalPhase(error, phase) : error;
 }
 
 /** A changed manifest on the same day may append records, but cannot erase or
@@ -143,7 +149,7 @@ async function assertSameDaySuccessorClosure(
       [day.manifestId, principal.participantId, principal.deviceId,
         day.day, day.manifestDigest],
     );
-    if (manifest.rows.length !== 1) throw conflict();
+    if (manifest.rows.length !== 1) throw conflict("closure");
     const summary = await client.query<{
       chunks: string; records: string; typed_records: string; legacy_records: string;
     }>(
@@ -166,7 +172,7 @@ async function assertSameDaySuccessorClosure(
         || Number(row.records) > expectedChunks * 200
         || row.records !== row.typed_records
         || row.legacy_records !== "0") {
-      throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
+      throw markTelemetryActivationRefusalPhase(new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE"), "closure");
     }
   }
   const missing = await client.query(
@@ -184,7 +190,7 @@ async function assertSameDaySuccessorClosure(
       LIMIT 1`,
     [previous.manifestId, successor.manifestId,activationDigest],
   );
-  if (missing.rows.length !== 0) throw conflict();
+  if (missing.rows.length !== 0) throw conflict("closure");
 }
 
 async function stateRow(client: PostgresClient, schema: string, participantId: string): Promise<StateRow> {
@@ -201,7 +207,7 @@ async function stateRow(client: PostgresClient, schema: string, participantId: s
     [participantId],
   );
   const state = result.rows[0];
-  if (!state || result.rows.length !== 1) throw conflict();
+  if (!state || result.rows.length !== 1) throw conflict("state");
   revision(state.input_revision);
   return state;
 }
@@ -409,7 +415,7 @@ export function createPostgresTypedV12Domain(
             || predecessor.previous_generation_id !== manifest.predecessor.previousGenerationId
             || predecessor.legacy_fingerprint !== manifest.predecessor.legacyFingerprint
             || predecessor.days_json === null) {
-          throw conflict();
+          throw conflict("state");
         }
         await assertPostgresTypedV12WriteAllowed(client, principal, actualNow.getTime(), authorityOptions);
         const state = await stateRow(client, schema, principal.participantId);
@@ -417,7 +423,7 @@ export function createPostgresTypedV12Domain(
             || state.generation_id !== predecessor.previous_generation_id
             || manifest.fromDay > predecessor.from_day
             || manifest.throughDay < predecessor.through_day) {
-          throw conflict();
+          throw conflict("state");
         }
         const daysJson = canonicalTelemetryV12Json(manifest.days);
         // A fresh predecessor token does not make an unchanged day vector new
@@ -456,7 +462,7 @@ export function createPostgresTypedV12Domain(
           !item || typeof item !== "object" || typeof item.day !== "string"
           || typeof item.manifestId !== "string" || typeof item.manifestDigest !== "string"
           || !manifest.days.some((day) => day.day === item.day))) {
-          throw conflict();
+          throw conflict("state");
         }
         const desiredIds = manifest.days.map((day) => day.manifestId);
         const ready = await client.query<ReadyManifestRow>(
@@ -471,7 +477,7 @@ export function createPostgresTypedV12Domain(
           const row = readyById.get(day.manifestId);
           return !row || row.chunk_day !== day.day || row.manifest_digest !== day.manifestDigest;
         })) {
-          throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
+          throw markTelemetryActivationRefusalPhase(new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE"), "state");
         }
         const generationId = crypto.randomUUID();
         try {
@@ -482,6 +488,7 @@ export function createPostgresTypedV12Domain(
             manifestDigest:manifest.manifestDigest,days:manifest.days,predecessorDays:existingDays as DomainDayReference[],
           });
         } catch(error) {
+          if(error instanceof PostgresClassificationActivationRefusalError) throw conflict(error.phase);
           if(error instanceof PostgresClassificationCorrectionError) throw conflict();
           throw error;
         }
@@ -526,7 +533,7 @@ export function createPostgresTypedV12Domain(
           RETURNING generation_id`,
           [principal.participantId, generationId, committedAt],
         );
-        if (head.rows[0]?.generation_id !== generationId) throw conflict();
+        if (head.rows[0]?.generation_id !== generationId) throw conflict("state");
         const consumed = await client.query(
           `UPDATE ${table(schema, "telemetry_v12_domain_predecessors")}
               SET consumed_at = $1
@@ -534,7 +541,7 @@ export function createPostgresTypedV12Domain(
               AND consumed_at IS NULL AND expires_at > $1::timestamptz`,
           [committedAt, tokenHash, principal.participantId, principal.deviceId],
         );
-        if (consumed.rowCount !== 1) throw conflict();
+        if (consumed.rowCount !== 1) throw conflict("state");
         return activationResult({
           id: generationId,
           manifest_digest: manifest.manifestDigest,
