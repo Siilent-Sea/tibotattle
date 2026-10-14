@@ -85,6 +85,8 @@ const PINNED_SOURCE_PATCHES = [
     "50451d4c3f13fb38e6a007c1f2fb6a5b1b365256c188c321109fc2ccfb5c4441"],
   ["apps/worker/src/analytics-shared-reducers.ts", "daily-fold-trusted-state", 2,
     "4ff0cd7345ad201938d0196e3a2571ff522b3458fd89811ebf362649073c3c06"],
+  ["apps/worker/src/v11-daily-projection-values.ts", "daily-values-ordered-closed-shape", 10,
+    "a00c3e6109b305a2f10d14b08dc3cdd78f14075a30b3eaeb7dd93a2547810d16"],
 ].map(([path, id, hunks, sha256]) => ({ path, id, hunks, sha256 }));
 const PACKAGE_FILE = /^packages\/([a-z-]+)\/(package\.json|index\.js|index\.d\.ts|src\/.+)$/;
 

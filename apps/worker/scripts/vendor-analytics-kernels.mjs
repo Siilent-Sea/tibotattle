@@ -787,6 +787,62 @@ export function foldV11DailyProjectionValuesTrusted(state:V11DailyProjectionValu
 ` },
     ],
   },
+  {
+    id: "daily-values-ordered-closed-shape",
+    path: "apps/worker/src/v11-daily-projection-values.ts",
+    // Ordered own keys avoid sorting; every other shape retains the existing
+    // sorted-NUL comparison. Sort copies so TOKEN_KEYS emission order is unchanged.
+    hunks: [
+      { find: `const TOKEN_KEYS = [...COMPONENTS,'effectiveOutput','nonOverlappingTotal'] as const;
+`,
+        replace: `const TOKEN_KEYS = [...COMPONENTS,'effectiveOutput','nonOverlappingTotal'] as const;
+const PRIVATE_CLOSED_KEYS = {
+  tokens: TOKEN_KEYS,
+  token: ['knownSum','unavailable'],
+  pricing: ['knownNanousd','fullyPriced','partiallyPriced','unpriced'],
+  current: ['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells','omitted'],
+  counts: ['usage','quota','session'],
+  omitted: ['usageEvents','tokens','pricing'],
+  cell: ['provider','modelId','usageEvents','tokens','pricing'],
+  legacy: ['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells'],
+} as const;
+const PRIVATE_CLOSED_SIGNATURES = Object.fromEntries(Object.entries(PRIVATE_CLOSED_KEYS)
+  .map(([name, keys]) => [name, [...keys].sort().join('\\0')])) as { [K in keyof typeof PRIVATE_CLOSED_KEYS]: string };
+` },
+      { find: `function closed(value: unknown, keys: readonly string[]): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join('\\0') !== [...keys].sort().join('\\0')) fail();
+}`,
+        replace: `function closed(value: unknown, keys: readonly string[], expectedSortedNul: string): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail();
+  const actual = Object.keys(value);
+  if (actual.length === keys.length) {
+    let ordered = true;
+    for (let index = 0; index < keys.length; index += 1) {
+      if (actual[index] !== keys[index]) { ordered = false; break; }
+    }
+    if (ordered) return;
+  }
+  if (actual.sort().join('\\0') !== expectedSortedNul) fail();
+}` },
+      { find: `closed(value,TOKEN_KEYS)`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.tokens,PRIVATE_CLOSED_SIGNATURES.tokens)` },
+      { find: `closed(entry,['knownSum','unavailable'])`,
+        replace: `closed(entry,PRIVATE_CLOSED_KEYS.token,PRIVATE_CLOSED_SIGNATURES.token)` },
+      { find: `closed(value,['knownNanousd','fullyPriced','partiallyPriced','unpriced'])`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.pricing,PRIVATE_CLOSED_SIGNATURES.pricing)` },
+      { find: `closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells','omitted'])`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.current,PRIVATE_CLOSED_SIGNATURES.current)` },
+      { find: `closed(value.counts,['usage','quota','session'])`,
+        replace: `closed(value.counts,PRIVATE_CLOSED_KEYS.counts,PRIVATE_CLOSED_SIGNATURES.counts)` },
+      { find: `closed(value.omitted,['usageEvents','tokens','pricing'])`,
+        replace: `closed(value.omitted,PRIVATE_CLOSED_KEYS.omitted,PRIVATE_CLOSED_SIGNATURES.omitted)` },
+      { find: `closed(entry,['provider','modelId','usageEvents','tokens','pricing'])`,
+        replace: `closed(entry,PRIVATE_CLOSED_KEYS.cell,PRIVATE_CLOSED_SIGNATURES.cell)` },
+      { find: `closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells'])`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.legacy,PRIVATE_CLOSED_SIGNATURES.legacy)` },
+    ],
+  },
 ].map((patch) => Object.freeze({ ...patch, hunks: Object.freeze(patch.hunks.map((hunk) => Object.freeze({ ...hunk }))) })));
 
 const SOURCE_PATCH_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;

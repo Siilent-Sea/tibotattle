@@ -107,6 +107,8 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 19: era-isolated model composition on the production hotfix line.
   // Existing single-era math is unchanged; each owner votes once per model.
   "e27e4b4f0f3d6f24a9ce2e85bc3bb90424465ec06c555830b0236d46fe935bfb",
+  // Kernel 20: ordered closed-shape validation; model-era composition retained.
+  "77b04b9418e2c84672eda34e44de82923511029693c96fe6615e635dace07041",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
