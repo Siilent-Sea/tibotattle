@@ -132,6 +132,7 @@ async function completeLinePrefixBytes(handle, size, maximumLineBytes, resourceG
     scanned += bytesRead;
     const newline = buffer.lastIndexOf(0x0a);
     if (newline !== -1) return start + newline + 1;
+    if (scanned > maximumLineBytes) throw new ExportResourceLimitError("line_bytes");
     end = start;
   }
   return 0;

@@ -52,6 +52,16 @@ The generator requires exact, hash-pinned binaries:
 Pass resolved absolute binary paths, not mutable symlinks. The script validates
 each binary's version and SHA-256 before executing the workload.
 
+Source admission applies the existing raw-line resource limit before parsing
+and interval selection, including oversized unfinished structured tails. An
+`export_resource_line_bytes` refusal is not a stale-receipt repair opportunity:
+do not raise the limit, filter out a source or record, change the registered
+interval, or substitute derived state for the raw corpus to obtain a passing
+matrix. Out-of-interval records can affect canonical duplicate selection.
+Diagnose with bounded, local, content-free evidence; preserve the existing
+receipts until complete regeneration succeeds. A genuine oversized source can
+block this gate even when the application fixes and synthetic checks pass.
+
 ## Regeneration
 
 The retained interval is frozen at exactly 31 days:

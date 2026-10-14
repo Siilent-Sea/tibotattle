@@ -14,6 +14,7 @@ const SECRET = Buffer.alloc(32, 53);
 const PRIVATE = "PRIVATE_INCREMENTAL_CLAUDE_CANARY";
 const START_AT = "2026-07-24T12:00:00.000Z";
 const END_AT = "2026-07-24T13:00:00.000Z";
+const MAXIMUM_LINE_BYTES = 16 * 1024 * 1024;
 
 function assistant(timestamp, { output = 3, toolId = "tool-a", toolName = "Read", input = 11 } = {}) {
   return {
@@ -47,6 +48,87 @@ async function databaseContains(root, needle) {
   }
   return false;
 }
+
+test("incremental canonical state enforces the unfinished line limit before recording a source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-claude-incremental-tail-limit-"));
+  await chmod(root, 0o700);
+  const transcript = join(root, "session.jsonl");
+  const canonicalizer = openClaudeDesktopIncrementalCanonicalizer(
+    join(root, "canonical.sqlite"), { secret: SECRET },
+  );
+  try {
+    const emptySnapshot = canonicalizer.snapshot();
+    assert.deepEqual(emptySnapshot, { sources: 0, groups: 0, tools: 0, dirtyGroups: 0 });
+    await writeFile(transcript, Buffer.alloc(MAXIMUM_LINE_BYTES + 1, 0x7b), { mode: 0o600 });
+    await assert.rejects(canonicalizer.refresh({
+      sourcePaths: [transcript], startAt: START_AT, endAt: END_AT, observedAtMs: 1,
+    }), (error) => error.code === "claude_desktop_incremental_line_bytes");
+    assert.deepEqual(canonicalizer.snapshot(), emptySnapshot);
+
+    await writeFile(transcript, Buffer.alloc(MAXIMUM_LINE_BYTES, 0x7b), { mode: 0o600 });
+    const exactLimit = await canonicalizer.refresh({
+      sourcePaths: [transcript], startAt: START_AT, endAt: END_AT, observedAtMs: 2,
+    });
+    assert.equal(exactLimit.parsedBytes, 0);
+    assert.equal(exactLimit.parsedLines, 0);
+    assert.equal(exactLimit.assistantOccurrences, 0);
+    assert.deepEqual(exactLimit.candidates, []);
+    assert.equal(exactLimit.presentSources.length, 1);
+    assert.deepEqual(canonicalizer.snapshot(), { sources: 1, groups: 0, tools: 0, dirtyGroups: 0 });
+  } finally {
+    canonicalizer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("incremental canonical state preserves its complete prefix at the unfinished line limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-claude-incremental-prefix-limit-"));
+  await chmod(root, 0o700);
+  const transcript = join(root, "session.jsonl");
+  const prefix = `${JSON.stringify(assistant("2026-07-24T12:10:00.000Z"))}\n`;
+  await writeFile(transcript, prefix, { mode: 0o600 });
+  const canonicalizer = openClaudeDesktopIncrementalCanonicalizer(
+    join(root, "canonical.sqlite"), { secret: SECRET },
+  );
+  try {
+    const initial = await canonicalizer.refresh({
+      sourcePaths: [transcript], startAt: START_AT, endAt: END_AT, observedAtMs: 1,
+    });
+    assert.equal(initial.parsedLines, 1);
+    assert.equal(initial.candidates.length, 1);
+    const initialSnapshot = canonicalizer.snapshot();
+    assert.deepEqual(initialSnapshot, { sources: 1, groups: 1, tools: 1, dirtyGroups: 1 });
+
+    await appendFile(transcript, Buffer.alloc(MAXIMUM_LINE_BYTES, 0x7b));
+    const exactLimit = await canonicalizer.refresh({
+      sourcePaths: [transcript], startAt: START_AT, endAt: END_AT, observedAtMs: 2,
+    });
+    assert.equal(exactLimit.parsedBytes, 0);
+    assert.equal(exactLimit.parsedLines, 0);
+    assert.equal(exactLimit.assistantOccurrences, 0);
+    assert.deepEqual(exactLimit.candidates, initial.candidates);
+    assert.deepEqual(exactLimit.presentSources, initial.presentSources);
+    assert.deepEqual(canonicalizer.snapshot(), initialSnapshot);
+
+    await appendFile(transcript, "{");
+    await assert.rejects(canonicalizer.refresh({
+      sourcePaths: [transcript], startAt: START_AT, endAt: END_AT, observedAtMs: 3,
+    }), (error) => error.code === "claude_desktop_incremental_line_bytes");
+    assert.deepEqual(canonicalizer.snapshot(), initialSnapshot);
+
+    await writeFile(transcript, prefix, { mode: 0o600 });
+    const recovered = await canonicalizer.refresh({
+      sourcePaths: [transcript], startAt: START_AT, endAt: END_AT, observedAtMs: 4,
+    });
+    assert.equal(recovered.parsedLines, 0);
+    assert.deepEqual(recovered.candidates, initial.candidates);
+    assert.deepEqual(recovered.presentSources, initial.presentSources);
+    assert.deepEqual(canonicalizer.snapshot(), initialSnapshot);
+  } finally {
+    canonicalizer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("incremental canonical state handles unchanged, append, restart, mutation, and disappearance", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-claude-incremental-test-"));

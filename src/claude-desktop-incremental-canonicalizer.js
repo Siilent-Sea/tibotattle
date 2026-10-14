@@ -103,6 +103,7 @@ async function completePrefixBytes(handle, size) {
     scanned += bytesRead;
     const newline = buffer.lastIndexOf(0x0a);
     if (newline !== -1) return start + newline + 1;
+    if (scanned > MAXIMUM_LINE_BYTES) fail("line_bytes");
     end = start;
   }
   return 0;
