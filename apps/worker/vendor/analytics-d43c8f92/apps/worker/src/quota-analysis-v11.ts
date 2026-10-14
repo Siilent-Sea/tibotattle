@@ -1438,29 +1438,71 @@ export async function usageEvent(context: Context, previous: Map<string, { time:
     interval: { start: prior?.time ?? end, end }, priced };
 }
 
-/** Synchronous model-era row path. It preserves the generic row memo, eager
- * pricing, session-before-price order, DROP behavior, and refusal contract. */
+/** One private signature/pricing slot per synchronous model-era context. The
+ * row/session/era decisions remain outside this memo and are recomputed per row. */
+interface UsageEventSyncContextMemo {
+  readonly recordJson: string;
+  readonly observedAt: string;
+  readonly attribution: TelemetryV11Attribution | null;
+  priced: ReturnType<typeof priceChunkUsageRecord> | undefined;
+}
+const usageEventSyncContextMemos = new WeakMap<Context, UsageEventSyncContextMemo>();
+function copyUsageEventSyncPrice(priced: ReturnType<typeof priceChunkUsageRecord> | undefined):
+  ReturnType<typeof priceChunkUsageRecord> | undefined {
+  if (priced === undefined || priced === null) return priced;
+  return { costNanousd: priced.costNanousd, pricingStatus: priced.pricingStatus, modelId: priced.modelId };
+}
+
+/** Synchronous model-era row path. It preserves eager pricing, the
+ * session-before-price order, DROP behavior, and the refusal contract. A
+ * context gets one exact-input parse/price slot; all row-specific metadata,
+ * carry, and era decisions are recomputed on every call. */
 export function usageEventSync(context: Context, previous: Map<string, { time: number; scope: string | null }>,
   row: UsageRow): UsageEvidence | Refusal | null {
   if (!TOKEN.test(row.provider)) return null;
   const known = usageRowEvidenceMemos.get(row);
+  const saved = usageEventSyncContextMemos.get(context);
+  const contextMemo = saved !== undefined && saved.recordJson === row.record_json && saved.observedAt === row.observed_at
+    ? saved : undefined;
   let record: Record<string, unknown> | null | undefined;
   let memo: UsageRowEvidenceMemo;
-  if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) {
-    memo = known;
+  let privateMemo: UsageEventSyncContextMemo;
+  if (contextMemo !== undefined) {
+    if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) {
+      memo = known;
+    } else {
+      memo = { recordJson: row.record_json, observedAt: row.observed_at,
+        attribution: contextMemo.attribution, priced: undefined };
+      usageRowEvidenceMemos.set(row, memo);
+    }
+    // Never return an exposed row-owned price when a private snapshot can
+    // supply an independent three-scalar copy.
+    memo.priced = copyUsageEventSyncPrice(contextMemo.priced);
+    privateMemo = contextMemo;
   } else {
-    record = parseStoredRecordJson(row.record_json);
-    let attribution: TelemetryV11Attribution | null = null;
-    if (record) {
-      try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
-      catch { attribution = null; }
+    let attribution: TelemetryV11Attribution | null;
+    if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) {
+      memo = known;
+      attribution = memo.attribution;
+      // A row memo's price may have escaped through UsageEvidence.priced. Reprice
+      // for this context slot instead of importing potentially mutated data.
+      memo.priced = undefined;
+    } else {
+      record = parseStoredRecordJson(row.record_json);
+      attribution = null;
+      if (record) {
+        try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+        catch { attribution = null; }
+      }
+      if (attribution !== null) {
+        attribution = internUsageRowValue(usageRowAttributions, JSON.stringify([attribution.accountBasis,
+          attribution.accountTrackId, attribution.planBasis, attribution.planType, attribution.planEraId]), attribution);
+      }
+      memo = { recordJson: row.record_json, observedAt: row.observed_at, attribution, priced: undefined };
+      usageRowEvidenceMemos.set(row, memo);
     }
-    if (attribution !== null) {
-      attribution = internUsageRowValue(usageRowAttributions, JSON.stringify([attribution.accountBasis,
-        attribution.accountTrackId, attribution.planBasis, attribution.planType, attribution.planEraId]), attribution);
-    }
-    memo = { recordJson: row.record_json, observedAt: row.observed_at, attribution, priced: undefined };
-    usageRowEvidenceMemos.set(row, memo);
+    privateMemo = { recordJson: row.record_json, observedAt: row.observed_at, attribution, priced: undefined };
+    usageEventSyncContextMemos.set(context, privateMemo);
   }
   if (memo.attribution === null) return refused("invalid_attribution_record");
   const attribution = memo.attribution;
@@ -1476,19 +1518,23 @@ export function usageEventSync(context: Context, previous: Map<string, { time: n
     }
     previous.set(session, { time: end, scope });
   }
+  const accountBreak = prior !== undefined && prior.scope !== scope;
+  const eraKey = v11UsageEventEra(context.index, { provider: row.provider, accountScopeId: scope,
+    planBasis: attribution.planBasis, planType: attribution.planType, planEraId: attribution.planEraId,
+    observedAtMs: end, accountBreak, ...(prior ? { priorObservedAtMs: prior.time } : {}) });
   if (memo.priced === undefined) {
     if (record === undefined) record = parseStoredRecordJson(row.record_json);
     const parsedPrice = record === null ? null : priceParsedChunkUsageRecord(record, row.observed_at);
-    memo.priced = parsedPrice === null || parsedPrice.modelId === null ? parsedPrice
+    const priced = parsedPrice === null || parsedPrice.modelId === null ? parsedPrice
       : { ...parsedPrice, modelId: internUsageRowValue(usageRowModels, parsedPrice.modelId, parsedPrice.modelId) };
+    memo.priced = priced;
+    // Only a successful current-call pricing result enters the private slot.
+    // A throw leaves it undefined; DROP remains a distinct cached null result.
+    privateMemo.priced = copyUsageEventSyncPrice(priced);
   }
   const priced = memo.priced;
   if (priced === null) return null;
-  const accountBreak = prior !== undefined && prior.scope !== scope;
-  return { provider: row.provider, scope, accountBreak,
-    eraKey: v11UsageEventEra(context.index, { provider: row.provider, accountScopeId: scope,
-      planBasis: attribution.planBasis, planType: attribution.planType, planEraId: attribution.planEraId,
-      observedAtMs: end, accountBreak, ...(prior ? { priorObservedAtMs: prior.time } : {}) }),
+  return { provider: row.provider, scope, accountBreak, eraKey,
     interval: { start: prior?.time ?? end, end }, priced };
 }
 

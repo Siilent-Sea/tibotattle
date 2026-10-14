@@ -283,6 +283,29 @@ function withUsageRecord(row: UsageRow, update: (record: Record<string, unknown>
   return { ...row, record_json: JSON.stringify(record) };
 }
 
+function replaceCanonicalRecordString(recordJson: string, key: string, previous: string, next: string): string {
+  const from = `${JSON.stringify(key)}:${JSON.stringify(previous)}`;
+  const to = `${JSON.stringify(key)}:${JSON.stringify(next)}`;
+  const start = recordJson.indexOf(from);
+  if (start < 0 || recordJson.indexOf(from, start + from.length) >= 0) {
+    throw new Error("synthetic canonical usage field is missing or ambiguous");
+  }
+  return recordJson.slice(0, start) + to + recordJson.slice(start + from.length);
+}
+
+function makeMappedUsageRowVariant(base: UsageRow, owner: ReturnType<typeof syntheticOwner>, index: number,
+  sessionUuid: string): UsageRow {
+  if (base.session_uuid === null) throw new Error("synthetic usage fixture requires a session");
+  const occurrenceId = `event:v1:${(owner.n * 1_000_000 + index).toString(16).padStart(64, "0")}`;
+  const recordJson = replaceCanonicalRecordString(base.record_json, "eventId", base.occurrence_id, occurrenceId);
+  return {
+    ...base,
+    occurrence_id: occurrenceId,
+    session_uuid: sessionUuid,
+    record_json: replaceCanonicalRecordString(recordJson, "sessionUuid", base.session_uuid, sessionUuid),
+  };
+}
+
 function completedAcquisition(input: WindowInput): V11CompletedQuotaAcquisition {
   const nowMs = Date.parse(modelHistoryWindow(input.day).fixedNow);
   const identity = createV11QuotaAcquisitionIdentity(input.pin, nowMs);
@@ -340,6 +363,35 @@ describe("GCP model-era composition fallback", () => {
 
     const ordinary = await compare(row);
     expect(ordinary.result).not.toBeNull();
+
+    // A context price hit must still use each row's provider/session metadata.
+    const alternateProvider = await compare({ ...row, provider: "anthropic_claude_code",
+      session_uuid: "synthetic-context-cache-other-provider-session" });
+    expect(alternateProvider.result).toMatchObject({ provider: "anthropic_claude_code" });
+    expect(alternateProvider.previous.size).toBe(1);
+
+    // The returned price object is mutable and row-owned. Mutating one result
+    // must not poison a distinct clone served from the private context slot.
+    const cachePriceRow = withUsageRecord(row, (record) => { record.modelId = GPT_MODELS[1]; });
+    const exposedRow = { ...cachePriceRow };
+    const firstPrice = usageEventSync(context, new Map(), exposedRow);
+    if (firstPrice === null || "status" in firstPrice) throw new Error("synthetic priced row unexpectedly refused");
+    const expectedPrice = await usageEvent(context, new Map(), { ...cachePriceRow });
+    expect(firstPrice).toEqual(expectedPrice);
+    firstPrice.priced.costNanousd = -1;
+    firstPrice.priced.modelId = "synthetic-poisoned-model";
+    const cachedClone = usageEventSync(context, new Map(), { ...cachePriceRow });
+    expect(cachedClone).toEqual(expectedPrice);
+
+    // A different context cannot import the exposed row memo's poisoned price.
+    const otherContext = await quotaContext(NO_DB, input.pin, {
+      nowMs: Date.parse(modelHistoryWindow(input.day).fixedNow),
+      quotaAcquisition: completedAcquisition(input),
+    });
+    if ("status" in otherContext) throw new Error("synthetic second quota context refused: " + otherContext.reason);
+    const isolatedPrice = usageEventSync(otherContext, new Map(), exposedRow);
+    const isolatedExpected = await usageEvent(otherContext, new Map(), { ...cachePriceRow });
+    expect(isolatedPrice).toEqual(isolatedExpected);
 
     const repeatedRow = { ...row };
     const firstPrevious = new Map<string, { time: number; scope: string | null }>();
@@ -408,6 +460,10 @@ describe("GCP model-era composition fallback", () => {
     expect(dropped.result).toBeNull();
     expect(dropped.previous.size).toBe(1);
 
+    const droppedClone = await compare({ ...noMeasurements, session_uuid: "synthetic-drop-cache-clone" });
+    expect(droppedClone.result).toBeNull();
+    expect(droppedClone.previous.size).toBe(1);
+
     const invalidAttribution = withUsageRecord(row, (record) => { record.accountPlanAttribution = {}; });
     const refused = await compare(invalidAttribution);
     expect(refused.result).toMatchObject({ status: "not_testable", reason: "invalid_attribution_record" });
@@ -427,6 +483,10 @@ describe("GCP model-era composition fallback", () => {
     expect(() => usageEventSync(context, syncPrevious, { ...invalidPrice })).toThrow();
     expect(asyncPrevious.size).toBe(1);
     expect([...syncPrevious]).toEqual([...asyncPrevious]);
+
+    const repeatedThrowPrevious = new Map<string, { time: number; scope: string | null }>();
+    expect(() => usageEventSync(context, repeatedThrowPrevious, { ...invalidPrice })).toThrow();
+    expect(repeatedThrowPrevious.size).toBe(1);
 
     const invalidPriceOutsideEra = withUsageRecord(outsideEra, (record) => {
       (record.components as Record<string, unknown>).inputUncachedTokens = "not-a-decimal";
@@ -759,19 +819,29 @@ describe("GCP model-era composition fallback", () => {
     const sessionPrefix = "synthetic-session-budget-";
     const sessionSuffixLength = 128 - sessionPrefix.length - 8;
     const observedAt = stamp(dayMs(TARGET_DAY) + 12 * HOUR_MS + 20 * MINUTE_MS);
-    // Each 128-character token is valid v1.1 sessionUuid vocabulary. Separate
-    // real mapped rows keep the occurrence and record session identities
-    // aligned; the rows remain below both the million-row window cap and the
-    // inherited 100,000 distinct-session cap. Their carry state alone crosses
-    // the shared 8 MiB reducer budget, before candidate output is serialized.
+    // Map one complete synthetic record, then vary only its canonical event
+    // and session identity fields. Representative variants below are sent
+    // through the mapper; all 75,000 rows still pass through the evaluator's
+    // real record decoder, validation, pricing, and refusal path.
+    const baseOccurrence = makeUnknownScopeUsage(transitionsOwner, 50_000_000,
+      Date.parse(observedAt), "openai_codex", GPT_MODELS[0],
+      sessionPrefix + "00000000" + "x".repeat(sessionSuffixLength));
+    const baseRow = mapEffectiveUsagePageRow(baseOccurrence);
     const longSessionRows = Array.from({ length: uniqueSessions }, (_, index) => {
       const sessionUuid = sessionPrefix + index.toString(16).padStart(8, "0") + "x".repeat(sessionSuffixLength);
-      return mapEffectiveUsagePageRow(makeUnknownScopeUsage(transitionsOwner, 50_000_000 + index,
-        Date.parse(observedAt), "openai_codex", GPT_MODELS[0], sessionUuid));
+      return makeMappedUsageRowVariant(baseRow, transitionsOwner, 50_000_000 + index, sessionUuid);
     });
     expect(longSessionRows).toHaveLength(uniqueSessions);
     expect(longSessionRows.length).toBeLessThan(MAX_WINDOWED_USAGE_ROWS);
     expect(longSessionRows.every((row) => row.session_uuid?.length === 128)).toBe(true);
+    for (const index of [0, Math.floor(uniqueSessions / 2), uniqueSessions - 1]) {
+      const row = longSessionRows[index]!;
+      expect(mapEffectiveUsagePageRow({ ...baseOccurrence,
+        occurrenceId: row.occurrence_id,
+        eventTime: row.observed_at,
+        recordJson: row.record_json,
+      })).toEqual(row);
+    }
 
     const rows = input.days.map((day) => ({ day: day.day,
       usageRows: day.day === TARGET_DAY ? longSessionRows : [] }));

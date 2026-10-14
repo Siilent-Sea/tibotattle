@@ -90,7 +90,7 @@ const PINNED_SOURCE_PATCHES = [
   ["apps/worker/src/quota-analysis-v1.ts", "price-parsed-chunk-record", 1,
     "b95f6a57f3249400af86f3593c7ff3ea594962babb2ebc1fd380db95dc3e5b9e"],
   ["apps/worker/src/quota-analysis-v11.ts", "synchronous-model-era-usage-event", 2,
-    "a5be59166fff45fe2a25c6f6be2686d205d311a0bd35afb5e121881a3c039be2"],
+    "2081cdc59762d8ae20270ecdeeb99851a875a7e2e76ef97d9d58e8d416fbedd4"],
 ].map(([path, id, hunks, sha256]) => ({ path, id, hunks, sha256 }));
 const PACKAGE_FILE = /^packages\/([a-z-]+)\/(package\.json|index\.js|index\.d\.ts|src\/.+)$/;
 
