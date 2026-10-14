@@ -2710,9 +2710,16 @@ test("v1.1 source_11 selection preserves the pinned accepted record-id/source-de
 
     await expectManifestMissingToExclude(aHistorical,
       "a missing historical accepted day-manifest removes its physical records from both queries", false);
-    assert.ok(aHeadManifestIds.includes(aHeadNeighbor.manifestId),
-      "the second missing-manifest case is explicitly a current-head day");
-    await expectManifestMissingToExclude(aHeadNeighbor,
+    const finalOwnerHead = (await pool.query(`SELECT generation_id FROM ${context.table("telemetry_v11_domain_heads")}
+      WHERE participant_id=$1`, [owner.participantId])).rows[0]?.generation_id;
+    assert.equal(finalOwnerHead, bWrongReceiptGeneration.activation.generationId,
+      "the later device-B activation remains the participant's current head after unrelated-owner activation");
+    const finalOwnerHeadManifestIds = (await pool.query(`SELECT manifest_id
+      FROM ${context.table("telemetry_v11_domain_days")} WHERE generation_id=$1 ORDER BY observed_day`,
+    [finalOwnerHead])).rows.map(row => row.manifest_id);
+    assert.ok(finalOwnerHeadManifestIds.includes(bWrongReceipt.manifestId),
+      "the current-head deletion target is reachable after every fixture activation");
+    await expectManifestMissingToExclude(bWrongReceipt,
       "a missing current-head day-manifest removes its physical records from both queries", true);
   });
 });
