@@ -52,6 +52,8 @@ const PINNED_EXPORT_PATCHES = [
   ["apps/worker/src/telemetry-usage-effective-reader.ts", 1021, "genericOccurrence", "function genericOccurrence("],
   ["apps/worker/src/storage-community-daily.ts", 292, "publicInputs", "function publicInputs("],
   ["apps/worker/src/quota-analysis-v1.ts", 735, "buildPricingEvent", "function buildPricingEvent("],
+  ["apps/worker/src/quota-analysis-v11.ts", 464, "quotaContext", "async function quotaContext("],
+  ["apps/worker/src/quota-analysis-v11.ts", 1249, "usageEvent", "async function usageEvent("],
 ].map(([path, line, symbol, original]) => ({ path, line, symbol, original }));
 /** The generator's patch list: symbols and declaration kinds, no line numbers. */
 const PINNED_PATCH_SPECS = [
@@ -61,6 +63,8 @@ const PINNED_PATCH_SPECS = [
   ["apps/worker/src/telemetry-usage-effective-reader.ts", "genericOccurrence", "function"],
   ["apps/worker/src/storage-community-daily.ts", "publicInputs", "function"],
   ["apps/worker/src/quota-analysis-v1.ts", "buildPricingEvent", "function"],
+  ["apps/worker/src/quota-analysis-v11.ts", "quotaContext", "async function"],
+  ["apps/worker/src/quota-analysis-v11.ts", "usageEvent", "async function"],
 ].map(([path, symbol, declaration]) => ({ path, symbol, declaration }));
 /**
  * Pinned on purpose, like the export patches: the reviewed source patches by
@@ -498,14 +502,14 @@ for (const tree of committedTrees) {
   const isDefault = tree.commit === COMMIT;
   const title = (text) => (isDefault ? text : `[${tree.short}] ${text}`);
 
-  test(title(isDefault ? "the manifest pins d43c8f92, exactly six export patches and the pinned source patches" : `the manifest pins ${tree.short} and its recorded export and source patches`), () => {
+  test(title(isDefault ? "the manifest pins d43c8f92, exactly eight export patches and the pinned source patches" : `the manifest pins ${tree.short} and its recorded export and source patches`), () => {
     assertManifestPins(tree);
     if (!isDefault) return;
     assert.equal(SOURCE_COMMIT, COMMIT);
     assert.deepEqual(EXPORT_PATCHES.map((patch) => ({ ...patch })), PINNED_PATCH_SPECS);
-    assert.equal(tree.manifest.exportPatches.length, 6);
-    assert.equal(tree.manifest.counts.exportPatched, 6);
-    assert.equal(tree.manifest.counts.exportPatchedFiles, 3);
+    assert.equal(tree.manifest.exportPatches.length, 8);
+    assert.equal(tree.manifest.counts.exportPatched, 8);
+    assert.equal(tree.manifest.counts.exportPatchedFiles, 4);
     assert.equal(tree.manifest.exportsAlreadyPresent, undefined);
     assert.deepEqual(SOURCE_PATCHES.map((patch) => ({ path: patch.path, id: patch.id, hunks: patch.hunks.length,
       sha256: hunksDigest(patch) })), PINNED_SOURCE_PATCHES);
@@ -1389,7 +1393,7 @@ test("the report resolves the patches at a commit, names drifted files, builds t
   assert.equal(report.ok, true);
   assert.equal(report.patchesOk, true);
   assert.deepEqual(report.patches.map(({ path, line, symbol, original }) => ({ path, line, symbol, original })), PINNED_EXPORT_PATCHES);
-  assert.deepEqual(report.summary, { apply: 6 });
+  assert.deepEqual(report.summary, { apply: 8 });
   assert.equal(report.verification.status, "passed");
   assert.deepEqual(report.sourcePatches, PINNED_SOURCE_PATCHES.map(({ path, id }) => ({ path, id, status: "apply" })));
   assert.deepEqual(report.drift.changed, []);
@@ -1398,7 +1402,7 @@ test("the report resolves the patches at a commit, names drifted files, builds t
   assert.deepEqual(report.facade, { entry: "entry.ts", modules: report.facade.modules, unresolved: [] });
   assert.deepEqual(report.provenance, { entry: "entry.ts", named: [COMMIT.slice(0, 8)], foreign: [] });
   assert.equal(report.generation.status, "passed");
-  assert.equal(report.generation.counts.exportPatched, 6);
+  assert.equal(report.generation.counts.exportPatched, 8);
   // The same commit gives the committed vocabularies: nothing to port.
   assert.deepEqual(report.generation.vocabularies, { module: VOCABULARY_RELATIVE, changed: [] });
   // Against a reference whose recorded blobs are wrong the same commit reports every file as changed.

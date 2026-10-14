@@ -221,6 +221,19 @@ proof withholds historical spend. The strict current-price validator and its
 read path are unchanged. This compatibility path does not publish, recompute,
 restamp or modify any stored head, contribution, membership or exclusion.
 
+GCP model composition preserves the original single-era result. When the
+101-day owner window contains several plans, accounts or continuity eras, the
+versioned partitioned adapter fits each eligible era independently against the
+full attribution history. Ambiguous quantity intervals exclude complete model
+observations, including later quota crossings within the kernel's maximum gap;
+they are never assigned to a convenient plan or account. Public aggregation
+normalizes each fitted era to its own plan basis and takes the newest eligible
+value per owner/model, counting the owner once. Fit stability, minimum evidence,
+pricing coverage and freshness gates remain unchanged. See the
+[plan-era composition contract](../../docs/design/2026-10-13-plan-era-model-composition.md).
+This source behavior requires a newly registered analytics kernel and an
+authorized rollout; local tests do not establish production publication.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,

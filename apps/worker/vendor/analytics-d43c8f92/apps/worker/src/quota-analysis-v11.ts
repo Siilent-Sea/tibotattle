@@ -461,7 +461,7 @@ function collapseDirectQuotaRows(rows: readonly QuotaRow[],
     .map((entry) => ({ ...entry.row, resets_at: entry.reset }));
 }
 
-async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11AnalysisOptions): Promise<Context | Refusal> {
+export async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11AnalysisOptions): Promise<Context | Refusal> {
   const nowMs = options.nowMs ?? Date.now();
   const window = v11AnalysisWindow(pin, nowMs);
   const { start, end } = window;
@@ -1414,7 +1414,7 @@ export function v11UsageEventEra(index: PlanAttributionIndex, event: {
   return !event.accountBreak && !planConflict && match.status === "matched" ? match.era.eraKey : null;
 }
 
-async function usageEvent(context: Context, previous: Map<string, { time: number; scope: string | null }>,
+export async function usageEvent(context: Context, previous: Map<string, { time: number; scope: string | null }>,
   row: UsageRow): Promise<UsageEvidence | Refusal | null> {
   let prior: { time: number; scope: string | null } | undefined;
   const evidence = await usageRowEvidence(row, async (session, end, scope) => {
