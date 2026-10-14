@@ -6,7 +6,8 @@ import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { assertCurrentD7RehearsalOutputsNew, assertCurrentImageRuntime, assertCurrentRehearsalOutputsNew,
   awaitCurrentD7OriginReadiness, createCurrentD7DeadlinePool, currentD7RemainingMs, currentD7StatementTimeoutMs,
@@ -14,8 +15,12 @@ import { assertCurrentD7RehearsalOutputsNew, assertCurrentImageRuntime, assertCu
   rehearsalComparisonGates, resolveRehearsalDump, runRehearsal, syntheticRehearsalFloorDays,
   validateCurrentD7ControllerQualification, verifyCurrentImageRuntimePath } from "./gcp-fastpath-rehearsal.mjs";
 
-import { assertS9ChildCompleted, boundedS9ChildOutput, captureS9ChildCompletion, createS9Progress, observeS9ChildProgress, ownedKeptRehearsalSchemas, withS9OwnedSchemaCleanup,
+import { assertS9ChildCompleted, boundedS9ChildOutput, captureS9ChildCompletion, createS9Progress, observeS9ChildProgress,
+  ownedKeptRehearsalSchemas, s9ControllerGoldenArguments, withS9OwnedSchemaCleanup,
   readS9ChildReport, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS } from "./s9-rehearsal-diagnostics.mjs";
+
+const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const CURRENT_GOLDEN = join(WORKER_ROOT, "analytics-v2-test", "golden");
 
 const refused = (code) => (error) => error?.code === code;
 
@@ -246,6 +251,43 @@ test("current-worker-d1-d7 selects the closed two-case controller and rejects al
   ]) assert.throws(() => parseArguments([...base, ...extra]), refused("REHEARSAL_ARGUMENT_INVALID"), extra.join(" "));
   assert.throws(() => parseArguments(["--golden", "/g/golden-q1-node", "--comparison-mode", "current-worker-d1-d7",
     "--out", "/tmp/current-d7-report.json"]), refused("REHEARSAL_ARGUMENT_INVALID"), "both cases require retained schemas");
+});
+
+test("S9 routes only the D7 controller through its dense manifest and keeps consumer corpus paths", async () => {
+  const d7Arguments = s9ControllerGoldenArguments({ mode: "current-worker-d1-d7", golden: CURRENT_GOLDEN,
+    workerRoot: WORKER_ROOT });
+  const d7Options = parseArguments([...d7Arguments, "--comparison-mode", "current-worker-d1-d7",
+    "--keep-schema", "--out", join(tmpdir(), "s9-controller-corpus-routing-report.json")]);
+  assert.deepEqual(d7Arguments, ["--golden", join(WORKER_ROOT, "analytics-v2-test", "golden-q1-node")]);
+  assert.equal(d7Options.golden, join(WORKER_ROOT, "analytics-v2-test", "golden-q1-node"));
+  assert.equal(d7Options.comparisonMode, "current-worker-d1-d7");
+  const d7Manifest = JSON.parse(await readFile(join(d7Options.golden, "manifest.json"), "utf8"));
+  assert.equal(d7Manifest.schemaVersion, "gcp-fastpath-dense-oracle-manifest-v1");
+  assert.equal(d7Manifest.nowMs, 1_790_856_000_000);
+  assert.equal(d7Manifest.corpus?.q1?.sha256, "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e");
+
+  const historicalGolden = join(tmpdir(), "historical-golden");
+  assert.deepEqual(s9ControllerGoldenArguments({ mode: "historical", golden: historicalGolden, workerRoot: WORKER_ROOT }),
+    ["--golden", historicalGolden]);
+  assert.deepEqual(s9ControllerGoldenArguments({ mode: "current-worker-d1", golden: CURRENT_GOLDEN, workerRoot: WORKER_ROOT }),
+    ["--golden", CURRENT_GOLDEN]);
+  const currentManifest = JSON.parse(await readFile(join(CURRENT_GOLDEN, "manifest.json"), "utf8"));
+  assert.equal(currentManifest.schemaVersion, "gcp-fastpath-oracle-manifest-v1");
+  const consumerDump = await readFile(join(CURRENT_GOLDEN, "dump", "usage-monitor-db.json"));
+  assert.ok(consumerDump.byteLength > 0, "the edge consumer source dump stays under its canonical Q-1 corpus root");
+
+  const edge = await readFile(new URL("../postgres-test/edge-origin-e2e.spec.mjs", import.meta.url), "utf8");
+  const producerStart = edge.indexOf("async function seededRehearsal()");
+  const producerEnd = edge.indexOf("\nasync function removeCurrentD7PrivateOutput", producerStart);
+  assert.ok(producerStart >= 0 && producerEnd > producerStart);
+  const producer = edge.slice(producerStart, producerEnd);
+  assert.ok(producer.includes("...s9ControllerGoldenArguments({ mode: S9_COMPARISON_MODE, golden: GOLDEN, workerRoot: WORKER_ROOT })"),
+    "the selector builds the actual controller CLI arguments from the canonical consumer root");
+  const currentD7Consumer = edge.slice(edge.indexOf("async function runCurrentD7S9"));
+  assert.ok(currentD7Consumer.includes('join(GOLDEN, "dump", "usage-monitor-db.json")'),
+    "the D7 edge transport continues to read the source dump from canonical GOLDEN");
+  assert.equal(CURRENT_GOLDEN, join(WORKER_ROOT, "analytics-v2-test", "golden"));
+  assert.notEqual(d7Options.golden, CURRENT_GOLDEN);
 });
 
 test("current D7 owns a fresh eight-file output set under an owner-only parent", async () => {

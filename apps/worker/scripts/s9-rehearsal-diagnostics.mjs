@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import { readFile } from "node:fs/promises";
+import { isAbsolute, resolve, join } from "node:path";
 
 export const S9_REHEARSAL_DEADLINE_MS = 40 * 60_000;
 export const S9_DIAGNOSTIC_BYTES = 256 * 1024;
@@ -11,6 +12,23 @@ const PHASES = Object.freeze({
   controller: ["input_binding", "current_d1_replay", "current_d1_acceptance", "postgres", "migrate", "sqlite",
     "importers", "refresh_first", "origin", "parity", "refresh_second", "source_recheck", "cleanup", "report"],
 });
+
+/** Build only the child controller corpus argument; the edge consumer retains its canonical GOLDEN root. */
+export function s9ControllerGoldenArguments({ mode, golden, workerRoot }) {
+  if (mode === "current-worker-d1-d7") {
+    if (typeof workerRoot !== "string" || !isAbsolute(workerRoot) || resolve(workerRoot) !== workerRoot) {
+      throw Object.assign(new Error("S9_CONTROLLER_GOLDEN_ROOT_INVALID"), { code: "S9_CONTROLLER_GOLDEN_ROOT_INVALID" });
+    }
+    return ["--golden", join(workerRoot, "analytics-v2-test", "golden-q1-node")];
+  }
+  if (mode === "historical" || mode === "current-worker-d1") {
+    if (typeof golden !== "string" || golden.length === 0) {
+      throw Object.assign(new Error("S9_CONTROLLER_GOLDEN_INVALID"), { code: "S9_CONTROLLER_GOLDEN_INVALID" });
+    }
+    return ["--golden", golden];
+  }
+  throw Object.assign(new Error("S9_CONTROLLER_GOLDEN_MODE_INVALID"), { code: "S9_CONTROLLER_GOLDEN_MODE_INVALID" });
+}
 const COUNTERS = ["iteration", "completedSteps", "scopeOrdinal", "ownerOrdinal", "dayOrdinal", "chunkOrdinal",
   "completedOwners", "completedDays", "completedChunks"];
 const SIGNALS = new Set(["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV", "SIGBUS"]);

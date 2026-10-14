@@ -70,7 +70,7 @@ import { assessCurrentQ1D7Qualification, currentQ1D7JsonSha256, currentQ1D7Publi
   validateCurrentQ1D7Binding, validateCurrentQ1D7CaseReference, validateCurrentQ1D7InputBinding,
   validateCurrentQ1D7PerDateExpectation, validateCurrentQ1D7PgCaseInput,
   validateCurrentQ1D7ProducerAcceptance, validateCurrentQ1D7StrictExportProof } from "./fixtures/current-q1-d7-contract.mjs";
-import { assertS9ChildCompleted, captureS9ChildCompletion, observeS9ChildProgress, ownedKeptRehearsalSchemas, readS9ChildReport, withS9OwnedSchemaCleanup, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS }
+import { assertS9ChildCompleted, captureS9ChildCompletion, observeS9ChildProgress, ownedKeptRehearsalSchemas, readS9ChildReport, s9ControllerGoldenArguments, withS9OwnedSchemaCleanup, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS }
   from "../scripts/s9-rehearsal-diagnostics.mjs";
 import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import {
@@ -3001,7 +3001,9 @@ async function seededRehearsal() {
     try {
       completion = await captureS9ChildCompletion(() => {
         const pending = execFileAsync(node,
-          [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
+          [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"),
+            ...s9ControllerGoldenArguments({ mode: S9_COMPARISON_MODE, golden: GOLDEN, workerRoot: WORKER_ROOT }),
+            "--keep-schema", "--out", out,
             "--comparison-mode", S9_COMPARISON_MODE,
             ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
             ...staged.flatMap((name) => ["--staged-primary", name])], {
