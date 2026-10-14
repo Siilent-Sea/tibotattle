@@ -182,7 +182,7 @@ async function seedDevice(context, participant, label) {
   return { participantId, deviceId };
 }
 
-async function seedAccountlessDevice(context, label) {
+async function seedAccountlessDevice(context, label, { publicEligible = true } = {}) {
   const { table } = context;
   const nowEpoch = Date.now();
   const now = new Date(nowEpoch).toISOString();
@@ -190,16 +190,16 @@ async function seedAccountlessDevice(context, label) {
   const participantId = `synthetic-unchanged-accountless-${label}-${randomUUID()}`;
   const deviceId = `synthetic-unchanged-accountless-device-${label}-${randomUUID()}`;
   const principalId = `synthetic-install-${randomUUID()}`;
-  const enrollmentSecret = randomBytes(32);
   const deviceSecret = randomBytes(32);
+  const enrollmentSecretHash = publicEligible ? deviceSecret : randomBytes(32);
   await pool.query(`INSERT INTO ${table("participants")}(id, owner_kind, state, consent_version, created_at)
     VALUES ($1,'accountless','active',NULL,$2)`, [participantId, now]);
   await pool.query(`INSERT INTO ${table("accountless_enrollment_ledger")}(
     device_id,device_secret_hash,installation_principal_id,schema_version,policy_version,
     authorization_basis,state,issued_at,expires_at
-  ) VALUES ($1,$2,$3,'accountless-enrollment-v1','accountless-opt-out-v1',
+  ) VALUES ($1,$2,$3,'accountless-enrollment-v0.1','accountless-opt-out-v1',
     'accountless-policy-v1','active',$4,$5)`,
-  [deviceId, enrollmentSecret, principalId, now, expires]);
+  [deviceId, enrollmentSecretHash, principalId, now, expires]);
   await pool.query(`INSERT INTO ${table("device_credentials")}(
     id,participant_id,authority_kind,accountless_enrollment_device_id,secret_hash,
     state,issued_at,expires_at,last_used_at
@@ -211,9 +211,11 @@ async function seedAccountlessDevice(context, label) {
   ) VALUES ($1,$2,$1,'accountless-opt-out-v1','accountless-policy-v1',$3,$4,'active')`,
   [deviceId, participantId, now, expires]);
   await pool.query(`INSERT INTO ${table("accountless_v12_device_authorizations")}(
-    enrollment_device_id,participant_id,device_credential_id,telemetry_schema_version,
-    field_dictionary_version,privacy_contract_version,authorized_at,expires_at,state
-  ) VALUES ($1,$2,$1,$3,$4,$5,$6,$7,'active')`,
+    enrollment_device_id,participant_id,device_credential_id,schema_version,policy_version,
+    authorization_basis,telemetry_schema_version,field_dictionary_version,privacy_contract_version,
+    authorized_at,expires_at,state
+  ) VALUES ($1,$2,$1,'accountless-upload-owner-v1.2','accountless-telemetry-v1.2-policy-v1',
+    'accountless-policy-v1.2',$3,$4,$5,$6,$7,'active')`,
   [deviceId, participantId, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
     TELEMETRY_V12_FIELD_DICTIONARY_VERSION, TELEMETRY_V12_PRIVACY_CONTRACT_VERSION, now, expires]);
   return { participantId, deviceId };
@@ -1461,6 +1463,28 @@ test("owner recovery activates social and accountless domains at the ordinary pr
       "the owner issue uses the ordinary cap: seven client tokens remain outstanding while its token is consumed");
     assert.equal(await maxSequence(context), sequenceBefore + 2,
       "both successful owner activations produce their normal source journal event");
+    const publicOwners = await pool.query(`SELECT participant_id,owner_kind,device_id
+      FROM ${context.table("community_public_source_owners")}
+      WHERE participant_id = ANY($1::text[]) ORDER BY owner_kind,participant_id`,
+    [[socialParticipant.participantId, accountless.participantId]]);
+    assert.deepEqual(publicOwners.rows, [
+      { participant_id: accountless.participantId, owner_kind: "accountless", device_id: accountless.deviceId },
+      { participant_id: socialParticipant.participantId, owner_kind: "social", device_id: null },
+    ], "both activated owners satisfy the maintained public-source eligibility contract");
+    const ownerJournalEvents = await pool.query(`SELECT receipt.participant_id,
+        count(change.sequence)::integer AS journal_events,
+        count(*) FILTER (WHERE change.kind='owner-active')::integer AS owner_active_events
+      FROM ${context.table("storage_v12_event_sources")} receipt
+      JOIN ${context.table("storage_ingestion_changes")} change
+        ON change.source_id=$2 AND change.event_digest=receipt.event_digest
+      WHERE receipt.participant_id = ANY($1::text[])
+      GROUP BY receipt.participant_id ORDER BY receipt.participant_id`,
+    [[socialParticipant.participantId, accountless.participantId], SOURCE_ID]);
+    assert.deepEqual(ownerJournalEvents.rows.map((row) => [
+      row.participant_id, row.journal_events, row.owner_active_events,
+    ]), [socialParticipant.participantId, accountless.participantId].sort().map((participantId) => [
+      participantId, 1, 1,
+    ]), "each sharing mode emits one joined owner-active source journal event");
     const audits = await pool.query(`SELECT outcome, details_json
       FROM ${context.table("admin_action_audit")} WHERE action='run_maintenance' ORDER BY id`);
     assert.equal(audits.rows.length, 1);
@@ -1490,6 +1514,45 @@ test("owner recovery activates social and accountless domains at the ordinary pr
       "activation consumes the exact latest READY manifest captured with the predecessor");
     assert.notEqual(socialDayOneBaseline.manifestId, socialDayOneLatest.manifestId);
     assert.deepEqual([socialDays.length, accountlessDays.length], [2, 1]);
+  });
+});
+
+test("accountless v1.2 authority without the public enrollment-secret binding stays outside the source journal", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_authority_only", async (context) => {
+    await enableOwnerProcessing(context);
+    const accountless = await seedAccountlessDevice(context, "owner-authority-only", { publicEligible: false });
+    await registerEmptyDay(context, accountless, DAY_ONE, "synthetic-owner-authority-only-day");
+    const activeAuthorization = await pool.query(`SELECT 1
+      FROM ${context.table("telemetry_v12_typed_active_authorizations")}
+      WHERE participant_id=$1 AND device_id=$2`, [accountless.participantId, accountless.deviceId]);
+    assert.equal(activeAuthorization.rows.length, 1,
+      "the exact v1.2 grant still supplies activation authority");
+    const sequenceBefore = await maxSequence(context);
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.deepEqual(result.outcomes, {
+      activated: 1, eligible: 0, already_active: 0, authority_unavailable: 0, refused: 0,
+    });
+    assert.ok(await head(context, accountless.participantId), "the authority-valid domain activates");
+    const publicOwner = await pool.query(`SELECT 1 FROM ${context.table("community_public_source_owners")}
+      WHERE participant_id=$1 AND device_id=$2`, [accountless.participantId, accountless.deviceId]);
+    assert.equal(publicOwner.rows.length, 0,
+      "the mismatched enrollment secret keeps this accountless graph outside publication eligibility");
+    const receipts = await pool.query(`SELECT count(*)::integer AS n
+      FROM ${context.table("storage_v12_event_sources")} WHERE participant_id=$1`, [accountless.participantId]);
+    assert.equal(receipts.rows[0].n, 0);
+    assert.equal(await maxSequence(context), sequenceBefore,
+      "authority without the exact public-source lease does not append a journal event");
   });
 });
 
@@ -1914,7 +1977,9 @@ test("owner recovery ranks recent devices and excludes manifests made READY afte
       "the manifest was created before the cutoff but only became READY after it");
     const rankedEvidence = await pool.query(`SELECT device_id, max(created_at) AS latest_created,
       max(ready_at) AS latest_ready FROM ${context.table("telemetry_v12_day_manifests")}
-      WHERE participant_id=$1 AND state='ready' GROUP BY device_id`, [participant.participantId]);
+      WHERE participant_id=$1 AND state='ready' AND created_at <= $2::timestamptz
+        AND ready_at <= $2::timestamptz GROUP BY device_id`,
+    [participant.participantId, new Date(nowEpoch).toISOString()]);
     const oldEvidence = rankedEvidence.rows.find((row) => row.device_id === lexicalFirst.deviceId);
     const recentEvidence = rankedEvidence.rows.find((row) => row.device_id === recent.deviceId);
     assert.ok(new Date(oldEvidence.latest_created).getTime() > new Date(recentEvidence.latest_created).getTime(),
