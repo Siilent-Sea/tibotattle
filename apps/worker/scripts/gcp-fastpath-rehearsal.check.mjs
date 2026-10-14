@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { assertCurrentD7RehearsalOutputsNew, assertCurrentImageRuntime, assertCurrentRehearsalOutputsNew,
@@ -798,6 +798,192 @@ test("S9 progress uses fixed stages, a monotonic clock, bounded numeric counters
   assert.doesNotThrow(() => broken.phase("current_d1_replay")); broken.close();
 });
 
+
+test("current D7 reports a failed child before qualification and still cleans only verified pairs", async () => {
+  const edge = await readFile(new URL("../postgres-test/edge-origin-e2e.spec.mjs", import.meta.url), "utf8");
+  const helperStart = edge.indexOf("const SHA256 = /^[a-f0-9]{64}$/u;");
+  const helperEnd = edge.indexOf("\nasync function readCurrentD7PrivateSidecar", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "the actual D7 ownership and failure helpers are extractable");
+  const helperSource = edge.slice(helperStart, helperEnd);
+  assert.ok(helperSource.includes("assertS9ChildCompleted(childCompletion);"));
+  assert.ok(helperSource.includes("validateCurrentD7SchemaHandoff(report, candidates)"));
+  const extracted = new Function("assert", "createHash", "basename", "S9_REHEARSAL_DEADLINE_MS",
+    "ownedKeptRehearsalSchemas", "assertS9ChildCompleted", `${helperSource}
+return {
+  withCurrentD7OwnedSchemaCleanup, currentD7FailureDiagnostic, validateCurrentD7SchemaHandoff,
+  CURRENT_D7_CONTROLLER_ERROR_CODES, CURRENT_D7_CONTROLLER_PHASES,
+};`)(assert, createHash, basename, S9_REHEARSAL_DEADLINE_MS, ownedKeptRehearsalSchemas, assertS9ChildCompleted);
+  const { withCurrentD7OwnedSchemaCleanup, currentD7FailureDiagnostic, CURRENT_D7_CONTROLLER_ERROR_CODES,
+    CURRENT_D7_CONTROLLER_PHASES } = extracted;
+  const controllerSource = await readFile(new URL("./gcp-fastpath-rehearsal.mjs", import.meta.url), "utf8");
+  const sourceFailureCodes = [...new Set([
+    ...[...controllerSource.matchAll(/\bfail\("([A-Z0-9_]+)"/gu)].map((match) => match[1]),
+    ...[...controllerSource.matchAll(/new RehearsalError\("([A-Z0-9_]+)"/gu)].map((match) => match[1]),
+    "REHEARSAL_CURRENT_D7_FAILED",
+  ])].sort();
+  assert.deepEqual([...CURRENT_D7_CONTROLLER_ERROR_CODES].sort(), sourceFailureCodes,
+    "the TAP error-code allowlist matches only fixed controller source codes and its fixed fallback");
+  const diagnosticsSource = await readFile(new URL("./s9-rehearsal-diagnostics.mjs", import.meta.url), "utf8");
+  const controllerPhaseBlock = /controller:\s*\[([\s\S]*?)\]/u.exec(diagnosticsSource)?.[1];
+  assert.ok(controllerPhaseBlock, "the closed S9 controller phase list is present");
+  const sourceControllerPhases = [...controllerPhaseBlock.matchAll(/"([a-z0-9_]+)"/gu)].map((match) => match[1]).sort();
+  assert.deepEqual([...CURRENT_D7_CONTROLLER_PHASES].sort(), sourceControllerPhases,
+    "the TAP phase projection matches the validated S9 controller phase contract");
+  const d7RunStart = edge.indexOf("async function runCurrentD7S9(f, testContext)");
+  const d7RunEnd = edge.indexOf("\ntest(CURRENT_D7", d7RunStart);
+  assert.ok(d7RunStart >= 0 && d7RunEnd > d7RunStart, "the current D7 consumer is present");
+  const d7Run = edge.slice(d7RunStart, d7RunEnd);
+  const cleanupInvocation = d7Run.indexOf("withCurrentD7OwnedSchemaCleanup(rehearsal, seeded.childCompletion,");
+  const tapDiagnostic = d7Run.indexOf("testContext.diagnostic(JSON.stringify(currentD7FailureDiagnostic(");
+  assert.ok(cleanupInvocation >= 0 && tapDiagnostic > cleanupInvocation
+    && d7Run.indexOf("throw error;", tapDiagnostic) > tapDiagnostic,
+  "the closed TAP projection follows the cleanup wrapper and precedes the failed test outcome");
+  const producerStart = edge.indexOf("async function seededRehearsal()");
+  const producerEnd = edge.indexOf("\nasync function removeCurrentD7PrivateOutput", producerStart);
+  const producer = edge.slice(producerStart, producerEnd);
+  const validatedJournal = producer.indexOf("validateS9ProgressJournal(await readFile(progressPath), liveProgress)");
+  const phaseProjection = producer.indexOf("records.toReversed()", validatedJournal);
+  const returnedPhase = producer.indexOf("lastValidatedControllerPhase, temporaryOutputRemoved: false", phaseProjection);
+  assert.ok(validatedJournal >= 0 && phaseProjection > validatedJournal && returnedPhase > phaseProjection,
+    "only the controller phase from the validated private progress journal reaches the TAP projection");
+  const caseIds = ["conflictPreserving", "conflictFreePositive"];
+  const digest = "a".repeat(64);
+  const makePair = (caseId, suffix) => ({ caseId,
+    schema: `typed_legacy_transfer_rehearsal_target_fastpath_${suffix}`,
+    controlSchema: `typed_legacy_transfer_rehearsal_ctl_${suffix}` });
+  const pairs = [makePair(caseIds[0], "0123abcd"), makePair(caseIds[1], "89abcdef")];
+  const cleanupNames = (selected) => selected.flatMap(({ schema, controlSchema }) => [schema, controlSchema]);
+  const makeCompleteReport = () => {
+    const caseReceipts = Object.fromEntries(pairs.map((pair) => [pair.caseId, {
+      caseId: pair.caseId, schemaVersion: "current-q1-d7-controller-case-receipt-v1",
+      referenceSha256: digest, expectationSha256: digest, corpusSha256: digest, admissionSha256: digest,
+      sourceInvariantSha256: digest, pgInputSha256: digest, bootstrapPreservationSha256: digest,
+      strictExportSha256: digest, actualResponseSha256: digest, actualPreviewSha256: digest,
+      schema: pair.schema, controlSchema: pair.controlSchema, currentDay: "2026-10-01", retainedForS9Cleanup: true,
+    }]));
+    return { schemaVersion: "gcp-fastpath-current-d7-rehearsal-report-v1", comparisonMode: "current-worker-d1-d7",
+      decisionId: "D7", status: "cleanup_pending", reusedSchema: false, keptSchemaPairs: pairs,
+      keptSchemas: cleanupNames(pairs), currentD7Qualification: {
+        schemaVersion: "current-q1-d7-controller-qualification-v1", comparisonMode: "current-worker-d1-d7",
+        decisionId: "D7", caseIds, inputBindingSha256: digest, inputBindingCaptureContentSha256: digest,
+        bindingSha256: digest, referenceContentSha256: digest, producerAcceptanceContentSha256: digest,
+        contractContentSha256: digest, caseReceipts,
+        sidecars: { inputBindingCaptureSha256: digest, referenceSha256: digest, bindingSha256: digest,
+          producerAcceptanceSha256: digest, conflictPreservingCaseSha256: digest,
+          conflictFreePositiveCaseSha256: digest, contractSha256: digest },
+        cleanupPending: true, qualifying: false, establishesNativeExecution: false,
+        deadlineMs: S9_REHEARSAL_DEADLINE_MS, elapsedMs: 1, pgInputSnapshotsRemoved: true,
+      } };
+  };
+  const failedCompletion = (await captureS9ChildCompletion(async () => {
+    throw Object.assign(new Error("PRIVATE_CANARY"), { code: 2, stdout: "PRIVATE_CANARY", stderr: "PRIVATE_CANARY" });
+  })).metadata;
+  const failedReport = { schemaVersion: "gcp-fastpath-current-d7-rehearsal-report-v1",
+    comparisonMode: "current-worker-d1-d7", decisionId: "D7", status: "error", reusedSchema: false,
+    qualifying: false, establishesNativeExecution: false, error: { code: "REHEARSAL_CURRENT_D7_CASE_INCOMPLETE" },
+    keptSchemaPairs: [pairs[0], { caseId: caseIds[1], schema: "private_schema", controlSchema: "private_control" },
+      { caseId: "unexpected", schema: "typed_legacy_transfer_rehearsal_target_fastpath_deadbeef",
+        controlSchema: "typed_legacy_transfer_rehearsal_ctl_deadbeef" }],
+    keptSchemas: [...cleanupNames(pairs), "private_schema", "private_control"],
+  };
+  const events = [];
+  const expectedFailureCleanup = cleanupNames([pairs[0]]);
+  await assert.rejects(withCurrentD7OwnedSchemaCleanup(failedReport, failedCompletion, async () => {
+    events.push("work"); assert.fail("a failed controller cannot enter edge qualification");
+  }, async (names) => { events.push("cleanup"); events.push(...names); }), (error) => {
+    events.push("rejected");
+    assert.equal(error.code, "S9_REHEARSAL_CHILD_FAILED");
+    assert.equal(error.message, "S9_REHEARSAL_CHILD_FAILED");
+    return true;
+  });
+  assert.deepEqual(events, ["cleanup", ...expectedFailureCleanup, "rejected"],
+    "the child failure surfaces only after the exact independently accepted pair cleanup runs");
+  const zeroPairReport = { ...failedReport,
+    keptSchemaPairs: [{ caseId: "unexpected", schema: "private_schema", controlSchema: "private_control" }],
+    keptSchemas: ["private_schema", "private_control"] };
+  let zeroPairCleanup;
+  await assert.rejects(withCurrentD7OwnedSchemaCleanup(zeroPairReport, failedCompletion,
+    async () => assert.fail("unknown ownership cannot enter edge qualification"),
+    async (names) => { zeroPairCleanup = names; }),
+  (error) => error.code === "S9_REHEARSAL_CHILD_FAILED");
+  assert.deepEqual(zeroPairCleanup, [], "unrecognized report pairs authorize no schema cleanup");
+  const twoPairReport = { ...failedReport, keptSchemaPairs: pairs, keptSchemas: cleanupNames(pairs) };
+  let twoPairCleanup;
+  await assert.rejects(withCurrentD7OwnedSchemaCleanup(twoPairReport, failedCompletion,
+    async () => assert.fail("a failed child cannot enter edge qualification"),
+    async (names) => { twoPairCleanup = names; }),
+  (error) => error.code === "S9_REHEARSAL_CHILD_FAILED");
+  assert.deepEqual(twoPairCleanup, cleanupNames(pairs),
+    "two independently valid generated pairs retain all four exact cleanup names on child failure");
+  const diagnostic = currentD7FailureDiagnostic(failedReport, failedCompletion, "postgres");
+  assert.deepEqual(Object.keys(diagnostic).sort(), ["schemaVersion", "controllerStatus", "controllerErrorCode", "childState",
+    "childExitCode", "childSignal", "childKilled", "childCode", "deadlineMs", "deadlineElapsed",
+    "lastValidatedControllerPhase"].sort(), "the TAP projection has a closed field set");
+  assert.equal(diagnostic.controllerErrorCode, "REHEARSAL_CURRENT_D7_CASE_INCOMPLETE");
+  assert.equal(diagnostic.lastValidatedControllerPhase, "postgres");
+  assert.equal(diagnostic.childState, "failed");
+  assert.equal(diagnostic.childExitCode, 2);
+  assert.equal(diagnostic.deadlineMs, S9_REHEARSAL_DEADLINE_MS);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_CANARY|private_schema/u);
+  const unknownCode = currentD7FailureDiagnostic({ ...failedReport, error: { code: "PRIVATE_CANARY" } },
+    { ...failedCompletion, command: "LOCAL_PATH_CANARY" }, "PRIVATE_PHASE");
+  assert.equal(unknownCode.controllerErrorCode, "unrecognized");
+  assert.equal(unknownCode.lastValidatedControllerPhase, null);
+  assert.doesNotMatch(JSON.stringify(unknownCode), /PRIVATE_CANARY|LOCAL_PATH_CANARY|PRIVATE_PHASE/u);
+  const malformedError = currentD7FailureDiagnostic({ ...failedReport,
+    error: { code: "REHEARSAL_CURRENT_D7_CASE_INCOMPLETE", message: "PRIVATE_CANARY" } }, failedCompletion, "postgres");
+  assert.equal(malformedError.controllerErrorCode, "unavailable");
+  assert.doesNotMatch(JSON.stringify(malformedError), /PRIVATE_CANARY/u);
+  const sourceDefinedTimeout = currentD7FailureDiagnostic({ ...failedReport,
+    error: { code: "REHEARSAL_ORIGIN_START_TIMEOUT" } }, failedCompletion, "origin");
+  assert.equal(sourceDefinedTimeout.controllerErrorCode, "REHEARSAL_ORIGIN_START_TIMEOUT",
+    "a fixed direct RehearsalError code is included in the finite controller projection");
+
+  const actualRunCurrentD7S9 = new Function("assert", "seededRehearsal", "readFile", "join", "GOLDEN",
+    "withCurrentD7OwnedSchemaCleanup", "CURRENT_D7_CASE_IDS", "currentD7FailureDiagnostic",
+    `${d7Run}\nreturn runCurrentD7S9;`)(assert, async () => ({ report: failedReport,
+      childCompletion: failedCompletion, lastValidatedControllerPhase: "postgres",
+      privateOutputPath: "PRIVATE_PATH", runtime: "PRIVATE_RUNTIME", imageRuntime: "PRIVATE_IMAGE" }), async (path) => {
+      assert.equal(path, "synthetic-golden/dump/usage-monitor-db.json");
+      return "{\"synthetic\":true}";
+    }, (...parts) => parts.join("/"), "synthetic-golden", withCurrentD7OwnedSchemaCleanup,
+    caseIds, currentD7FailureDiagnostic);
+  const cleanupFailure = Object.assign(new Error("PRIVATE_CLEANUP_MESSAGE"), { code: "PRIVATE_CLEANUP_CODE" });
+  const actualEvents = [], tapLines = [], cleanupQueries = [];
+  const fakeContext = { diagnostic(line) { actualEvents.push("diagnostic"); tapLines.push(line); } };
+  const fakeFixture = { base: { async query(sql) {
+    actualEvents.push("cleanup"); cleanupQueries.push(sql); throw cleanupFailure;
+  } } };
+  await assert.rejects(actualRunCurrentD7S9(fakeFixture, fakeContext), (error) => error === cleanupFailure,
+    "the cleanup error remains the actual test failure");
+  assert.deepEqual(actualEvents, ["cleanup", "diagnostic"],
+    "the actual D7 catch emits its diagnostic after rejected exact cleanup");
+  assert.deepEqual(cleanupQueries, [`DROP SCHEMA IF EXISTS \"${pairs[0].controlSchema}\" CASCADE`],
+    "the extracted consumer attempts only the exact generated pair cleanup");
+  assert.equal(tapLines.length, 1, "the fake Node test context receives one visible diagnostic");
+  const visibleDiagnostic = JSON.parse(tapLines[0]);
+  assert.deepEqual(visibleDiagnostic, diagnostic);
+  assert.doesNotMatch(tapLines[0], /PRIVATE_CANARY|PRIVATE_PATH|PRIVATE_RUNTIME|PRIVATE_IMAGE|PRIVATE_CLEANUP|private_schema/u);
+
+  const completed = (await captureS9ChildCompletion(async () => ({ stdout: "", stderr: "" }))).metadata;
+  const completeReport = makeCompleteReport();
+  const successEvents = [];
+  assert.equal(await withCurrentD7OwnedSchemaCleanup(completeReport, completed, async (validated, names) => {
+    successEvents.push("work");
+    assert.deepEqual(validated, pairs, "completed children still pass all original qualification checks");
+    assert.deepEqual(names, cleanupNames(pairs));
+    return "qualified-handoff";
+  }, async (names) => { successEvents.push("cleanup"); assert.deepEqual(names, cleanupNames(pairs)); }), "qualified-handoff");
+  assert.deepEqual(successEvents, ["work", "cleanup"]);
+  const malformedSuccess = { ...completeReport };
+  delete malformedSuccess.currentD7Qualification;
+  const malformedSuccessCleanup = [];
+  await assert.rejects(withCurrentD7OwnedSchemaCleanup(malformedSuccess, completed,
+    async () => assert.fail("a completed child still requires the full qualification handoff"),
+    async (names) => malformedSuccessCleanup.push(...names)));
+  assert.deepEqual(malformedSuccessCleanup, cleanupNames(pairs),
+    "qualification failures after completed children still retain exact cleanup");
+});
 
 test("S9 executes exact owned-schema cleanup before a sanitized failed-child rejection", async () => {
   const report = { reusedSchema: false, schema: "typed_legacy_transfer_rehearsal_target_fastpath_0123abcd",

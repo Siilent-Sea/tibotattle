@@ -2510,7 +2510,107 @@ function validateCurrentD7SchemaHandoff(report, cleanupCandidates = currentD7Sch
   return pairs;
 }
 
-async function withCurrentD7OwnedSchemaCleanup(report, work, cleanup) {
+const CURRENT_D7_CONTROLLER_ERROR_CODES = new Set([
+  "REHEARSAL_ARGUMENT_INVALID",
+  "REHEARSAL_CURRENT_CANDIDATE_INPUTS_CHANGED",
+  "REHEARSAL_CURRENT_CORPUS_MISMATCH",
+  "REHEARSAL_CURRENT_D7_CASE_INCOMPLETE",
+  "REHEARSAL_CURRENT_D7_CASE_SET_INVALID",
+  "REHEARSAL_CURRENT_D7_COMPARATOR_UNAVAILABLE",
+  "REHEARSAL_CURRENT_D7_CONTRACT_NOT_ACCEPTED",
+  "REHEARSAL_CURRENT_D7_CONTROLLER_PIN_INVALID",
+  "REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED",
+  "REHEARSAL_CURRENT_D7_DEADLINE_INVALID",
+  "REHEARSAL_CURRENT_D7_EVIDENCE_INCOMPLETE",
+  "REHEARSAL_CURRENT_D7_EVIDENCE_INVALID",
+  "REHEARSAL_CURRENT_D7_EXPECTATION_INVALID",
+  "REHEARSAL_CURRENT_D7_FAILED",
+  "REHEARSAL_CURRENT_D7_GOLDEN_INVALID",
+  "REHEARSAL_CURRENT_D7_INPUT_BINDING_CAPTURE_CHANGED",
+  "REHEARSAL_CURRENT_D7_INPUT_BINDING_INVALID",
+  "REHEARSAL_CURRENT_D7_INPUT_CHANGED",
+  "REHEARSAL_CURRENT_D7_INPUT_CLEANUP_FAILED",
+  "REHEARSAL_CURRENT_D7_INPUT_INVALID",
+  "REHEARSAL_CURRENT_D7_OUTPUT_INVALID",
+  "REHEARSAL_CURRENT_D7_PG_ADAPTER_INVALID",
+  "REHEARSAL_CURRENT_D7_PRODUCER_UNAVAILABLE",
+  "REHEARSAL_CURRENT_D7_REFERENCE_INVALID",
+  "REHEARSAL_CURRENT_D7_SCHEMA_CLEANUP_FAILED",
+  "REHEARSAL_CURRENT_D7_SCHEMA_OWNERSHIP_INVALID",
+  "REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID",
+  "REHEARSAL_CURRENT_MIGRATION_BINDING_CHANGED",
+  "REHEARSAL_CURRENT_OUTPUT_EXISTS",
+  "REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE",
+  "REHEARSAL_CURRENT_REFERENCE_INCOMPLETE",
+  "REHEARSAL_CURRENT_REFERENCE_RUNTIME_INVALID",
+  "REHEARSAL_DATABASE_INVALID",
+  "REHEARSAL_DATABASE_UNCONFIGURED",
+  "REHEARSAL_DIST_MISSING",
+  "REHEARSAL_DUMP_AMBIGUOUS",
+  "REHEARSAL_DUMP_DIGEST_MISMATCH",
+  "REHEARSAL_DUMP_MISSING",
+  "REHEARSAL_DUMP_UNPINNED",
+  "REHEARSAL_GOLDEN_CLOCK_INVALID",
+  "REHEARSAL_GOLDEN_REQUIRED",
+  "REHEARSAL_IDENTIFIER_INVALID",
+  "REHEARSAL_JOURNAL_DDL_MISSING",
+  "REHEARSAL_JOURNAL_INPUT_AMBIGUOUS",
+  "REHEARSAL_JOURNAL_SOURCE_MISMATCH",
+  "REHEARSAL_JOURNAL_TABLE_MISSING",
+  "REHEARSAL_MIGRATION_INCOMPLETE",
+  "REHEARSAL_NODE22_MISSING",
+  "REHEARSAL_NODE_UNSUPPORTED",
+  "REHEARSAL_ORIGIN_CHILD_CLEANUP_FAILED",
+  "REHEARSAL_ORIGIN_CONFIG_INVALID",
+  "REHEARSAL_ORIGIN_START_FAILED",
+  "REHEARSAL_ORIGIN_START_TIMEOUT",
+  "REHEARSAL_PER_DATE_INVALID",
+  "REHEARSAL_POSTGRES_17_REQUIRED",
+  "REHEARSAL_READ_FAILED",
+  "REHEARSAL_REFRESH_FAILED",
+  "REHEARSAL_REFRESH_INCOMPLETE",
+  "REHEARSAL_REUSE_SCHEMA_MISSING",
+  "REHEARSAL_SQLITE_NOT_SEALED",
+  "REHEARSAL_SUFFIX_INVALID",
+  "REHEARSAL_TARGET_SCHEMA_INVALID",
+]);
+const CURRENT_D7_CONTROLLER_PHASES = new Set(["input_binding", "current_d1_replay", "current_d1_acceptance", "postgres",
+  "migrate", "sqlite", "importers", "refresh_first", "origin", "parity", "refresh_second", "source_recheck", "cleanup", "report"]);
+const CURRENT_D7_CHILD_SIGNALS = new Set(["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV", "SIGBUS"]);
+const CURRENT_D7_CHILD_CODES = new Set(["ENOENT", "EACCES", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "other"]);
+
+/** Project only closed, source-verified controller and child facts into TAP diagnostics. */
+function currentD7FailureDiagnostic(report, childCompletion, lastValidatedControllerPhase) {
+  const isCurrentD7Error = report?.schemaVersion === "gcp-fastpath-current-d7-rehearsal-report-v1"
+    && report?.comparisonMode === "current-worker-d1-d7" && report?.decisionId === "D7"
+    && report?.status === "error" && report?.qualifying === false && report?.establishesNativeExecution === false;
+  const errorValue = report?.error;
+  const errorKeys = errorValue !== null && typeof errorValue === "object" && !Array.isArray(errorValue)
+    ? Object.keys(errorValue) : [];
+  const rawControllerCode = isCurrentD7Error && errorKeys.length === 1 && errorKeys[0] === "code"
+    ? errorValue.code : null;
+  const controllerErrorCode = rawControllerCode === null ? "unavailable"
+    : CURRENT_D7_CONTROLLER_ERROR_CODES.has(rawControllerCode) ? rawControllerCode : "unrecognized";
+  const childState = childCompletion?.state === "failed" || childCompletion?.state === "completed"
+    ? childCompletion.state : "unknown";
+  return {
+    schemaVersion: "current-q1-d7-s9-failure-diagnostic-v1",
+    controllerStatus: isCurrentD7Error ? "error" : "unavailable",
+    controllerErrorCode,
+    childState,
+    childExitCode: Number.isSafeInteger(childCompletion?.exitCode) && childCompletion.exitCode >= 0
+      && childCompletion.exitCode <= 255 ? childCompletion.exitCode : null,
+    childSignal: CURRENT_D7_CHILD_SIGNALS.has(childCompletion?.signal) ? childCompletion.signal : null,
+    childKilled: typeof childCompletion?.killed === "boolean" ? childCompletion.killed : null,
+    childCode: CURRENT_D7_CHILD_CODES.has(childCompletion?.childCode) ? childCompletion.childCode : "unrecognized",
+    deadlineMs: childCompletion?.deadlineMs === S9_REHEARSAL_DEADLINE_MS ? S9_REHEARSAL_DEADLINE_MS : null,
+    deadlineElapsed: typeof childCompletion?.deadlineElapsed === "boolean" ? childCompletion.deadlineElapsed : null,
+    lastValidatedControllerPhase: CURRENT_D7_CONTROLLER_PHASES.has(lastValidatedControllerPhase)
+      ? lastValidatedControllerPhase : null,
+  };
+}
+
+async function withCurrentD7OwnedSchemaCleanup(report, childCompletion, work, cleanup) {
   const candidates = currentD7SchemaPairsForCleanup(report);
   const verifiedCandidates = candidates.filter(({ caseId, schema, controlSchema }) => {
     try {
@@ -2521,6 +2621,9 @@ async function withCurrentD7OwnedSchemaCleanup(report, work, cleanup) {
   });
   const names = [...new Set(verifiedCandidates.flatMap(({ schema, controlSchema }) => [schema, controlSchema]))];
   try {
+    // A failed controller has no success-only qualification handoff; surface its
+    // closed child outcome first, while finally still owns exact-pair cleanup.
+    assertS9ChildCompleted(childCompletion);
     const pairs = validateCurrentD7SchemaHandoff(report, candidates);
     return await work(pairs, names);
   } finally {
@@ -2800,10 +2903,11 @@ test("S9 D7 owns exactly two disjoint retained schema pairs and requires both re
   assert.throws(() => validateCurrentD7SchemaHandoff({ ...report,
     keptSchemaPairs: [{ ...keptSchemaPairs[0] }, { ...keptSchemaPairs[1], schema: keptSchemaPairs[0].schema }],
   }), /top-level pair projection/u);
+  const completedChild = (await captureS9ChildCompletion(async () => ({ stdout: "", stderr: "" }))).metadata;
   const cleaned = [];
   await assert.rejects(withCurrentD7OwnedSchemaCleanup({ ...report,
     keptSchemas: [...report.keptSchemas, "typed_legacy_transfer_rehearsal_target_fastpath_ffffffff"],
-  }, async () => assert.fail("invalid extra schema names cannot enter edge assertions"), async (names) => cleaned.push(...names)),
+  }, completedChild, async () => assert.fail("invalid extra schema names cannot enter edge assertions"), async (names) => cleaned.push(...names)),
   /four owned schema names/u);
   assert.deepEqual(cleaned, report.keptSchemas,
     "an invalid extra name still cleans only the four independently validated owned schemas");
@@ -3026,6 +3130,7 @@ async function seededRehearsal() {
     // Raw child output remains solely in this owner-private local directory.
     // Preserve failures before attempting a report; missing sidecars keep it intact.
     let failureOutputPreserved = liveProgress?.preserved === true;
+    let lastValidatedControllerPhase = null;
     if (completion.metadata.state === "failed") {
       try {
         await writeFile(join(directory, "child-completion.json"), `${JSON.stringify({ ...completion.metadata,
@@ -3054,6 +3159,8 @@ async function seededRehearsal() {
         && metadata.uid === process.getuid() && (metadata.mode & 0o077) === 0 && metadata.size <= S9_DIAGNOSTIC_BYTES,
       "the bounded progress journal remains an owner-private regular file");
       const records = validateS9ProgressJournal(await readFile(progressPath), liveProgress);
+      if (CURRENT_D7) lastValidatedControllerPhase = records.toReversed()
+        .find((record) => record.component === "controller")?.phase ?? null;
       await preserve("s9-progress", { schemaVersion: "s9-rehearsal-progress-v1", records });
     } catch { artifactsPreserved = false; }
     let evidence = null;
@@ -3072,7 +3179,7 @@ async function seededRehearsal() {
     discardDirectory = !CURRENT_D7 && completion.metadata.state === "completed" && artifactsPreserved
       && (!CURRENT_Q1 || evidence !== null);
     result = { report, evidence, runtime, imageRuntime, staged, artifactsPreserved,
-      childCompletion: completion.metadata, liveProgress, temporaryOutputRemoved: false,
+      childCompletion: completion.metadata, liveProgress, lastValidatedControllerPhase, temporaryOutputRemoved: false,
       ...(CURRENT_D7 ? { privateOutputPath: out, privateOutputDirectory: directory } : {}) };
     return result;
   } finally {
@@ -3196,36 +3303,48 @@ async function currentD7EdgeCase({ f, evidence, pair, caseOutput, dump, casesVer
   }
 }
 
-async function runCurrentD7S9(f) {
+async function runCurrentD7S9(f, testContext) {
   const seeded = await seededRehearsal();
   const rehearsal = seeded.report;
   const casesVerified = [];
   const dump = JSON.parse(await readFile(join(GOLDEN, "dump", "usage-monitor-db.json"), "utf8"));
   let evidence = null;
-  await withCurrentD7OwnedSchemaCleanup(rehearsal, async (pairs) => {
-    assertS9ChildCompleted(seeded.childCompletion);
-    evidence = await readCurrentD7Evidence({ out: seeded.privateOutputPath, report: rehearsal,
-      runtime: seeded.runtime, imageRuntime: seeded.imageRuntime });
-    await preserveS9Artifact("s9-rehearsal", rehearsal);
-    assert.equal(seeded.artifactsPreserved, true, "bounded child progress and completion records were preserved");
-    assert.equal(seeded.temporaryOutputRemoved, false, "the private sidecars remain available through edge reads and cleanup");
-    assert.deepEqual(pairs.map(({ caseId }) => caseId), CURRENT_D7_CASE_IDS);
-    const byCase = new Map(pairs.map((pair) => [pair.caseId, pair]));
-    for (const caseOutput of evidence.caseOutputs) {
-      const pair = byCase.get(caseOutput.caseId);
-      assert.ok(pair, `${caseOutput.caseId} retained pair exists`);
-      await currentD7EdgeCase({ f, evidence, pair, caseOutput, dump, casesVerified });
+  try {
+    await withCurrentD7OwnedSchemaCleanup(rehearsal, seeded.childCompletion,
+      async (pairs) => {
+        evidence = await readCurrentD7Evidence({ out: seeded.privateOutputPath, report: rehearsal,
+          runtime: seeded.runtime, imageRuntime: seeded.imageRuntime });
+        await preserveS9Artifact("s9-rehearsal", rehearsal);
+        assert.equal(seeded.artifactsPreserved, true, "bounded child progress and completion records were preserved");
+        assert.equal(seeded.temporaryOutputRemoved, false, "the private sidecars remain available through edge reads and cleanup");
+        assert.deepEqual(pairs.map(({ caseId }) => caseId), CURRENT_D7_CASE_IDS);
+        const byCase = new Map(pairs.map((pair) => [pair.caseId, pair]));
+        for (const caseOutput of evidence.caseOutputs) {
+          const pair = byCase.get(caseOutput.caseId);
+          assert.ok(pair, `${caseOutput.caseId} retained pair exists`);
+          await currentD7EdgeCase({ f, evidence, pair, caseOutput, dump, casesVerified });
+        }
+        assert.deepEqual(casesVerified.map(({ caseId }) => caseId), CURRENT_D7_CASE_IDS,
+          "edge, direct origin, preview, privacy and contract checks ran for both cases");
+      },
+      async (names) => {
+        for (const name of [...names].reverse()) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+        if (names.length > 0) {
+          const remaining = await f.base.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1::text[]) ORDER BY nspname",
+            [names]);
+          assert.deepEqual(remaining.rows, [], "the exact four owned generated schemas are independently absent");
+        }
+      });
+  } catch (error) {
+    // The cleanup error may replace the failed-child rejection from the wrapper's
+    // finally block. Preserve the captured failure diagnostic without replacing
+    // whichever error actually escaped cleanup.
+    if (seeded.childCompletion?.state === "failed") {
+      testContext.diagnostic(JSON.stringify(currentD7FailureDiagnostic(rehearsal, seeded.childCompletion,
+        seeded.lastValidatedControllerPhase)));
     }
-    assert.deepEqual(casesVerified.map(({ caseId }) => caseId), CURRENT_D7_CASE_IDS,
-      "edge, direct origin, preview, privacy and contract checks ran for both cases");
-  }, async (names) => {
-    for (const name of [...names].reverse()) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
-    if (names.length > 0) {
-      const remaining = await f.base.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1::text[]) ORDER BY nspname",
-        [names]);
-      assert.deepEqual(remaining.rows, [], "the exact four owned generated schemas are independently absent");
-    }
-  });
+    throw error;
+  }
   await removeCurrentD7PrivateOutput(seeded);
   assert.equal(seeded.temporaryOutputRemoved, true);
   const caseSummaries = casesVerified.map(({ caseId, currentDay, graphDays, currentPublicDays, controllerResponseSha256,
@@ -3246,10 +3365,10 @@ test(CURRENT_D7
   : "S9 golden: the community/daily read is byte-equal through the edge and reproduces the rehearsal's parity table; "
     + "the live check's write tier completes on the seeded schema at the deploy's origin settings", {
   skip: SKIP || GOLDEN === null, timeout: 3_600_000,
-}, async () => {
+}, async (testContext) => {
   const f = await fixture();
   if (CURRENT_D7) {
-    await runCurrentD7S9(f);
+    await runCurrentD7S9(f, testContext);
     return;
   }
   const golden = JSON.parse(await readFile(join(GOLDEN, "community-daily-response.json"), "utf8"));
