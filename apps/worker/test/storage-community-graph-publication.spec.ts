@@ -107,11 +107,11 @@ function evidence(){
 
 
 const bindings=()=>({source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace});
-async function fixture(id=participantId){
+async function fixture(id=participantId,options:{publishDaily?:boolean}={}){
  const f=await createV11DeviceFixture(typed(),{participantId:id,grant:true});
  await activate(typed(),f,await makeV11Day(day(),evidence()),true);
  for(let n=0;n<32;n++){if((await advanceStorageAnalytics(bindings())).state==='idle')break;}
- await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
+ if(options.publishDaily!==false)await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
 }
 async function modelFixture(){
  const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
@@ -398,8 +398,17 @@ describe('isolated allowance graph publication',()=>{
   expect(stored.day).toBe(day());expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'unchanged'});
  });
  it('measures both full 16-owner publications with the actual shared statement meter',async()=>{
-  for(let i=0;i<16;i++)await fixture(`participant:budget-${i.toString().padStart(2,'0')}`);
-  for(let i=0;i<16;i++){await compute('fits',today(),i);await compute('model',day(),i);}
+  for(let i=0;i<16;i++)await fixture(`participant:budget-${i.toString().padStart(2,'0')}`,{publishDaily:false});
+  expect(await advanceStorageAnalytics(bindings())).toMatchObject({state:'idle'});
+  // Build the complete cohort once; each pass retains the default four-owner
+  // bound instead of publishing every growing intermediate cohort.
+  for(let pass=0;pass<4;pass++)expect(await advanceStorageCommunityDaily({...bindings(),day:day()}))
+   .toMatchObject({state:pass===3?'published':'progress',ownersAdvanced:4});
+  expect(await readStorageCommunityOwnerPage(typed())).toHaveLength(16);
+  for(let i=0;i<16;i++){
+   expect(await compute('fits',today(),i)).toMatchObject({state:'complete'});
+   expect(await compute('model',day(),i)).toMatchObject({state:'complete'});
+  }
   const modelMeter=createD1InvocationBudget(900),previewMeter=createD1InvocationBudget(900);
   expect(await publishStorageCommunityModelDay({...bindings(),source:modelMeter.wrap(typed()),target:modelMeter.wrap(b.STORAGE_ANALYTICS_DB)},
    {day:day()})).toMatchObject({state:'published',memberCount:16});
