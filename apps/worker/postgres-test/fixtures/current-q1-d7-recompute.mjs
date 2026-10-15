@@ -140,7 +140,8 @@ export async function runCurrentQ1D7DailyConvergence(ctx, topology, totalBound =
   const dailyPasses = [];
   let remaining = totalBound;
   for (const preferStaleHead of [false, true]) {
-    const pass = await runCurrentQ1D7DailyPass({ ...topology, preferStaleHead, bound: remaining - 2,
+    const pass = await runCurrentQ1D7DailyPass({ ...topology, expectedDailyDays: topology.dailyDays,
+      preferStaleHead, bound: remaining - 2,
       advance: (options) => ctx.P.advanceNextStorageCommunityDaily({ source: ctx.ingestion, target: ctx.analytics,
         sourceId: ctx.sourceId, sourceNamespace: ctx.sourceNamespace, ...options, nowMs: ctx.nowMs }),
       onIteration: (iteration) => ctx.progress.counts({ iteration }) });

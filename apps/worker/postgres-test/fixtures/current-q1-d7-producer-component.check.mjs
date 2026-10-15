@@ -75,6 +75,114 @@ function generatedAdmissionCorpus(caseKey) {
   return corpus;
 }
 
+test("D7 daily convergence forwards its exact day sets through both public scheduler passes", async () => {
+  const source = {};
+  const target = {};
+  const nowMs = 1_800_000_000_000;
+  for (const caseKey of ["conflictPreserving", "conflictFreePositive"]) {
+    const corpus = generatedAdmissionCorpus(caseKey);
+    const topology = D7.validateCurrentQ1D7Topology(caseKey, corpus);
+    assert.equal(Object.hasOwn(topology, "dailyDays"), true);
+    assert.equal(Object.hasOwn(topology, "expectedDailyDays"), false);
+    const topologyBefore = structuredClone(topology);
+    const calls = [];
+    const progressCalls = [];
+    const seenByPass = new Map([[false, new Set()], [true, new Set()]]);
+    const ctx = {
+      P: {
+        async advanceNextStorageCommunityDaily(args) {
+          assert.deepEqual(Object.keys(args).sort(), ["nowMs", "preferStaleHead", "skipDays", "source",
+            "sourceId", "sourceNamespace", "target"].sort());
+          assert.equal(args.source, source);
+          assert.equal(args.target, target);
+          assert.equal(args.sourceId, "gcp-fastpath-oracle");
+          assert.equal(args.sourceNamespace, "gcp-fastpath-oracle");
+          assert.equal(args.nowMs, nowMs);
+          assert.equal(typeof args.preferStaleHead, "boolean");
+          const seen = seenByPass.get(args.preferStaleHead);
+          assert.ok(seen);
+          assert.deepEqual(args.skipDays, topology.conflictDays.filter((day) => seen.has(day)));
+          const day = topology.allDays.find((candidate) => !args.skipDays.includes(candidate) && !seen.has(candidate));
+          let step;
+          if (day === undefined) {
+            step = { state: "idle", ownersAdvanced: 0 };
+          } else {
+            seen.add(day);
+            step = topology.conflictDays.includes(day)
+              ? { state: "deferred", reason: "projection_pending", ownersAdvanced: 0, day }
+              : { state: "published", ownersAdvanced: 4, day };
+          }
+          calls.push({ preferStaleHead: args.preferStaleHead, skipDays: [...args.skipDays], step });
+          return step;
+        },
+      },
+      ingestion: source,
+      analytics: target,
+      sourceId: "gcp-fastpath-oracle",
+      sourceNamespace: "gcp-fastpath-oracle",
+      nowMs,
+      progress: { counts(value) { progressCalls.push(value); } },
+    };
+
+    const passes = await D7.runCurrentQ1D7DailyConvergence(ctx, topology);
+    const expectedOutcomes = {
+      published: topology.dailyDays.length,
+      unchanged: 0,
+      progress: 0,
+      conflicts: topology.conflictDays.length,
+    };
+    assert.deepEqual(passes, [false, true].map(() => ({
+      iterations: 171,
+      outcomes: expectedOutcomes,
+      filteredIdle: true,
+    })));
+    assert.equal(calls.length, 342);
+    assert.deepEqual(calls.map((call) => call.preferStaleHead), [
+      ...Array(171).fill(false),
+      ...Array(171).fill(true),
+    ]);
+    assert.ok(calls.length <= D7.CURRENT_Q1_D7_DAILY_BOUND);
+    assert.deepEqual(progressCalls, [false, true].flatMap(() =>
+      Array.from({ length: 171 }, (_, index) => ({ iteration: index + 1 }))));
+
+    for (const preferStaleHead of [false, true]) {
+      const passCalls = calls.filter((call) => call.preferStaleHead === preferStaleHead);
+      assert.equal(passCalls.length, 171);
+      const expectedSkipped = [];
+      const expectedSkipTrace = topology.allDays.map((day) => {
+        const skipDays = [...expectedSkipped];
+        if (topology.conflictDays.includes(day)) expectedSkipped.push(day);
+        return skipDays;
+      });
+      expectedSkipTrace.push([...expectedSkipped]);
+      assert.deepEqual(passCalls.map((call) => call.skipDays), expectedSkipTrace);
+      assert.deepEqual(passCalls.slice(0, -1).map((call) => call.step), topology.allDays.map((day) =>
+        topology.conflictDays.includes(day)
+          ? { state: "deferred", reason: "projection_pending", ownersAdvanced: 0, day }
+          : { state: "published", ownersAdvanced: 4, day }));
+      assert.deepEqual(passCalls.at(-1), {
+        preferStaleHead,
+        skipDays: topology.conflictDays,
+        step: { state: "idle", ownersAdvanced: 0 },
+      });
+      assert.deepEqual([...seenByPass.get(preferStaleHead)].sort(), topology.allDays);
+    }
+    assert.deepEqual(topology, topologyBefore);
+
+    let malformedAdvanceCalls = 0;
+    const malformedContext = {
+      ...ctx,
+      P: { async advanceNextStorageCommunityDaily() { malformedAdvanceCalls++; } },
+    };
+    await assert.rejects(
+      D7.runCurrentQ1D7DailyConvergence(malformedContext,
+        { ...topology, dailyDays: topology.dailyDays.slice(1) }),
+      (error) => error?.code === "CURRENT_Q1_D7_RECOMPUTATION_INVALID",
+    );
+    assert.equal(malformedAdvanceCalls, 0);
+  }
+});
+
 function seedExecutionOrder(corpus, identities) {
   const receipts = [];
   for (const owner of corpus.owners) {
