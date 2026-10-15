@@ -64,8 +64,9 @@
  * checkout, pinned runtimes and generated build inputs, requires every
  * producer job to succeed, and evaluates every canonical file exactly once.
  * No-flag execution remains the complete serial gate.
- * Progress JSON on stderr contains canonical file ownership and elapsed time
- * only; stdout continues to contain one result summary.
+ * Suite progress JSON on stderr contains canonical file ownership and elapsed
+ * time; the EDGE runner adds only validated closed S9 component/phase progress.
+ * Stdout continues to contain one result summary.
  */
 
 import { spawn, execFileSync } from "node:child_process";
@@ -74,6 +75,11 @@ import { access, lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  S9_DIAGNOSTIC_BYTES,
+  S9_TAP_PROGRESS_PREFIX,
+  validateClosedS9Progress,
+} from "./s9-rehearsal-diagnostics.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const WORKER_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -1141,7 +1147,58 @@ export function passEnvironment(baseEnvironment, pass, { socket, port, tcpHost, 
   return environment;
 }
 
-function spawnProcess(command, args, { cwd, env, captureStdout }) {
+/** Forward only the tagged, closed S9 progress comments from the EDGE TAP stream. */
+export function createEdgeS9TapProgressForwarder(emit = (value) => {
+  process.stderr.write(`${JSON.stringify(value)}\n`);
+}) {
+  let buffer = "";
+  let dropping = false;
+  let records = 0;
+  let bytes = 0;
+  const lastElapsed = new Map();
+  const prefix = `# ${S9_TAP_PROGRESS_PREFIX}`;
+  const accept = (line) => {
+    if (!line.startsWith(prefix) || Buffer.byteLength(line) + 1 > 1_024) return;
+    const encoded = line.slice(prefix.length);
+    let parsed;
+    try { parsed = JSON.parse(encoded); } catch { return; }
+    const value = validateClosedS9Progress(parsed);
+    if (value === null || JSON.stringify(value) !== encoded
+        || value.elapsedMs < (lastElapsed.get(value.component) ?? 0)) return;
+    const size = Buffer.byteLength(`${JSON.stringify(value)}\n`);
+    if (records >= 1_024 || bytes + size > S9_DIAGNOSTIC_BYTES) return;
+    records += 1;
+    bytes += size;
+    lastElapsed.set(value.component, value.elapsedMs);
+    try { emit(value); } catch { /* Visibility cannot change the suite result. */ }
+  };
+  return (chunk) => {
+    if (!(typeof chunk === "string" || Buffer.isBuffer(chunk)) || Buffer.byteLength(chunk) > 64 * 1024) {
+      buffer = "";
+      dropping = true;
+      return;
+    }
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    for (const part of text.split(/(?<=\n)/u)) {
+      if (dropping) {
+        if (part.endsWith("\n")) dropping = false;
+        continue;
+      }
+      if (Buffer.byteLength(buffer) + Buffer.byteLength(part) > 1_024) {
+        buffer = "";
+        dropping = !part.endsWith("\n");
+        continue;
+      }
+      buffer += part;
+      if (buffer.endsWith("\n")) {
+        accept(buffer.slice(0, -1));
+        buffer = "";
+      }
+    }
+  };
+}
+
+function spawnProcess(command, args, { cwd, env, captureStdout, onStdoutChunk }) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -1151,7 +1208,12 @@ function spawnProcess(command, args, { cwd, env, captureStdout }) {
       stdio: ["ignore", captureStdout ? "pipe" : 2, 2],
     });
     const chunks = [];
-    child.stdout?.on("data", (chunk) => chunks.push(chunk));
+    child.stdout?.on("data", (chunk) => {
+      chunks.push(chunk);
+      if (typeof onStdoutChunk === "function") {
+        try { onStdoutChunk(chunk); } catch { /* Streaming diagnostics cannot change the child outcome. */ }
+      }
+    });
     child.once("error", reject);
     child.once("close", (code, signal) => {
       resolvePromise({
@@ -1213,6 +1275,7 @@ export async function runPostgresSuite({
   onRecords = () => {},
   onExecutionInputs = async () => {},
   onProgress = (entry) => process.stderr.write(`${JSON.stringify(entry)}\n`),
+  onS9Progress = (entry) => process.stderr.write(`${JSON.stringify(entry)}\n`),
   now = () => Date.now(),
 } = {}) {
   const profile = readSocketProfileInput(environment);
@@ -1345,18 +1408,21 @@ export async function runPostgresSuite({
       const absoluteFile = join(workerRoot, entry.file);
       await onExecutionInputs();
       progress("started", PROFILE_EDGE_E2E, entry.runner, [entry.file]);
+      const registeredD7EdgeSpec = entry.file === EDGE_PARTITION_FILES[0]
+        && entry.profile === PROFILE_EDGE_E2E
+        && entry.source === "edge:e2e"
+        && entry.runner === scriptRunner("edge:e2e")
+        && SCRIPT_PROFILES[entry.source] === entry.profile;
       const { exitCode, stdout } = await run(runtime.node, [
         ...EDGE_E2E_NODE_FLAGS,
         "--test",
         ...(entry.testFlags ?? []).filter((flag) => !flag.startsWith("--test-reporter")),
         "--test-reporter=tap",
         `./${entry.file}`,
-      ], { cwd: workerRoot, env: passEnv, captureStdout: true });
-      const registeredD7EdgeSpec = entry.file === EDGE_PARTITION_FILES[0]
-        && entry.profile === PROFILE_EDGE_E2E
-        && entry.source === "edge:e2e"
-        && entry.runner === scriptRunner("edge:e2e")
-        && SCRIPT_PROFILES[entry.source] === entry.profile;
+      ], { cwd: workerRoot, env: passEnv, captureStdout: true,
+        ...(registeredD7EdgeSpec
+          ? { onStdoutChunk: createEdgeS9TapProgressForwarder(onS9Progress) }
+          : {}) });
       const expectedTestCount = registeredD7EdgeSpec
         && environment[EDGE_E2E_S9_MODE_VARIABLE] === CURRENT_D7_S9_MODE
         ? CURRENT_D7_EDGE_E2E_TEST_COUNT

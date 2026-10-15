@@ -6,6 +6,7 @@ import { isAbsolute, resolve, join } from "node:path";
 
 export const S9_REHEARSAL_DEADLINE_MS = 40 * 60_000;
 export const S9_DIAGNOSTIC_BYTES = 256 * 1024;
+export const S9_TAP_PROGRESS_PREFIX = "S9_PROGRESS ";
 const PHASES = Object.freeze({
   producer: ["source_provenance", "runtime", "module_load", "corpus_validation", "migrations", "admission",
     "settle", "settle_bootstrap", "settle_delivery", "settle_daily", "settle_retirement", "settle_cache", "public_before", "oracle", "public_after", "native_probes", "source_recheck", "cleanup"],
@@ -63,7 +64,7 @@ export function createS9Progress(component, { now = () => performance.now(), emi
   };
 }
 
-function closedS9Progress(value) {
+export function validateClosedS9Progress(value) {
   const required = ["event", "component", "phase", "elapsedMs"];
   if (value === null || typeof value !== "object" || Array.isArray(value)
     || !required.every((key) => Object.hasOwn(value, key))
@@ -89,7 +90,7 @@ export function validateS9ProgressJournal(bytes, receipt) {
   const last = new Map();
   return lines.map((line) => {
     assert.ok(Buffer.byteLength(line) + 1 <= 1_024);
-    const value = closedS9Progress(JSON.parse(line));
+    const value = validateClosedS9Progress(JSON.parse(line));
     assert.ok(value !== null, "only the closed progress contract may be preserved");
     assert.ok(value.elapsedMs >= (last.get(value.component) ?? 0));
     last.set(value.component, value.elapsedMs);
@@ -98,8 +99,8 @@ export function validateS9ProgressJournal(bytes, receipt) {
 }
 
 /** Observe only the existing child's stderr; never launch, signal, or change its result.
- * Unknown/raw output is discarded. The live file receives reserialized closed progress only. */
-export function observeS9ChildProgress(child, write) {
+ * The journal receives reserialized closed progress; publish is best-effort after each successful write. */
+export function observeS9ChildProgress(child, write, publish = null) {
   const stream = child?.stderr;
   if (!stream || typeof stream.on !== "function" || typeof stream.off !== "function") {
     throw new Error("S9_PROGRESS_STREAM_INVALID");
@@ -111,7 +112,7 @@ export function observeS9ChildProgress(child, write) {
   const accept = (line) => {
     let value;
     try { value = JSON.parse(line); } catch { reject(); return; }
-    const safe = closedS9Progress(value);
+    const safe = validateClosedS9Progress(value);
     if (safe === null) { reject(); return; }
     const text = `${JSON.stringify(safe)}\n`, size = Buffer.byteLength(text);
     if (failed || value.elapsedMs < (lastElapsed.get(value.component) ?? 0)
@@ -121,6 +122,9 @@ export function observeS9ChildProgress(child, write) {
     pending = pending.then(async () => {
       if (failed) { reject(); return; }
       await write(text); records++; bytes += size;
+      if (typeof publish === "function") {
+        try { publish(`${S9_TAP_PROGRESS_PREFIX}${text}`); } catch { /* Live visibility cannot change journal preservation. */ }
+      }
     }).catch(() => { failed = true; reject(); });
   };
   const onData = (chunk) => {

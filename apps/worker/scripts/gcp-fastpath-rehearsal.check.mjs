@@ -18,7 +18,8 @@ import { assertCurrentD7RehearsalOutputsNew, assertCurrentImageRuntime, assertCu
 
 import { assertS9ChildCompleted, boundedS9ChildOutput, captureS9ChildCompletion, createS9Progress, observeS9ChildProgress,
   ownedKeptRehearsalSchemas, s9ControllerGoldenArguments, withS9OwnedSchemaCleanup,
-  readS9ChildReport, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS } from "./s9-rehearsal-diagnostics.mjs";
+  readS9ChildReport, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS,
+  S9_TAP_PROGRESS_PREFIX } from "./s9-rehearsal-diagnostics.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CURRENT_GOLDEN = join(WORKER_ROOT, "analytics-v2-test", "golden");
@@ -1471,9 +1472,10 @@ test("S9 executes exact owned-schema cleanup before a sanitized failed-child rej
 });
 
 test("S9 live progress preserves split records and heartbeats before child completion and closes exactly", async () => {
-  const stderr = new EventEmitter(), lines = [], buffered = [];
+  const stderr = new EventEmitter(), lines = [], published = [], buffered = [];
   stderr.on("data", (chunk) => buffered.push(chunk));
-  const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(line));
+  const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(line),
+    (line) => published.push(line));
   const value = { event: "s9_rehearsal_progress", component: "producer", phase: "settle_cache", elapsedMs: 5_000, iteration: 3 };
   const line = `${JSON.stringify(value)}\n`;
   stderr.emit("data", Buffer.from(line.slice(0, 17)));
@@ -1481,6 +1483,8 @@ test("S9 live progress preserves split records and heartbeats before child compl
   stderr.emit("data", Buffer.from(line.slice(41)));
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(lines.map((text) => JSON.parse(text)), [value], "the child has not exited, yet phase evidence is retained");
+  assert.deepEqual(published, [`${S9_TAP_PROGRESS_PREFIX}${JSON.stringify(value)}\n`],
+    "only the written canonical record is published to the live TAP channel");
   stderr.emit("data", line);
   const first = await observer.close(), second = await observer.close();
   assert.equal(first.records, 2); assert.equal(first.rejected, 0); assert.equal(first.preserved, true);
@@ -1492,8 +1496,9 @@ test("S9 live progress preserves split records and heartbeats before child compl
 });
 
 test("S9 live progress rejects raw, private, malformed, oversized and out-of-contract values", async () => {
-  const stderr = new EventEmitter(), lines = [];
-  const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(line));
+  const stderr = new EventEmitter(), lines = [], published = [];
+  const observer = observeS9ChildProgress({ stderr }, async (line) => lines.push(line),
+    (line) => published.push(line));
   const good = { event: "s9_rehearsal_progress", component: "controller", phase: "current_d1_replay", elapsedMs: 0 };
   for (const value of [{ ...good, privatePath: "/private/SENSITIVE_CANARY" }, { ...good, phase: "SENSITIVE_CANARY" },
     { ...good, component: "SENSITIVE_CANARY" }, { ...good, component: { toString: "SENSITIVE_CANARY" } },
@@ -1510,6 +1515,7 @@ test("S9 live progress rejects raw, private, malformed, oversized and out-of-con
   const result = await observer.close();
   assert.equal(result.records, 1); assert.equal(result.preserved, true); assert.ok(result.rejected >= 19);
   assert.deepEqual(lines.map((line) => JSON.parse(line)), [good]);
+  assert.deepEqual(published, [`${S9_TAP_PROGRESS_PREFIX}${JSON.stringify(good)}\n`]);
   assert.doesNotMatch(lines.join(""), /SENSITIVE_CANARY|private/u);
   assert.throws(() => observeS9ChildProgress({}, async () => {}), /S9_PROGRESS_STREAM_INVALID/u);
 });
@@ -1544,6 +1550,15 @@ test("S9 live progress file and record caps remain finite and write failures are
   assert.equal(prefixResult.preserved, false); assert.equal(attempts, 2);
   assert.equal(prefixResult.records, retained.length); assert.equal(prefixResult.records, 1);
   assert.equal(prefixResult.bytes, Buffer.byteLength(retained.join(""))); assert.equal(prefixResult.rejected, 2);
+
+  const safeJournal = [], sinkFailure = new EventEmitter();
+  const bestEffort = observeS9ChildProgress({ stderr: sinkFailure },
+    async (text) => safeJournal.push(text), () => { throw new Error("PRIVATE_SINK_FAILURE"); });
+  sinkFailure.emit("data", line);
+  const bestEffortResult = await bestEffort.close();
+  assert.equal(bestEffortResult.preserved, true);
+  assert.equal(bestEffortResult.records, 1);
+  assert.deepEqual(safeJournal, [line], "a failed visibility sink cannot alter the private journal or qualification facts");
 });
 
 

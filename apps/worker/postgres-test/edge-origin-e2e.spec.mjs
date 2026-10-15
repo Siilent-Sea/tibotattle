@@ -3117,7 +3117,8 @@ async function seededRehearsal() {
               ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
               ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}) },
           });
-        observer = observeS9ChildProgress(pending.child, (line) => progressFile.writeFile(line));
+        observer = observeS9ChildProgress(pending.child, (line) => progressFile.writeFile(line),
+          (line) => process.stderr.write(line));
         return pending;
       });
     } finally {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync } from "node:fs";
+import { chmodSync, existsSync } from "node:fs";
 import {
   chmod,
   cp,
@@ -25,6 +25,7 @@ import {
   postgresExecutionInputs,
   aggregatePostgresReceipts,
   createPostgresReceipt,
+  createEdgeS9TapProgressForwarder,
   partitionPostgresPlan,
   parseSuiteArguments,
   postgresPlanDigest,
@@ -58,6 +59,7 @@ import {
   SCRIPT_PROFILES,
   UNREGISTERED_ALLOWLIST,
 } from "./ci-postgres-suite.mjs";
+import { S9_DIAGNOSTIC_BYTES, S9_TAP_PROGRESS_PREFIX } from "./s9-rehearsal-diagnostics.mjs";
 import {
   CI_WORK_DIRECTORY,
   ciPostgresProfiles,
@@ -653,6 +655,124 @@ test("parent", async (t) => { await t.test("child", () => {}); });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("EDGE TAP forwarding accepts only closed monotonic tagged S9 progress within both caps", () => {
+  const forwarded = [];
+  const forward = createEdgeS9TapProgressForwarder((value) => forwarded.push(value));
+  const valid = { event: "s9_rehearsal_progress", component: "controller", phase: "current_d1_replay", elapsedMs: 10 };
+  const tagged = (value) => `# ${S9_TAP_PROGRESS_PREFIX}${JSON.stringify(value)}\n`;
+  forward(Buffer.from([
+    "# ordinary TAP comment\n",
+    `# ${S9_TAP_PROGRESS_PREFIX}{malformed}\n`,
+    tagged({ ...valid, privatePath: "/private/SENSITIVE_CANARY" }),
+    tagged({ ...valid, phase: "SENSITIVE_CANARY" }),
+    tagged(valid),
+    tagged({ ...valid, elapsedMs: 9 }),
+    "# PRIVATE_RAW_ERROR /private/SENSITIVE_CANARY\n",
+  ].join("")));
+  assert.deepEqual(forwarded, [valid]);
+  assert.doesNotMatch(JSON.stringify(forwarded), /SENSITIVE_CANARY|private/u);
+
+  const splitForwarded = [];
+  const splitForward = createEdgeS9TapProgressForwarder((value) => splitForwarded.push(value));
+  const splitLine = tagged({ ...valid, elapsedMs: 11 });
+  const prefixLength = `# ${S9_TAP_PROGRESS_PREFIX}`.length;
+  splitForward(Buffer.from(splitLine.slice(0, prefixLength - 3)));
+  splitForward(Buffer.from(splitLine.slice(prefixLength - 3, prefixLength + 12)));
+  splitForward(Buffer.from(splitLine.slice(prefixLength + 12)));
+  assert.deepEqual(splitForwarded, [{ ...valid, elapsedMs: 11 }],
+    "a tagged prefix and JSON split across chunks remain one validated record");
+
+  const canonicalForwarded = [];
+  const forwardCanonical = createEdgeS9TapProgressForwarder((value) => canonicalForwarded.push(value));
+  forwardCanonical(Buffer.from(`${tagged(valid).replaceAll(",", ", ")}${tagged(valid)}`));
+  assert.deepEqual(canonicalForwarded, [valid], "valid but noncanonical JSON is refused");
+
+  const oversizedChunkForwarded = [];
+  const forwardOversizedChunk = createEdgeS9TapProgressForwarder((value) => oversizedChunkForwarded.push(value));
+  const validLine = tagged(valid);
+  const oversizedChunk = validLine.repeat(Math.ceil((64 * 1024 + 1) / Buffer.byteLength(validLine)));
+  assert.ok(Buffer.byteLength(oversizedChunk) > 64 * 1024);
+  forwardOversizedChunk(Buffer.from(oversizedChunk));
+  forwardOversizedChunk(Buffer.from(`${validLine}${validLine}`));
+  assert.deepEqual(oversizedChunkForwarded, [valid],
+    "an oversized whole chunk is discarded and parsing resumes after the next newline");
+
+  const oversizedLineForwarded = [];
+  const forwardOversizedLine = createEdgeS9TapProgressForwarder((value) => oversizedLineForwarded.push(value));
+  const oversizedLine = `# ${S9_TAP_PROGRESS_PREFIX}${"x".repeat(1_024)}\n`;
+  forwardOversizedLine(Buffer.from(`${oversizedLine}${validLine}`));
+  assert.deepEqual(oversizedLineForwarded, [valid],
+    "an oversized line is discarded without blocking the following line");
+
+  const recordCapped = [];
+  const forwardRecordCapped = createEdgeS9TapProgressForwarder((value) => recordCapped.push(value));
+  const small = { event: "s9_rehearsal_progress", component: "producer", phase: "oracle", elapsedMs: 0 };
+  const smallLine = Buffer.from(tagged(small));
+  for (let index = 0; index < 2_000; index += 1) forwardRecordCapped(smallLine);
+  assert.equal(recordCapped.length, 1_024, "the independent record cap remains exact");
+
+  const byteCapped = [];
+  const forwardByteCapped = createEdgeS9TapProgressForwarder((value) => byteCapped.push(value));
+  const large = { event: "s9_rehearsal_progress", component: "producer", phase: "oracle", elapsedMs: 0,
+    ...Object.fromEntries(["iteration", "completedSteps", "scopeOrdinal", "ownerOrdinal", "dayOrdinal",
+      "chunkOrdinal", "completedOwners", "completedDays", "completedChunks"].map((key) => [key, 10_000_000])) };
+  const largeLine = Buffer.from(tagged(large));
+  for (let index = 0; index < 2_000; index += 1) forwardByteCapped(largeLine);
+  const forwardedBytes = byteCapped.reduce((total, value) => total + Buffer.byteLength(`${JSON.stringify(value)}\n`), 0);
+  assert.ok(byteCapped.length < 1_024, "the byte cap is independently exercised");
+  assert.ok(forwardedBytes <= S9_DIAGNOSTIC_BYTES);
+
+  const sinkFailure = createEdgeS9TapProgressForwarder(() => { throw new Error("PRIVATE_SINK_FAILURE"); });
+  assert.doesNotThrow(() => sinkFailure(Buffer.from(tagged(valid))));
+});
+
+test("EDGE run streams a real Node TAP progress comment before child completion and still parses full TAP", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-edge-progress-tap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const specDirectory = join(root, "postgres-test");
+  await mkdir(specDirectory);
+  const spec = join(specDirectory, "edge-origin-e2e.spec.mjs");
+  const completed = join(root, "child-completed.marker");
+  const valid = { event: "s9_rehearsal_progress", component: "controller", phase: "current_d1_replay", elapsedMs: 100 };
+  const regressing = { ...valid, elapsedMs: 99 };
+  const privateValue = { ...valid, privatePath: "/private/SENSITIVE_CANARY" };
+  const source = `import { test } from "node:test";
+import { writeFile } from "node:fs/promises";
+test("synthetic progress boundary", async () => {
+  process.stderr.write(${JSON.stringify(`${S9_TAP_PROGRESS_PREFIX}${JSON.stringify(valid)}\n`)});
+  process.stderr.write(${JSON.stringify(`${S9_TAP_PROGRESS_PREFIX}${JSON.stringify(regressing)}\n`)});
+  process.stderr.write(${JSON.stringify(`${S9_TAP_PROGRESS_PREFIX}${JSON.stringify(privateValue)}\n`)});
+  process.stderr.write("PRIVATE_RAW_ERROR /private/SENSITIVE_CANARY\\n");
+  process.stdout.write(${JSON.stringify(`# ${S9_TAP_PROGRESS_PREFIX}${JSON.stringify(valid)}\n`)});
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+  await writeFile(${JSON.stringify(completed)}, "done");
+});
+`;
+  await writeFile(spec, source);
+  const live = [];
+  let observedBeforeCompletion = false;
+  const plan = { failures: [], files: [{ file: EDGE_SPEC, runner: "script:edge:e2e", source: "edge:e2e",
+    profile: PROFILE_EDGE_E2E }] };
+  const result = await runPostgresSuite({ workerRoot: root, plan,
+    environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
+    probeEdgeE2e: async () => ({ available: true, node: process.execPath }),
+    onOutput: () => {},
+    onS9Progress: (value) => {
+      observedBeforeCompletion ||= !existsSync(completed);
+      live.push(value);
+      throw new Error("PRIVATE_LIVE_SINK_FAILURE");
+    },
+  });
+  assert.equal(observedBeforeCompletion, true,
+    "the suite forwards progress while the synthetic child test is still running");
+  assert.deepEqual(live, [valid], "regressing, malformed-shape, and untagged output is not forwarded");
+  assert.doesNotMatch(JSON.stringify(live), /SENSITIVE_CANARY|private/u);
+  assert.equal(result.status, "passed");
+  assert.equal(result.tests, 1);
+  assert.deepEqual(result.failures, []);
+  assert.ok(existsSync(completed));
 });
 
 function vitestReport(entries) {
