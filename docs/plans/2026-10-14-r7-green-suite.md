@@ -13,7 +13,9 @@ and complete-corpus admission, then failed the unchanged elapsed-resource limit.
 All ten original receipts were preserved. A concrete repeated-plan validation
 defect and inherited backend failures now have reviewed, focused-test-passing
 repairs; R7 receipt freshness,
-the full local umbrella gate and final-commit hosted CI remain pending. No
+the full local umbrella gate and final-commit hosted CI remain pending. The next
+private-history regeneration requires explicit owner authorization after an
+automatic approval-review refusal. No
 resource limit or test assertion was relaxed. The suite is not green.
 
 The owner requested resolution of the remaining R7 blockers and a complete
@@ -316,3 +318,75 @@ changes have independent review and publication-privacy clearance. Documentation
 all 23 preflight checks and architecture also pass. The disposable database was
 stopped after validation. The next gate is one complete protected R7 attempt on
 the frozen candidate; its success is not presumed from these focused results.
+
+## Current candidate verification — 15 October 2026
+
+The pushed candidate `b57ac6fdac82b1390d131c95aea0a8221c389af5` completed
+the full root suite with 6,432 tests: 6,386 passes, two stale R7 receipt failures,
+zero cancellations and 44 existing platform skips. Its protected regeneration
+launch was rejected by automatic approval review before execution because exact
+authorization for the private-history read and atomic ten-receipt replacement
+was not established. No process started, private corpus was read or receipt
+changed in that attempt. The owner confirmation remains pending; no alternate
+execution path is authorized by this refusal.
+
+The separate product run passed UI 1,094/1,094, release site 82/82, local
+companion 420/420, Worker application 2,836/2,836 across 184 files, Worker Node
+2/2 and analytics 349/349. Eleven existing Worker script skips required a local
+PostgreSQL environment; these are distinct from the zero-skip application suites
+and the actual PostgreSQL tests recorded above. The product command then
+correctly rejected an ignored public-site build left from before main integration.
+Canonical regeneration repaired that local prerequisite without source changes.
+Both remaining Worker dry-run commands passed on clean `0ab39d92`; no deployment
+occurred. Separately, macOS transition passed 127/127 and local-review runtime
+qualification passed. These completed pieces do not relabel the failed original
+aggregate as a passing complete run.
+
+Hosted run `38688571002` at `b57ac6fda` passed Cloud Run and the complete
+PostgreSQL Vitest partition, 15 files and 107 tests with zero skips. Dependency
+scanning, release trust, documentation and contract drift also passed. The first
+Node partition passed 40 files and 261 tests with zero skips. The second Node
+partition completed 39 files and 333 tests: 332 passed, one timed out and none
+skipped. The real v12 SQL 40,000/40,001-variant boundary exceeded its unchanged
+600-second case limit; the 45-minute job limit was not reached. The aggregate
+correctly failed. The bounded SQL path received the follow-up repair below. Worker passed
+all 2,836 application tests, then its historical-vendor test failed because the
+shallow checkout lacked required source history. Edge integration passed
+13/15 tests and failed the closed limiter inventory and golden comparison.
+Commit `0ab39d92` adds the three current operational guards to the exact inventory
+without expanding route-admission replay and adds bounded comparison diagnostics.
+Before the follow-up repair, the focused golden reproduction failed its unchanged
+zero-difference check:
+336 spend-provenance, 74 allowance-breakdown, 72 model-day and 76 preview
+differences. The PR remains draft and unmerged.
+
+The reviewed follow-up comparison repair builds an explicitly selected current
+Q1 expectation from immutable, hash-pinned historical inputs and independently
+pinned current metadata. It preserves every historical amount, count, coverage,
+common-plan and model value; validates all additional four-plan and catalog
+fields; and retains exact zero-unexpected and per-date comparisons. Legacy
+comparison behavior and historical fixtures remain unchanged. Mutation coverage
+rejects altered values, provenance, metadata, wire shape and duplicate days.
+All 95 owning checks passed on both Node.js 22.16.0 and 26.2.0. The complete
+15-case edge file passed against PostgreSQL 17.11 in 334.46 seconds with zero
+failures, skips or cancellations, including every route probe and the full S9
+rehearsal. Documentation, all 23 preflight checks and architecture also passed.
+
+The Worker CI prerequisite correction fetches full history while retaining all
+provenance assertions, action pins, permissions and deadlines. Its workflow
+tests passed 23/23, workflow policy verified 25 files, and release trust passed
+87/87 with zero skips. Independent reviews of both repairs are clear.
+
+The SQL boundary diagnostic measured 39.492 seconds of duplicate occurrence
+reads in one 129.587-second local v12 run. The repaired test asserts on the
+original returned values and original refusal codes retained by its existing
+comparison call. It preserves independent base/candidate reads, complete
+occurrence and fingerprint parity, exact 40,000 acceptance and 40,001 refusal,
+the 200-ID batch and the 600-second deadline. No production SQL or fixture was
+changed. Six helper checks cover assertion propagation and normalization edge
+cases. Independent correctness and privacy review cleared the final source;
+the complete two-case boundary file passed against PostgreSQL 17.11 and Node.js
+26.2.0 with zero failures, skips or cancellations: legacy 59.078 seconds, v12
+108.274 seconds, total 167.487 seconds. These local timings do not establish a
+hosted speedup. The final complete local run, final-commit hosted CI, and
+explicit R7 authorization and replacement remain outstanding.
