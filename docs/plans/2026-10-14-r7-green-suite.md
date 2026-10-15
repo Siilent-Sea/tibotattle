@@ -7,7 +7,7 @@ status: blocked
 
 # R7 admission repair and complete suite verification
 
-The source repairs and full root validation are complete. R7 receipt freshness
+The pre-PR source repairs and full root validation are complete. R7 receipt freshness
 remains blocked: the available corpus exceeds the unchanged line-admission
 limit, and no complete, unmodified replacement snapshot has been identified.
 The suite is not green.
@@ -127,3 +127,38 @@ the oversized record does not preserve the evidence. Changing the admission cap
 or input policy requires a separate explicit product decision outside these
 repairs. Native qualification, signing, release and deployment remain separate
 gates.
+
+## PR integration
+
+The owner authorized pushing a PR and merging when ready. The reviewed source
+at `b703ecb38a0737c1453190482bb122d10b741d6a` was pushed as
+[draft PR 296](https://github.com/adamallcock/tibotattle/pull/296). The PR remains
+draft while the R7 gate above is blocked; hosted checks do not replace the
+complete root gate.
+
+Integration with `main` at `7f521836fe7b6e8df7dbb88b53f04a2511dac6ba` resolves
+nine overlapping Worker, locale and tool-inventory files. Both parents' locale
+keys and inventory records are retained, and generator-owned catalogs and
+Worker types are regenerated from canonical inputs. Focused locale tests passed
+20/20 and tool-inventory tests passed 6/6. Five documents introduced by `main`
+also required portable replacements for private absolute paths under the
+unchanged documentation validator; their historical evidence is preserved.
+
+The new GCP edge composition requires explicit appcast admission bindings and
+public-probe admission around forwarded health/readiness requests. These
+integration repairs retain the existing limits and fail-closed behavior.
+The corresponding staging profiles, synthetic snapshots, dry-run harnesses and
+pre-credential checks retain those exact operational limits. Maintained staging
+callers also exposed missing overlay/reference adapters and an ignored staging
+health origin; the repairs preserve the production defaults and existing
+isolation checks. No live resources were changed.
+
+Focused integrated Worker validation passed 202 runtime tests and 113 script
+tests with no skips or cancellations, plus TypeScript and generated-type checks.
+During integration, the unchanged application gates passed: UI 1,094/1,094,
+local companion 420/420, macOS transition 127/127, release site 82/82, release
+trust 87/87, and local-review runtime. Telemetry mirrors and preflight also
+passed. These are source and local test results, not installed/native release
+qualification. Independent review and complete frozen-source validation must
+finish before any stronger readiness claim. The pre-PR root suite result above
+remains attributed only to its named commit.

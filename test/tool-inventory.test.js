@@ -345,6 +345,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // redacted-path guard. The Linux successor helper separates profile-generation
   // proof from process-owned authenticated health. These are tooling boundaries,
   // never product APIs.
+  // Integration also retains the reviewed GCP operation tools.
   assert.equal(result.records, 189);
   assert.equal(result.candidates.length, 188);
   assert.ok(result.aliases >= 25);
