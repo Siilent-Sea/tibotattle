@@ -38,7 +38,8 @@ name: Hosted backend
 # cutover seal check reads pinned commits as git objects; it fails, and never
 # skips, when they are absent. The postgres-17-suite job checks out full history
 # too, because the READ-EXPANSION specs archive their pinned base commit. The
-# Worker gate stays at depth 1. The PostgreSQL-backed part of
+# Worker gate needs full history for the vendor-kernel checks' pinned c766
+# facade and the d43c8f92 ancestry regression. The PostgreSQL-backed part of
 # that command, postgres-production-migrations.spec.mjs and
 # github-distribution-manifest-visibility.spec.mjs, runs in the
 # postgres-17-suite job.
@@ -100,10 +101,12 @@ jobs:
     env:
       WRANGLER_SEND_METRICS: "false"
     steps:
+      # vendor:kernels:check reads the pinned c766 historical facade and
+      # d43c8f92~25; the selected revision alone cannot satisfy these checks.
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Node.js

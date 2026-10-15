@@ -59,13 +59,14 @@ const NODE_PLAN = Object.freeze({
   "cloud-run-check": Object.freeze([TOOLCHAIN_NODE]),
   "postgres-17-suite": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
 });
-// The Worker gate checks out depth 1. The Cloud Run check runs the cutover
+// The Worker gate's vendor-kernel check reads the pinned c766 facade and
+// d43c8f92~25 ancestry regression. The Cloud Run check runs the cutover
 // seal check, which reads pinned commits (the restore-base generator commit
 // and the Cloudflare production line) as git objects and fails as an
 // environment gap without them. The PostgreSQL 17 suite runs the
 // READ-EXPANSION specs, which `git archive` their pinned base commit
-// (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). Both need full history.
-const FETCH_DEPTH = Object.freeze({ "worker-gate": 1, "cloud-run-check": 0, "postgres-17-suite": 0 });
+// (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). All need full history.
+const FETCH_DEPTH = Object.freeze({ "worker-gate": 0, "cloud-run-check": 0, "postgres-17-suite": 0 });
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
@@ -199,6 +200,14 @@ async function loadWorkflow() {
 
 const runs = (job) => job.steps.filter((step) => typeof step.run === "string").map((step) => step.run.trim());
 
+function workerHistoryFailures(workflow) {
+  const checkouts = workflow.jobs["worker-gate"].steps.filter(({ uses }) => uses === CHECKOUT);
+  return checkouts.length === 1
+    && checkouts[0].with?.["fetch-depth"] === 0
+    && checkouts[0].with?.["persist-credentials"] === false
+    ? [] : ["Worker vendor-kernel regressions require full history without persisted credentials"];
+}
+
 function postgresShardFailures(workflow) {
   const failures = [];
   const job = workflow.jobs["postgres-17-suite"];
@@ -294,6 +303,26 @@ test("every job that runs the cutover seal check checks out full history", async
   for (const [id, job] of sealJobs) {
     const checkout = job.steps.find(({ uses: action }) => action === CHECKOUT);
     assert.equal(checkout.with["fetch-depth"], 0, `${id} needs the pinned commit objects the seal check reads`);
+  }
+});
+
+test("the Worker vendor-kernel historical regressions require a complete checkout", async () => {
+  const { workflow } = await loadWorkflow();
+  const worker = JSON.parse(await readFile(join(REPOSITORY_ROOT, "apps/worker/package.json"), "utf8"));
+  const vendorCheck = await readFile(join(REPOSITORY_ROOT, "apps/worker/scripts/vendor-analytics-kernels.check.mjs"), "utf8");
+  assert.ok(worker.scripts.check.split(" && ").includes("npm run vendor:kernels:check"));
+  assert.ok(worker.scripts["vendor:kernels:check"].split(" && ").includes("node ./scripts/vendor-analytics-kernels.check.mjs"));
+  assert.match(vendorCheck, /const HISTORICAL_FACADE_COMMIT = "c766235a0345bf4e3474559a9aee69b4dfb0e34d";/u);
+  assert.ok(vendorCheck.includes('git(["show", `${HISTORICAL_FACADE_COMMIT}:apps/worker/${STABLE_VENDOR_RELATIVE}/${file}`])'));
+  assert.ok(vendorCheck.includes('git(["rev-parse", "--verify", `${COMMIT}~25`])'));
+  assert.deepEqual(workerHistoryFailures(workflow), []);
+  for (const depth of [undefined, 1, 25, "0"]) {
+    const changed = structuredClone(workflow);
+    const checkout = changed.jobs["worker-gate"].steps.find(({ uses }) => uses === CHECKOUT);
+    if (depth === undefined) delete checkout.with["fetch-depth"];
+    else checkout.with["fetch-depth"] = depth;
+    assert.deepEqual(workerHistoryFailures(changed),
+      ["Worker vendor-kernel regressions require full history without persisted credentials"]);
   }
 });
 
