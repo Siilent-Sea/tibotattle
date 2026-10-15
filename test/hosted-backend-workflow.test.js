@@ -82,6 +82,10 @@ const WORKER_PROCESS_PREREQUISITES = Object.freeze({
     "",
   ].join("\n"),
 });
+const WORKER_GRAPH_DIAGNOSTIC = Object.freeze({
+  name: "Diagnose the complete Worker graph file early",
+  run: "node scripts/worker-graph-thread-diagnostic.mjs",
+});
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
 // the PostgreSQL 17 suite. The rest run in the Cloud Run job, one step each.
@@ -253,6 +257,20 @@ function workerProcessPrerequisiteFailures(workflow) {
     && JSON.stringify(prerequisites[0]) === JSON.stringify(WORKER_PROCESS_PREREQUISITES)
     && steps.indexOf(prerequisites[0]) < install && install < gate
     ? [] : ["Worker real cleanup callers require bounded, mandatory process prerequisites before dependencies and tests"];
+}
+
+function workerGraphDiagnosticFailures(workflow) {
+  const steps = workflow.jobs["worker-gate"].steps;
+  const diagnostics = steps.filter(({ name }) => name === WORKER_GRAPH_DIAGNOSTIC.name);
+  const postgres = steps.findIndex(({ run }) => run?.trim() === START_POSTGRES);
+  const site = steps.findIndex(({ run }) => run?.includes("node scripts/build-public-release-site.js"));
+  const gate = steps.findIndex(({ run }) => run?.trim() === WORKER_GATE_RUN);
+  return diagnostics.length === 1
+    && steps.filter(({ run }) => run?.trim() === WORKER_GRAPH_DIAGNOSTIC.run).length === 1
+    && JSON.stringify(diagnostics[0]) === JSON.stringify(WORKER_GRAPH_DIAGNOSTIC)
+    && postgres >= 0 && site > postgres
+    && steps.indexOf(diagnostics[0]) > site && steps.indexOf(diagnostics[0]) < gate
+    ? [] : ["Worker graph diagnostic must be mandatory, after setup and before the unchanged complete gate"];
 }
 
 function postgresShardFailures(workflow) {
@@ -467,6 +485,7 @@ test("three execution jobs run the unchanged Worker and Cloud Run gates and all 
     "test/hosted-backend-workflow.test.js",
     "test/hosted-backend-process-sampler.test.js",
     "test/hosted-backend-resource-sampler.check.mjs",
+    "test/worker-graph-thread-diagnostic.test.js",
     "apps/worker/scripts/migration-numbering.check.mjs",
     "apps/worker/scripts/ci-postgres-suite.check.mjs",
   ].join(" "));
@@ -485,6 +504,27 @@ test("three execution jobs run the unchanged Worker and Cloud Run gates and all 
   assert.match(worker[site], /--output "\$GITHUB_WORKSPACE\/\.release-build\/public-release-site"/u);
   assert.match(worker[site], /--social-image "\$social_card"/u);
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
+});
+
+test("the complete Worker graph diagnostic is additive, mandatory and runs after setup", async () => {
+  const { workflow } = await loadWorkflow();
+  assert.deepEqual(workerGraphDiagnosticFailures(workflow), []);
+  for (const mutate of [
+    (steps, index) => steps.splice(index, 1),
+    (steps, index) => steps.push(structuredClone(steps[index])),
+    (steps, index) => steps.push({ ...steps[index], name: "Duplicate graph diagnostic" }),
+    (steps, index) => steps.push(steps.splice(index, 1)[0]),
+    (steps, index) => steps.unshift(steps.splice(index, 1)[0]),
+    (steps, index) => { steps[index].if = "false"; },
+    (steps, index) => { steps[index]["continue-on-error"] = true; },
+    (steps, index) => { steps[index].run += " || true"; },
+    (steps, index) => { steps[index].run += " --testNamePattern graph"; },
+  ]) {
+    const changed = structuredClone(workflow);
+    const steps = changed.jobs["worker-gate"].steps;
+    mutate(steps, steps.findIndex(({ name }) => name === WORKER_GRAPH_DIAGNOSTIC.name));
+    assert.ok(workerGraphDiagnosticFailures(changed).length > 0);
+  }
 });
 
 test("Worker resource sampling wraps the full gate with two owned samplers and explicit status-preserving cleanup", async () => {

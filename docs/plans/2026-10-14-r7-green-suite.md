@@ -7,12 +7,14 @@ status: in-progress
 
 # R7 admission repair and complete suite verification
 
-The pushed candidate `60e00d9ee` passes the complete local Worker command,
-hosted PostgreSQL and Cloud Run gates, and four auxiliary workflows. Its hosted
-Worker runtime ran all 2,836 tests and failed one graph case at the unchanged
-five-second limit. A reviewed local reader experiment remains uncommitted;
-finer Linux process measurements are being prepared before another hosted run.
-Neither establishes a graph timing repair.
+The last completed hosted candidate, `fd0112d0c`, passed PostgreSQL and Cloud Run gates
+and four auxiliary workflows. Its hosted Worker runtime ran all 2,836 tests
+and failed one graph case at the unchanged five-second limit; later Worker
+stages were not reached. The complete local Worker pass belongs to predecessor
+`60e00d9ee`. Five local experimental files remain preserved and uncommitted.
+A bounded Linux thread diagnostic has passed portable tests and independent
+review; its hosted Linux execution is pending. No graph timing repair is
+established.
 
 The Claude ingestion and repeated-plan validation repairs are reviewed and
 tested. The 15 October R7 attempt passed all six synthetic phases and
@@ -955,3 +957,112 @@ The complete previously failing command passed 38/38 with no skips, failures or
 cancellations; inventory validation passed with 190 records, 189 executable
 paths and 59 aliases. Sampler, production source, checker and workload remain
 unchanged. This repairs tool registration, not the graph timing failure.
+
+At 16:00 UTC on 15 October, the corrected pushed candidate
+`fd0112d0ca0a72af47f9588ad1ab8554147a017a` had passed Cloud Run's complete five
+steps and 1,191 tests across 20 invocations, with zero failures, skips or
+cancellations. Kernel 19 built and database cleanup reported stopped. All four
+auxiliary workflows passed. Release trust passed 209 tests, including the
+repaired 38-test inventory command and every later step; documentation passed
+33 tests and OSV's 27 guard tests plus its scanner succeeded. The Codex offline
+PR check passed. Existing publication-only and live-comparison workflow steps
+remained event-conditionally skipped and are not newly qualified. Worker and
+the complete PostgreSQL aggregate were still pending.
+
+The superseded, cancelled `d94c7f00c` Worker log established partial Linux
+sampler capability: 405 samples over 404.186 seconds, with Node and workerd
+observations and no configured-limit crossings. A final missing-root sample and
+closed unavailable marker preceded the cancellation message; normal exit-trap
+cleanup is unproven by that cancelled job. There were no graph phase records.
+The graph's eleven records contain relative durations, without an absolute
+clock anchor. Buffered log arrival timestamps cannot precisely align them
+with sampler UTC intervals, so these observations do not establish a graph
+phase's CPU or I/O cost, causality, or a performance repair.
+
+At 16:08:55 UTC on 15 October, the same `fd0112d0c` candidate completed all
+four PostgreSQL partitions and the strict aggregate in hosted run `38763813448`.
+The 95 canonical, selected, reported and unique files agree exactly: Vitest
+15 files/107 tests, Node 1 40/262, Node 2 39/333 and edge 1/15, totaling
+717/717 passed tests with no skips, failures, environment gaps, missing files
+or overlaps. Both real boundary cases passed with the unchanged 40,000/40,001
+rows, 200-ID batches and 600-second per-case limits. Their combined file took
+286,170 milliseconds; this is not an individual-case timing. Each partition
+verified PostgreSQL 17.11 and successful stopped cleanup. The coordinator
+independently checked all five complete log hashes, native summaries and the
+strict aggregate result. Worker remains pending; this qualifies PostgreSQL,
+not the full hosted or final local suite, and does not resolve graph timing.
+
+That hosted run completed at 16:45:49 UTC with Worker as its sole failed job.
+Worker ran all 184 runtime files and 2,836 tests: 2,835 passed and the unchanged
+graph case timed out at 5,000 milliseconds. The graph file ran all 36 cases,
+with 35 passes; the target reported 8,365 milliseconds. All eleven diagnostic
+records survived, with all original assertions completing at 7,463 milliseconds
+of body time, 5,110 calls and 7,231 statements. Uploads took 1,915 milliseconds,
+journal proof 1,143, daily preparation 119 and kernels 4,247; kernel quartiles
+were 898/718/1,541/1,090 milliseconds. Summed settled-call time was 6,885
+milliseconds and the largest call 138. There was no additional semantic
+assertion failure. The complete runtime took 2,802.94 seconds; the 55m05s job
+stopped before its unchanged 60-minute limit. Workflow checks 101/101, early
+process checks 39/39 and pre-runtime checks 1,311/1,311 passed without skips.
+Later Node, vendor, analytics, fastpath, production-shape and dry-run/staging
+stages were not reached. PostgreSQL cleanup succeeded. No retry was started.
+
+The new sampler emitted 3,232 valid samples over 3,232.759 seconds through the
+failed step, with no unavailable, root-loss, configured-limit or counter-regression
+records. Metadata gaps remained explicit: 28 missing, one unreadable and eleven
+malformed observations across 26 samples. Workerd had matched CPU/I/O observations
+in 2,660 samples and Node in 3,231; these are partial lifetime measurements, not
+complete process totals. Maximum record size was 1,787 bytes and observed scan
+duration 39.337 milliseconds. No cancellation or runner orphan termination was
+logged. This supports observation through the normal failure path, but individual
+sampler exit statuses and successful reaps were not explicitly recorded.
+
+Aggregate sampling produced 107 complete 30-second intervals, excluding the
+initial since-boot report and leaving the final approximately 23 seconds without
+a closing interval. There was no swap or stolen CPU; interval means were 71.35%
+idle and 10.65% I/O wait, with 6.85–8.84 GiB free memory. These host-wide
+observations and matched process counters establish no graph-phase cause or
+diagnostic overhead. Relative graph records still cannot be precisely aligned
+to the sampler's clock. Production source, every workload and all limits remain
+unchanged; the five local experiments remain preserved and uncommitted.
+
+A separate read-only review rejected conditional single-statement checkpoint
+consolidation. Lazy branch execution does not prevent preparation from resolving
+later tables or columns, so a missing later relation can preempt the required
+first-proof refusal. Blanket error translation or a later proof reread would
+also change the contract. Theoretical call reductions are not admissible savings;
+no implementation or test run followed. Existing negative fault injectors would
+need to target any future query shape explicitly to avoid a vacuous pass.
+
+The next diagnostic is a bounded Linux ancestor launcher for the complete,
+unchanged 36-case graph file. It retains the five-second test timeout and
+observes only owned thread CPU, runnable delay and closed syscall/state categories
+at a target 250-millisecond cadence, with a separate 240-second command cap.
+Access denials, disabled counters and identity races remain unavailable evidence.
+Sampled occupancy cannot prove exact wait duration or SQLite attribution.
+The existing later complete Worker gate remains mandatory; failure in the early
+diagnostic prevents that later gate from running and cannot qualify it.
+
+On 15 October, separate source, workflow and inventory owners completed this
+implementation, with independent review of each boundary. Portable launcher
+checks passed 32/32, including the production orchestration paths for success,
+interruption, command cap, established child failure, unadmitted identity,
+readiness failure and supervisor reparenting. Review found and corrected
+cleanup-induced status replacement, stale promise-race side effects and initial
+identity admission before publication. Cleanup evidence is deliberately limited
+to verified owned-group signaling and direct-supervisor reap; it does not prove
+independent disappearance of every descendant. No debugger attachment, system
+configuration change or privilege is introduced.
+
+The coordinator's complete mandatory workflow command passed 134/134, release
+trust passed 87/87, and documentation/preflight passed 23/23, with no failures,
+skips or cancellations. Workflow policy verified 25 files and architecture
+boundaries passed. The full historical qualification/inventory command passed
+38/38; inventory reports 191 records, 190 executable paths and 59 aliases. The
+only prior-record change is the actual new sampler importer; all other historical
+fields and checker rules remain unchanged. The reviewed launcher source hash is
+`0f9728fd97d8b3605ab44caf42411e2d5d8f1d95a91f7f5437c37d04bd3908a8`.
+The graph source and all five preserved experiments remain unchanged. These
+checks qualify portable synthetic behavior and source wiring only. Linux procfs
+execution, the complete 36-case diagnostic, observer overhead, final-candidate
+gates and a graph timing repair remain unqualified.

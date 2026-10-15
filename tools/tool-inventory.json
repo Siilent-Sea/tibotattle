@@ -1661,6 +1661,7 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/hosted-backend.yml",
+        "scripts/worker-graph-thread-diagnostic.mjs",
         "test/hosted-backend-process-sampler.test.js"
       ],
       "decision": "retain_as_internal_ci_diagnostic",
@@ -3431,6 +3432,22 @@
       "decision": "retain_as_explicit_postbuild_linux_qualification_preparation",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/worker-graph-thread-diagnostic.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Internal Linux CI launcher for the fixed Worker graph diagnostic; not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/hosted-backend.yml",
+        "test/worker-graph-thread-diagnostic.test.js"
+      ],
+      "decision": "retain_as_internal_ci_diagnostic",
+      "provenance": null,
+      "provenanceReason": "The fixed launcher runs the complete graph test file and emits bounded content-free aggregates from its owned descendant threads. Its maintained contracts are the hosted workflow and focused launcher tests; these observations do not establish performance causality or release readiness.",
       "legacyPaths": []
     }
   ]

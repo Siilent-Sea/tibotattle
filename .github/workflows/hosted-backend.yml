@@ -152,7 +152,7 @@ jobs:
         run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
 
       - name: Check this workflow's contract, migration numbering and PostgreSQL suite routing
-        run: node --test test/hosted-backend-workflow.test.js test/hosted-backend-process-sampler.test.js test/hosted-backend-resource-sampler.check.mjs apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
+        run: node --test test/hosted-backend-workflow.test.js test/hosted-backend-process-sampler.test.js test/hosted-backend-resource-sampler.check.mjs test/worker-graph-thread-diagnostic.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
 
       - name: Check Linux process and measurement tooling early
         run: npm --prefix apps/worker run gcp:fastpath:prod-shape:check
@@ -196,6 +196,12 @@ jobs:
             --security-url https://tibotattle.com/docs.html \
             --support-url https://tibotattle.com/docs.html \
             --social-image "$social_card" > /dev/null
+
+      # Run the unchanged complete graph file before the longer gate. The
+      # launcher's fixed 240s cap does not alter any test timeout. This diagnostic
+      # must succeed, and never substitutes for the complete Worker gate below.
+      - name: Diagnose the complete Worker graph file early
+        run: node scripts/worker-graph-thread-diagnostic.mjs
 
       - name: Run the Worker gate
         # The first vmstat report is since boot; subsequent reports cover 30s.
