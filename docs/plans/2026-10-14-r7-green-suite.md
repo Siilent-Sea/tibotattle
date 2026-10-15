@@ -7,12 +7,14 @@ status: in-progress
 
 # R7 admission repair and complete suite verification
 
-The pre-PR source repairs and full root validation are complete. The integrated
-candidate's two Claude ingestion failures have reviewed source repairs; R7
-receipt freshness and a complete final suite remain pending. No resource limit
-or test assertion was relaxed. An inherited exporter policy may change the earlier raw-input
-blocker, but no successful admission or fresh matrix is established yet. The
-suite is not green.
+The integrated candidate's two Claude ingestion failures have reviewed and
+tested source repairs. The 15 October R7 attempt passed all six synthetic phases
+and complete-corpus admission, then failed the unchanged elapsed-resource limit.
+All ten original receipts were preserved. A concrete repeated-plan validation
+defect and inherited backend failures now have reviewed, focused-test-passing
+repairs; R7 receipt freshness,
+the full local umbrella gate and final-commit hosted CI remain pending. No
+resource limit or test assertion was relaxed. The suite is not green.
 
 The owner requested resolution of the remaining R7 blockers and a complete
 green root suite without weakening checks. Work starts from clean
@@ -21,8 +23,9 @@ green root suite without weakening checks. Work starts from clean
 
 Acceptance requires a diagnosed, regression-tested correction where a source
 defect exists, independent review, complete protected regeneration of all ten
-receipts on frozen source, passing freshness checks, and a completed `pnpm test`
-run with no failures or cancellations. Existing platform qualification skips
+receipts on frozen source, passing freshness checks, a completed `pnpm run check`
+with no failures or cancellations, and passing hosted CI on the final commit.
+Existing platform qualification skips
 remain explicit; no new skip, relaxed assertion, increased admission limit or
 timeout, partial receipt reuse, or private-input alteration is permitted.
 
@@ -32,15 +35,16 @@ timeout, partial receipt reuse, or private-input alteration is permitted.
 | Admission contract reviewer | Independently trace discovery, line admission, interval filtering, source frontiers and integrity contracts | Existing limit refusal confirmed; strengthening correction specified |
 | Benchmark cancellation owner | Propagate cancellation to the owned child without changing workload, timeout or assertions | Implemented in `9b4bb3d5733151efe62f68b713c306ed7f479312`; independent review and 121 focused checks passed |
 | Snapshot investigator | Inspect documented artifacts and bounded local metadata for an existing complete, unmodified corpus snapshot | No candidate found in the documented locations checked |
-| Coordinator | Integrate reviewed fixes, freeze source, supervise authorized validation and record exact outcomes | Integrated root run complete; new source repairs and admission readiness in progress |
+| Coordinator | Integrate reviewed fixes, freeze source, supervise authorized validation and record exact outcomes | Focused repairs reviewed and tested; protected regeneration and final gates pending |
 
 The authorized private-history operation remains local and follows the
 [R7 maintenance runbook](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md).
 Only content-free diagnostic classifications may leave the reader. Private
 history, paths, filenames, identifiers and record contents must not enter
 reports, fixtures, logs or external services. The retained interval and both
-hash-pinned runtimes remain unchanged. Signing, deployment and publication are
-outside this request.
+hash-pinned runtimes remain unchanged. The owner authorized pushing the branch,
+updating the PR and merging when ready. Signing, release publication and
+deployment remain separate operations.
 
 The previous refresh failed before source-plan freeze with
 `operation=create source=claude_transcript reason=export_resource_line_bytes`.
@@ -242,3 +246,73 @@ absence of transaction artifacts were reverified. The next step is one complete
 protected regeneration attempt after committing and freezing these repairs.
 This is justified by the reviewed inherited reader policy and its new escaped-key
 correction, not by a changed cap, interval, selected corpus or receipt hash.
+
+
+## Protected attempt and remaining integration work — 15 October 2026
+
+The complete protected attempt at
+`ea57471257ab9b3c5b9ba5e1ac2f3419200736d6` held the workload source closure
+unchanged throughout execution.
+All six synthetic phases passed. The complete shared source plan froze
+successfully, clearing the earlier line-admission blocker under the reviewed
+reader policy. The history lifecycle subsequently failed with
+`export_resource_elapsed_time`; its existing cumulative active-operation budget
+is 600,000 ms. The failure did not identify the operation, runtime or pass, so
+no exact attribution is claimed. All ten original receipts remained
+byte-identical with owner-only permissions, and no transaction or cleanup
+artifacts remained. No partial receipt was installed and no input was changed.
+
+Static investigation found that Claude bundle verification revalidated the full
+plan for every source, causing quadratic metadata work. The scoped repair uses
+one complete validation followed by source-specific verification, retaining
+source identities, frozen-prefix hashes, interval checks and caller-mutation
+refusal. This is a concrete performance defect and a plausible contributor to
+the elapsed failure, not a measured causal conclusion. Independent security and performance reviews are clear. All 29 owning tests
+pass on each pinned runtime, including full-plan integrity, later-source prefix
+corruption, nested caller mutation, linear metadata scaling and source counters. A separate
+reviewed diagnostic change preserves only closed operation/runtime/pass labels
+alongside the sanitized failure code; all eight owning tests pass on each
+pinned runtime. Neither change alters limits, accounting or receipt admission.
+
+Hosted run `38677723777` at `10ed81fb6` passed Cloud Run. Worker completed
+2,835 tests with 2,833 passes and two failures caused by existing five-second
+case limits; PostgreSQL repeated eight inherited assertion failures and reached
+its unchanged 45-minute job limit. Reviewed candidate repairs restore current
+projection identities, distinguish classification-proof reads from usage-fact
+probes, complete the exact migration inventory, and execute the blob-verified
+historical oracle independently from current code. Historical pricing parity and separate current-pricing coverage now pass
+against disposable PostgreSQL 17.11. Worker fixture setup is
+batched or split into independent cases while retaining every original
+assertion and five-second limit.
+
+PostgreSQL CI is being partitioned into four closed, disjoint parts of the same
+95-file canonical plan. Each retains the 45-minute limit, serial file execution
+and strict missing/duplicate/skipped-result refusal. A final aggregate requires
+all four parts to succeed; no runner or test is removed. All 73 scoped runner/workflow tests and all 87 release-trust tests pass on
+Node.js 26.2.0, with zero skips or cancellations; policy validation covers 25
+workflow files. Backend runtime validation, the complete final `pnpm run check`,
+and final-commit hosted CI must all pass before the authorized merge of PR #296.
+
+
+The repaired projection paths passed all 35 tests across the three owning files
+against disposable PostgreSQL 17.11, with zero skips; Worker TypeScript also
+passed. The three Worker timeout cases passed individually in 2,064 ms, 860 ms
+and 1,223 ms under their unchanged 5,000 ms default; the full umbrella remains
+responsible for unfiltered coverage. Historical-oracle provenance passed against
+the actual pinned source. Its first v0.1 comparison reproduced a difference in
+pricing method, registry version and registry digest, while contribution costs
+matched. The narrow, explicitly historical test composition passed every original
+full-row comparison, including usage records. Separate complete current-pricing,
+persisted-provenance, replay and retired-route checks also passed. No historical
+assertion or production pricing behavior was discarded.
+
+
+The complete occurrence file passed 20/20 tests, including family-first bounds,
+40,000-plus-one refusal, rollback, cancellation and index negative controls.
+Both complete historical-oracle and migration-inventory files passed 37/37
+with zero skips or cancellations. The four CI partitions, projection repair,
+fixture changes, occurrence probe repair, historical oracle and R7 source
+changes have independent review and publication-privacy clearance. Documentation,
+all 23 preflight checks and architecture also pass. The disposable database was
+stopped after validation. The next gate is one complete protected R7 attempt on
+the frozen candidate; its success is not presumed from these focused results.
