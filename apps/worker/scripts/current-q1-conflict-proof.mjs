@@ -2,15 +2,20 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { canonicalTelemetryV11Json, parseTelemetryV11Record } from "@app-usagemonitor/telemetry-contract";
 
-export const CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA = "current-q1-effective-history-guard-origin-v1";
+export const CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA = "current-q1-effective-history-guard-origin-v2";
 export const CURRENT_Q1_CONFLICT_PAGE_SCHEMA = "current-q1-effective-conflict-page-proof-v1";
 export const CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256 = "347f7674f3473ee7991aeecc83657c69e0506e0ddbe057b6f7ce48f39784b6d7";
+export const CURRENT_Q1_QUOTA_ANALYSIS_SOURCE_SHA256 = "c8f938dbe1448c9757e74ab3d03102404a410799674f4df63d81509d9804abca";
 export const CURRENT_Q1_EFFECTIVE_HISTORY_GUARD_LABEL = "effective_history_guard_544";
 
 const SOURCE_MODULE_PATH = fileURLToPath(new URL("../src/storage-effective-history.ts", import.meta.url));
+const QUOTA_ANALYSIS_MODULE_PATH = fileURLToPath(new URL("../src/quota-analysis-v11.ts", import.meta.url));
 const SOURCE_ERROR_MESSAGE = "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE";
 const EFFECTIVE_TELEMETRY_METHOD = "effective-telemetry-owner-day-v1";
 const MAX_STACK_CHARS = 65_536;
+const MAX_GUARD_STACK_FRAMES = 12;
+const MAX_FRAME_PATH_CHARS = 4_096;
+const MAX_FRAME_COORDINATE = 1_000_000;
 const MAX_PAGE_ROWS = 200;
 const MAX_PAGE_BYTES = 4 * 1024 * 1024;
 const MAX_RECORD_BYTES = 1_250_000;
@@ -166,7 +171,8 @@ function validSourceProvenance(row) {
 }
 
 function parseV8Frame(frame) {
-  if (!frame.startsWith("    at ")) return null;
+  if (typeof frame !== "string" || frame.length > MAX_FRAME_PATH_CHARS + 512
+      || /[\0\r\n]/u.test(frame) || !frame.startsWith("    at ")) return null;
   const body = frame.slice(7);
   const opening = body.lastIndexOf(" (");
   let location = body;
@@ -175,11 +181,30 @@ function parseV8Frame(frame) {
     location = body.slice(opening + 2, -1);
   }
   const match = /^(.*):([1-9][0-9]*):([1-9][0-9]*)$/u.exec(location);
-  if (!match || match[1] !== SOURCE_MODULE_PATH) return null;
+  if (!match || match[1].length < 1 || match[1].length > MAX_FRAME_PATH_CHARS
+      || /[\0\r\n]/u.test(match[1])) return null;
   const line = Number(match[2]);
   const column = Number(match[3]);
-  if (!Number.isSafeInteger(line) || !Number.isSafeInteger(column)) return null;
-  return { line, column };
+  if (!Number.isSafeInteger(line) || !Number.isSafeInteger(column)
+      || line > MAX_FRAME_COORDINATE || column > MAX_FRAME_COORDINATE) return null;
+  return { modulePath: match[1], line, column };
+}
+
+function sourceMapContentMatches(server, modulePath, expectedHash) {
+  const map = server.environments?.ssr?.moduleGraph?.getModuleById(modulePath)?.transformResult?.map;
+  return Array.isArray(map?.sourcesContent) && map.sourcesContent.length === 1
+    && typeof map.sourcesContent[0] === "string"
+    && Buffer.byteLength(map.sourcesContent[0], "utf8") <= 262_144
+    && sha256(map.sourcesContent[0]) === expectedHash;
+}
+
+function isCallerFrame(frame) {
+  const parsed = parseV8Frame(frame);
+  if (!parsed || parsed.modulePath === SOURCE_MODULE_PATH
+      || parsed.modulePath === QUOTA_ANALYSIS_MODULE_PATH) return false;
+  // Callers are context only. Require a bounded absolute V8 location or a
+  // Node internal frame, but never include that location in the origin proof.
+  return parsed.modulePath.startsWith("/") || parsed.modulePath.startsWith("node:internal/");
 }
 
 function parseCanonicalUsage(row, page, budget) {
@@ -272,28 +297,72 @@ function validPage(page, association) {
   return { pageSha256: sha256(pageJson), rowCount: page.rows.length, compatibleCount, conflictCount };
 }
 
-/** Prove only the pinned current-source guard's closed origin label and digests. */
+/** Prove the exact pinned guard-origin chain; caller frames remain bounded context. */
 export function observeCurrentQ1EffectiveHistoryGuard(error, server) {
   try {
     if (error?.message !== SOURCE_ERROR_MESSAGE || typeof server?.ssrFixStacktrace !== "function"
-        || server.config?.future?.removeSsrLoadModule === "warn") return null;
-    const module = server.environments?.ssr?.moduleGraph?.getModuleById(SOURCE_MODULE_PATH);
-    const map = module?.transformResult?.map;
-    if (!Array.isArray(map?.sourcesContent) || map.sourcesContent.length !== 1
-        || typeof map.sourcesContent[0] !== "string"
-        || Buffer.byteLength(map.sourcesContent[0], "utf8") > 262_144
-        || sha256(map.sourcesContent[0]) !== CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256) return null;
+        || server.config?.future?.removeSsrLoadModule === "warn"
+        || !sourceMapContentMatches(server, SOURCE_MODULE_PATH, CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256)) return null;
     if (typeof error.stack !== "string" || error.stack.length > MAX_STACK_CHARS) return null;
     const holder = new Error(SOURCE_ERROR_MESSAGE);
     holder.stack = error.stack;
     server.ssrFixStacktrace(holder);
     if (typeof holder.stack !== "string" || holder.stack.length > MAX_STACK_CHARS) return null;
     const lines = holder.stack.split("\n");
-    if (lines.length !== 3 || lines[0] !== `Error: ${SOURCE_ERROR_MESSAGE}`) return null;
-    const positions = lines.slice(1).map(parseV8Frame);
-    if (positions.some((position) => position === null)) return null;
-    if (positions[0]?.line !== 26 || positions[1]?.line !== 544) return null;
-    const originProofSha256 = sha256(`${CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA}\n${CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256}\n26:${positions[0].column}\n544:${positions[1].column}`);
+    if (lines[0] !== `Error: ${SOURCE_ERROR_MESSAGE}`) return null;
+
+    // Retain the existing closed two-frame form for current pure callers. It
+    // accepts no caller tail, so an added frame cannot silently widen it.
+    if (lines.length === 3) {
+      const positions = lines.slice(1).map(parseV8Frame);
+      if (positions.some((position) => position === null)
+          || positions[0].modulePath !== SOURCE_MODULE_PATH || positions[1].modulePath !== SOURCE_MODULE_PATH
+          || positions[0].line !== 26 || positions[1].line !== 544) return null;
+      const originProofSha256 = sha256([
+        CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA,
+        "legacy-two-frame",
+        CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256,
+        `1:26:${positions[0].column}`,
+        `1:544:${positions[1].column}`,
+      ].join("\n"));
+      return Object.freeze({
+        schemaVersion: CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA,
+        guardLabel: CURRENT_Q1_EFFECTIVE_HISTORY_GUARD_LABEL,
+        sourceContentSha256: CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256,
+        originProofSha256,
+      });
+    }
+
+    const frames = lines.slice(1);
+    if (frames.length < 7 || frames.length > MAX_GUARD_STACK_FRAMES) return null;
+    const [factoryFrame, guardFrame, arrayMapFrame, mapSetupFrame, quotaReducerFrame, finishFrame, ...callerFrames] = frames;
+    if (arrayMapFrame !== "    at Array.map (<anonymous>)" || callerFrames.length < 1
+        || callerFrames.some((frame) => !isCallerFrame(frame))) return null;
+    const [factory, guard, mapSetup, quotaReducer, finish] = [
+      factoryFrame, guardFrame, mapSetupFrame, quotaReducerFrame, finishFrame,
+    ].map(parseV8Frame);
+    if ([factory, guard, mapSetup, quotaReducer, finish].some((position) => position === null)
+        || factory.modulePath !== SOURCE_MODULE_PATH || factory.line !== 26
+        || guard.modulePath !== SOURCE_MODULE_PATH || guard.line !== 544
+        || mapSetup.modulePath !== SOURCE_MODULE_PATH || mapSetup.line !== 543
+        || quotaReducer.modulePath !== QUOTA_ANALYSIS_MODULE_PATH || quotaReducer.line !== 1447
+        || finish.modulePath !== SOURCE_MODULE_PATH || finish.line !== 555
+        || !sourceMapContentMatches(server, QUOTA_ANALYSIS_MODULE_PATH, CURRENT_Q1_QUOTA_ANALYSIS_SOURCE_SHA256)) return null;
+
+    // Only these six ordered frames establish origin. Bounded callers are
+    // validated above, excluded from the digest, and never exposed as proof.
+    const originProofSha256 = sha256([
+      CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA,
+      "real-vite-origin-chain-v1",
+      CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256,
+      CURRENT_Q1_QUOTA_ANALYSIS_SOURCE_SHA256,
+      `1:26:${factory.column}`,
+      `1:544:${guard.column}`,
+      "array-map",
+      `1:543:${mapSetup.column}`,
+      `2:1447:${quotaReducer.column}`,
+      `1:555:${finish.column}`,
+    ].join("\n"));
     return Object.freeze({
       schemaVersion: CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA,
       guardLabel: CURRENT_Q1_EFFECTIVE_HISTORY_GUARD_LABEL,

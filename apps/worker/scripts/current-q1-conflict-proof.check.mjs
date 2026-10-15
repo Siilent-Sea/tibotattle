@@ -9,6 +9,7 @@ import {
   CURRENT_Q1_CONFLICT_PAGE_SCHEMA,
   CURRENT_Q1_EFFECTIVE_HISTORY_GUARD_LABEL,
   CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256,
+  CURRENT_Q1_QUOTA_ANALYSIS_SOURCE_SHA256,
   observeCurrentQ1EffectiveHistoryGuard,
   validateCurrentQ1ConflictPageProof,
 } from "./current-q1-conflict-proof.mjs";
@@ -19,6 +20,9 @@ let sourceBytes;
 try { sourceBytes = readFileSync(sourcePath); } catch { sourceBytes = null; }
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const sourcePathForFrames = fileURLToPath(new URL("../src/storage-effective-history.ts", import.meta.url));
+const quotaSourcePathForFrames = fileURLToPath(new URL("../src/quota-analysis-v11.ts", import.meta.url));
+let quotaSourceBytes;
+try { quotaSourceBytes = readFileSync(quotaSourcePathForFrames); } catch { quotaSourceBytes = null; }
 
 function guardStack({ factoryLine = 26, guardLine = 544, factoryPath = sourcePathForFrames,
   guardPath = sourcePathForFrames, guardNamed = false, extra = [] } = {}) {
@@ -30,13 +34,37 @@ function guardStack({ factoryLine = 26, guardLine = 544, factoryPath = sourcePat
   ].join("\n");
 }
 
-function guardServer(content = sourceBytes?.toString("utf8"), fix = () => {}) {
-  const calls = { moduleId: null, stacktraceCalls: 0 };
+function realGuardStack({ factoryPath = sourcePathForFrames, factoryLine = 26,
+  guardPath = sourcePathForFrames, guardLine = 544, mapSetupPath = sourcePathForFrames,
+  mapSetupLine = 543, quotaPath = quotaSourcePathForFrames, quotaLine = 1447,
+  finishPath = sourcePathForFrames, finishLine = 555,
+  callerFrames = ["    at /synthetic/caller.mjs:1:1"] } = {}) {
+  return [
+    "Error: STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+    `    at fail (${factoryPath}:${factoryLine}:20)`,
+    `    at ${guardPath}:${guardLine}:89`,
+    "    at Array.map (<anonymous>)",
+    `    at ${mapSetupPath}:${mapSetupLine}:39`,
+    `    at ${quotaPath}:${quotaLine}:58`,
+    `    at ${finishPath}:${finishLine}:15`,
+    ...callerFrames,
+  ].join("\n");
+}
+
+function guardServer(content = sourceBytes?.toString("utf8"), fix = () => {}, quotaContent = quotaSourceBytes?.toString("utf8")) {
+  const calls = { moduleId: null, moduleIds: [], stacktraceCalls: 0 };
   const server = {
     config: { future: {} },
     environments: { ssr: { moduleGraph: { getModuleById(id) {
       calls.moduleId = id;
-      return { transformResult: { map: { sources: ["storage-effective-history.ts"], sourcesContent: [content] } } };
+      calls.moduleIds.push(id);
+      if (id === sourcePathForFrames) {
+        return { transformResult: { map: { sources: ["storage-effective-history.ts"], sourcesContent: [content] } } };
+      }
+      if (id === quotaSourcePathForFrames) {
+        return { transformResult: { map: { sources: ["quota-analysis-v11.ts"], sourcesContent: [quotaContent] } } };
+      }
+      return null;
     } } } },
     ssrFixStacktrace(holder) { calls.stacktraceCalls += 1; fix(holder); },
   };
@@ -158,9 +186,10 @@ test("guard origin proof exposes only the exact pinned label and digests", () =>
   error.stack = guardStack();
   const proof = observeCurrentQ1EffectiveHistoryGuard(error, server);
   assert.equal(calls.moduleId, sourcePathForFrames);
+  assert.deepEqual(calls.moduleIds, [sourcePathForFrames]);
   assert.equal(calls.stacktraceCalls, 1);
   assert.deepEqual(proof, {
-    schemaVersion: CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA,
+    schemaVersion: "current-q1-effective-history-guard-origin-v2",
     guardLabel: CURRENT_Q1_EFFECTIVE_HISTORY_GUARD_LABEL,
     sourceContentSha256: CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256,
     originProofSha256: proof.originProofSha256,
@@ -173,10 +202,42 @@ test("guard origin proof exposes only the exact pinned label and digests", () =>
   assert.ok(observeCurrentQ1EffectiveHistoryGuard(named, guardServer(sourceBytes.toString("utf8")).server));
 });
 
+test("the observed Vite-mapped guard chain proves only its pinned origin and excludes callers", () => {
+  assert.ok(sourceBytes, "canonical source fixture unavailable");
+  assert.ok(quotaSourceBytes, "quota reducer source fixture unavailable");
+  assert.equal(sha256(sourceBytes), CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256);
+  assert.equal(sha256(quotaSourceBytes), CURRENT_Q1_QUOTA_ANALYSIS_SOURCE_SHA256);
+  const { server, calls } = guardServer(sourceBytes.toString("utf8"));
+  const error = new Error("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  error.stack = realGuardStack();
+  const proof = observeCurrentQ1EffectiveHistoryGuard(error, server);
+  assert.ok(proof);
+  assert.equal(calls.stacktraceCalls, 1);
+  assert.deepEqual(calls.moduleIds, [sourcePathForFrames, quotaSourcePathForFrames]);
+  assert.deepEqual({ ...proof, originProofSha256: "sha256" }, {
+    schemaVersion: CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA,
+    guardLabel: CURRENT_Q1_EFFECTIVE_HISTORY_GUARD_LABEL,
+    sourceContentSha256: CURRENT_Q1_EFFECTIVE_HISTORY_SOURCE_SHA256,
+    originProofSha256: "sha256",
+  });
+  assert.match(proof.originProofSha256, /^[a-f0-9]{64}$/u);
+  assert.equal(proof.schemaVersion, "current-q1-effective-history-guard-origin-v2");
+  const anotherCaller = new Error("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  anotherCaller.stack = realGuardStack({ callerFrames: ["    at /synthetic/other-caller.mjs:9:2"] });
+  assert.equal(observeCurrentQ1EffectiveHistoryGuard(anotherCaller,
+    guardServer(sourceBytes.toString("utf8")).server).originProofSha256, proof.originProofSha256);
+  const internalCaller = new Error("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  internalCaller.stack = realGuardStack({ callerFrames: ["    at node:internal/process/task_queues:95:5"] });
+  assert.equal(observeCurrentQ1EffectiveHistoryGuard(internalCaller,
+    guardServer(sourceBytes.toString("utf8")).server).originProofSha256, proof.originProofSha256);
+  assert.equal(JSON.stringify(proof).includes(sourcePathForFrames), false);
+  assert.equal(JSON.stringify(proof).includes(quotaSourcePathForFrames), false);
+});
+
 test("guard origin rejects a wrong map, foreign path, wrong factory, intervening frame, or trailing frame", () => {
   assert.ok(sourceBytes, "canonical source fixture unavailable");
-  const reject = (stack, content = sourceBytes) => {
-    const { server } = guardServer(content);
+  const reject = (stack, content = sourceBytes, quotaContent = quotaSourceBytes?.toString("utf8")) => {
+    const { server } = guardServer(content?.toString("utf8"), () => {}, quotaContent);
     const error = new Error("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
     error.stack = stack;
     return observeCurrentQ1EffectiveHistoryGuard(error, server);
@@ -188,6 +249,30 @@ test("guard origin rejects a wrong map, foreign path, wrong factory, intervening
   assert.equal(reject(guardStack({ extra: [`    at intervening (${sourcePathForFrames}:100:2)`] })), null);
   assert.equal(reject(`${guardStack()}\n    at trailing (${sourcePathForFrames}:545:2)`), null);
   assert.equal(reject("x".repeat(65_537)), null);
+  assert.equal(reject(realGuardStack({ factoryPath: `${sourcePathForFrames}.foreign` })), null);
+  assert.equal(reject(realGuardStack({ quotaPath: `${quotaSourcePathForFrames}.foreign` })), null);
+  assert.equal(reject(realGuardStack({ factoryLine: 27 })), null);
+  assert.equal(reject(realGuardStack({ guardLine: 545 })), null);
+  assert.equal(reject(realGuardStack({ mapSetupLine: 544 })), null);
+  assert.equal(reject(realGuardStack().replace("Array.map (<anonymous>)", "Array.filter (<anonymous>)")), null);
+  assert.equal(reject(realGuardStack({ quotaLine: 1448 })), null);
+  assert.equal(reject(realGuardStack({ finishLine: 554 })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: [] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: ["malformed caller frame"] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at ${sourcePathForFrames}:541:2`] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at ${quotaSourcePathForFrames}:1448:2`] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: Array.from({ length: 7 }, (_, index) => `    at /synthetic/caller-${index}.mjs:1:1`) })), null);
+  const extraOriginPrefix = realGuardStack().replace("Error: STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE\n",
+    `Error: STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE\n    at ${sourcePathForFrames}:27:1\n`);
+  assert.equal(reject(extraOriginPrefix), null);
+  const intervening = realGuardStack().replace(`    at ${sourcePathForFrames}:544:89\n`,
+    `    at ${sourcePathForFrames}:100:2\n    at ${sourcePathForFrames}:544:89\n`);
+  assert.equal(reject(intervening), null);
+  const wrongOrder = realGuardStack().replace(
+    `    at ${sourcePathForFrames}:543:39\n    at ${quotaSourcePathForFrames}:1447:58\n`,
+    `    at ${quotaSourcePathForFrames}:1447:58\n    at ${sourcePathForFrames}:543:39\n`);
+  assert.equal(reject(wrongOrder), null);
+  assert.equal(reject(realGuardStack(), sourceBytes, `${quotaSourceBytes?.toString("utf8")}\n`), null);
   const generic = new Error("unknown failure");
   assert.equal(observeCurrentQ1EffectiveHistoryGuard(generic, guardServer().server), null);
 });
