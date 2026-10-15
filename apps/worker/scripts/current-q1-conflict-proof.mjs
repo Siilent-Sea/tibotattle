@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalTelemetryV11Json, parseTelemetryV11Record } from "@app-usagemonitor/telemetry-contract";
 
 export const CURRENT_Q1_CONFLICT_ORIGIN_SCHEMA = "current-q1-effective-history-guard-origin-v2";
@@ -21,6 +22,7 @@ const MAX_PAGE_BYTES = 4 * 1024 * 1024;
 const MAX_RECORD_BYTES = 1_250_000;
 const MAX_SOURCE_KEYS = 256;
 const HASH = /^[a-f0-9]{64}$/u;
+const FRAME_CONTROL_CHARS = /[\u0000-\u001f\u007f]/u;
 const DAY = /^\d{4}-\d{2}-\d{2}$/u;
 const TOKEN = /^[A-Za-z0-9._:-]{1,256}$/u;
 const ROW_KEYS = Object.freeze([
@@ -172,17 +174,20 @@ function validSourceProvenance(row) {
 
 function parseV8Frame(frame) {
   if (typeof frame !== "string" || frame.length > MAX_FRAME_PATH_CHARS + 512
-      || /[\0\r\n]/u.test(frame) || !frame.startsWith("    at ")) return null;
+      || FRAME_CONTROL_CHARS.test(frame) || !frame.startsWith("    at ")) return null;
   const body = frame.slice(7);
   const opening = body.lastIndexOf(" (");
   let location = body;
   if (opening >= 0) {
     if (!body.endsWith(")") || /[()\r\n]/u.test(body.slice(0, opening))) return null;
     location = body.slice(opening + 2, -1);
+  } else if (location.startsWith("async ")) {
+    // V8 emits bare async file locations without a function-name wrapper.
+    location = location.slice("async ".length);
   }
   const match = /^(.*):([1-9][0-9]*):([1-9][0-9]*)$/u.exec(location);
   if (!match || match[1].length < 1 || match[1].length > MAX_FRAME_PATH_CHARS
-      || /[\0\r\n]/u.test(match[1])) return null;
+      || FRAME_CONTROL_CHARS.test(match[1])) return null;
   const line = Number(match[2]);
   const column = Number(match[3]);
   if (!Number.isSafeInteger(line) || !Number.isSafeInteger(column)
@@ -198,13 +203,40 @@ function sourceMapContentMatches(server, modulePath, expectedHash) {
     && sha256(map.sourcesContent[0]) === expectedHash;
 }
 
+function canonicalCallerPath(modulePath) {
+  if (modulePath.startsWith("node:internal/")) return modulePath;
+  let callerPath;
+  if (modulePath.startsWith("/")) {
+    callerPath = modulePath;
+  } else if (modulePath.startsWith("file://")) {
+    try {
+      const url = new URL(modulePath);
+      if (url.protocol !== "file:" || url.host !== "" || url.username !== "" || url.password !== ""
+          || url.search !== "" || url.hash !== "") return null;
+      callerPath = fileURLToPath(url);
+      // Accept only the canonical local file URL spelling. This rejects URL
+      // aliases such as dot segments, encoded separators, and remote hosts.
+      if (pathToFileURL(callerPath).href !== modulePath) return null;
+    } catch {
+      return null;
+    }
+  } else {
+    return null;
+  }
+
+  if (callerPath.length < 1 || callerPath.length > MAX_FRAME_PATH_CHARS
+      || FRAME_CONTROL_CHARS.test(callerPath)) return null;
+  const canonicalPath = resolve(callerPath);
+  return canonicalPath === resolve(SOURCE_MODULE_PATH) || canonicalPath === resolve(QUOTA_ANALYSIS_MODULE_PATH)
+    ? null : canonicalPath;
+}
+
 function isCallerFrame(frame) {
   const parsed = parseV8Frame(frame);
-  if (!parsed || parsed.modulePath === SOURCE_MODULE_PATH
-      || parsed.modulePath === QUOTA_ANALYSIS_MODULE_PATH) return false;
-  // Callers are context only. Require a bounded absolute V8 location or a
-  // Node internal frame, but never include that location in the origin proof.
-  return parsed.modulePath.startsWith("/") || parsed.modulePath.startsWith("node:internal/");
+  if (!parsed) return false;
+  // Caller locations are bounded context only. Resolve local paths and
+  // canonical file URLs so aliases of either origin module remain forbidden.
+  return canonicalCallerPath(parsed.modulePath) !== null;
 }
 
 function parseCanonicalUsage(row, page, budget) {

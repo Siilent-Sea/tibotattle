@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
 import { canonicalTelemetryV11Json } from "@app-usagemonitor/telemetry-contract";
 import {
@@ -230,6 +230,14 @@ test("the observed Vite-mapped guard chain proves only its pinned origin and exc
   internalCaller.stack = realGuardStack({ callerFrames: ["    at node:internal/process/task_queues:95:5"] });
   assert.equal(observeCurrentQ1EffectiveHistoryGuard(internalCaller,
     guardServer(sourceBytes.toString("utf8")).server).originProofSha256, proof.originProofSha256);
+  const bareAsyncFileUrl = new Error("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  bareAsyncFileUrl.stack = realGuardStack({ callerFrames: [`    at async ${pathToFileURL("/synthetic/caller path/worker.mjs").href}:11:3`] });
+  assert.equal(observeCurrentQ1EffectiveHistoryGuard(bareAsyncFileUrl,
+    guardServer(sourceBytes.toString("utf8")).server).originProofSha256, proof.originProofSha256);
+  const namedAsyncFileUrl = new Error("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  namedAsyncFileUrl.stack = realGuardStack({ callerFrames: [`    at async task (${pathToFileURL("/synthetic/task.mjs").href}:12:4)`] });
+  assert.equal(observeCurrentQ1EffectiveHistoryGuard(namedAsyncFileUrl,
+    guardServer(sourceBytes.toString("utf8")).server).originProofSha256, proof.originProofSha256);
   assert.equal(JSON.stringify(proof).includes(sourcePathForFrames), false);
   assert.equal(JSON.stringify(proof).includes(quotaSourcePathForFrames), false);
 });
@@ -261,6 +269,27 @@ test("guard origin rejects a wrong map, foreign path, wrong factory, intervening
   assert.equal(reject(realGuardStack({ callerFrames: ["malformed caller frame"] })), null);
   assert.equal(reject(realGuardStack({ callerFrames: [`    at ${sourcePathForFrames}:541:2`] })), null);
   assert.equal(reject(realGuardStack({ callerFrames: [`    at ${quotaSourcePathForFrames}:1448:2`] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at async ${pathToFileURL(sourcePathForFrames).href}:541:2`] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at async ${pathToFileURL(quotaSourcePathForFrames).href}:1448:2`] })), null);
+  const sourceUrlAlias = pathToFileURL(sourcePathForFrames).href.replace(
+    "/src/storage-effective-history.ts", "/scripts/../src/storage-effective-history.ts");
+  assert.notEqual(sourceUrlAlias, pathToFileURL(sourcePathForFrames).href);
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at async ${sourceUrlAlias}:541:2`] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at ${sourcePathForFrames.replace("/apps/worker/src/", "/apps/worker/scripts/../src/")}:541:2`] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: ["    at async https://synthetic.invalid/caller.mjs:1:1"] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: ["    at async file://remote.invalid/caller.mjs:1:1"] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: ["    at async file://%zz/caller.mjs:1:1"] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: ["    at async file:///synthetic/caller.mjs:0:1"] })), null);
+  for (const encodedControl of ["%00", "%01", "%1f", "%7f", "%0a", "%0d"]) {
+    assert.equal(reject(realGuardStack({ callerFrames: [`    at async file:///synthetic/${encodedControl}caller.mjs:11:3`] })), null);
+  }
+  for (const rawControl of ["\0", "\x01", "\x1f", "\x7f", "\n", "\r"]) {
+    assert.equal(reject(realGuardStack({ callerFrames: [`    at /synthetic/caller${rawControl}.mjs:11:3`] })), null);
+  }
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at async ${pathToFileURL("/synthetic/caller path/worker.mjs").href.replace("%20", " ")}:1:1`] })), null);
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at async ${pathToFileURL("/synthetic/caller.mjs").href}?debug=1:1:1`] })), null);
+  const encodedSeparator = pathToFileURL("/synthetic/caller.mjs").href.replace("caller.mjs", "caller%2Fmjs");
+  assert.equal(reject(realGuardStack({ callerFrames: [`    at async ${encodedSeparator}:1:1`] })), null);
   assert.equal(reject(realGuardStack({ callerFrames: Array.from({ length: 7 }, (_, index) => `    at /synthetic/caller-${index}.mjs:1:1`) })), null);
   const extraOriginPrefix = realGuardStack().replace("Error: STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE\n",
     `Error: STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE\n    at ${sourcePathForFrames}:27:1\n`);
