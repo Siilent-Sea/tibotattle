@@ -432,6 +432,11 @@ Complete Worker gate from the repository root:
 npm run product:worker:check
 ```
 
+The process checks require `zsh` with its `zsh/datetime` module, `/usr/bin/time`,
+`ps`, and `pgrep`. The Ubuntu CI job explicitly installs `zsh`, `time`, and
+`procps`; missing prerequisites must fail the gate. Native timing uses BSD time
+on macOS and GNU time on Linux, with measurements normalized to the same units.
+
 That gate checks guarded workspace-package copies, endpoint parity, generated
 types, TypeScript, operational scripts, Vitest, production asset staging, dry
 deployment, and disabled-staging configuration. It does not deploy, migrate,

@@ -419,3 +419,40 @@ limit remain. Independent strictness review is clear and the full owning file
 passes 36/36 without skips. The measured local timing improvement is small;
 hosted timeout robustness remains unproven until the next complete CI run.
 R7 authorization, regeneration and final freshness checks remain pending.
+
+Hosted run `38702465381` on `df269a9e9` passed all 184 Worker runtime files and
+2,836 tests, including the repaired 36-case graph file. Its meter case reported
+4,842 milliseconds including lifecycle; no separate body timing was exposed.
+Analytics passed 33 files and 349 tests, and the historical vendor checks passed
+59/59. All four PostgreSQL partitions and their aggregate passed 95 unique files
+and 716 tests without skips or coverage gaps. Cloud Run, documentation, release
+trust, dependency scanning and contract drift also passed.
+
+The Worker job then failed at 40 minutes 36 seconds in the production-shape
+tooling checks, before its unchanged 60-minute limit. That stage passed 33 of
+36 tests, with two failures and one existing missing-shell skip: the local
+measurement helper passed macOS `time -l` to GNU time on Ubuntu, and a real
+cleanup test could not spawn `zsh`. The preceding fast-path script checks passed
+211 tests with two existing environment skips. The next repair must supply the
+required shell and select the correct platform measurement interface while
+preserving real child execution, metric units, cleanup assertions and every
+existing limit. This run establishes the graph repair's hosted pass, not a
+complete Worker gate or Linux production measurement qualification. R7 consent
+and regeneration remain pending; the PR stays draft and unmerged.
+
+The reviewed platform repair explicitly provisions `zsh`, GNU time and procps
+in the Worker job, verifies the exact process-tool paths and `zsh/datetime`,
+and bounds setup to five minutes within the original job deadline. The native
+timer retains BSD behavior on macOS and selects a fixed GNU format on Linux,
+normalizing RSS to bytes while keeping unavailable or invalid metrics explicit.
+Unsupported platforms refuse before measurement work. The real child launch,
+arguments, resource environment, ownership checks and cleanup deadlines remain;
+missing-shell skips and silent syntax-check bypasses are removed.
+
+Node.js 26.2.0 on macOS passed all 39 production-shape checks without skips,
+including the real child and cleanup cases. Workflow checks passed 24/24,
+workflow policy verified 25 files, and release trust passed 87/87. Independent
+reviews of the timer and prerequisite changes are clear. The Worker README and
+operations runbook now document the prerequisites. Full final-candidate local
+and hosted validation, native Linux execution and the protected R7 gate remain
+outstanding; these focused results do not establish a full measurement receipt.

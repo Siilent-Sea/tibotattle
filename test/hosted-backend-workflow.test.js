@@ -68,6 +68,20 @@ const NODE_PLAN = Object.freeze({
 // (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). All need full history.
 const FETCH_DEPTH = Object.freeze({ "worker-gate": 0, "cloud-run-check": 0, "postgres-17-suite": 0 });
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
+const WORKER_PROCESS_PREREQUISITES = Object.freeze({
+  name: "Install Worker process-check prerequisites",
+  "timeout-minutes": 5,
+  run: [
+    "set -euo pipefail",
+    "sudo apt-get update",
+    "sudo apt-get install --yes --no-install-recommends zsh time procps",
+    "test -x /usr/bin/time",
+    "test -x /bin/ps",
+    "test -x /usr/bin/pgrep",
+    "zsh -ec 'zmodload zsh/datetime'",
+    "",
+  ].join("\n"),
+});
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
 // the PostgreSQL 17 suite. The rest run in the Cloud Run job, one step each.
@@ -208,6 +222,17 @@ function workerHistoryFailures(workflow) {
     ? [] : ["Worker vendor-kernel regressions require full history without persisted credentials"];
 }
 
+function workerProcessPrerequisiteFailures(workflow) {
+  const steps = workflow.jobs["worker-gate"].steps;
+  const prerequisites = steps.filter(({ name }) => name === WORKER_PROCESS_PREREQUISITES.name);
+  const install = steps.findIndex(({ run }) => run?.includes("pnpm install"));
+  const gate = steps.findIndex(({ run }) => run === workerNpm("check"));
+  return prerequisites.length === 1
+    && JSON.stringify(prerequisites[0]) === JSON.stringify(WORKER_PROCESS_PREREQUISITES)
+    && steps.indexOf(prerequisites[0]) < install && install < gate
+    ? [] : ["Worker real cleanup callers require bounded, mandatory process prerequisites before dependencies and tests"];
+}
+
 function postgresShardFailures(workflow) {
   const failures = [];
   const job = workflow.jobs["postgres-17-suite"];
@@ -323,6 +348,33 @@ test("the Worker vendor-kernel historical regressions require a complete checkou
     else checkout.with["fetch-depth"] = depth;
     assert.deepEqual(workerHistoryFailures(changed),
       ["Worker vendor-kernel regressions require full history without persisted credentials"]);
+  }
+});
+
+test("the Worker real cleanup callers have mandatory process prerequisites before tests", async () => {
+  const { workflow } = await loadWorkflow();
+  const worker = JSON.parse(await readFile(join(REPOSITORY_ROOT, "apps/worker/package.json"), "utf8"));
+  const callers = await readFile(join(REPOSITORY_ROOT, "apps/worker/scripts/gcp-fastpath-prod-shape/prod-shape.check.mjs"), "utf8");
+  assert.ok(worker.scripts.check.split(" && ").includes("npm run gcp:fastpath:scripts-check"));
+  assert.ok(worker.scripts["gcp:fastpath:scripts-check"].split(" && ").includes("npm run gcp:fastpath:prod-shape:check"));
+  assert.ok(worker.scripts["gcp:fastpath:prod-shape:check"].includes("./scripts/gcp-fastpath-prod-shape/prod-shape.check.mjs"));
+  assert.ok(callers.includes('spawn("zsh", ["-c", script]'), "the checks execute real shell callers");
+  assert.ok(callers.includes("zmodload zsh/datetime"), "the signal check needs the zsh datetime module");
+  assert.deepEqual(workerProcessPrerequisiteFailures(workflow), []);
+  for (const mutate of [
+    (steps, index) => steps.splice(index, 1),
+    (steps, index) => steps.push(steps.splice(index, 1)[0]),
+    (steps, index) => steps.push(structuredClone(steps[index])),
+    (steps, index) => { steps[index].if = "false"; },
+    (steps, index) => { steps[index]["continue-on-error"] = true; },
+    (steps, index) => { delete steps[index]["timeout-minutes"]; },
+    (steps, index) => { steps[index].run = steps[index].run.replace("--no-install-recommends zsh time procps", "--no-install-recommends bash"); },
+    (steps, index) => { steps[index].run = steps[index].run.replace("zsh -ec 'zmodload zsh/datetime'\n", ""); },
+  ]) {
+    const changed = structuredClone(workflow);
+    const steps = changed.jobs["worker-gate"].steps;
+    mutate(steps, steps.findIndex(({ name }) => name === WORKER_PROCESS_PREREQUISITES.name));
+    assert.ok(workerProcessPrerequisiteFailures(changed).length > 0);
   }
 });
 

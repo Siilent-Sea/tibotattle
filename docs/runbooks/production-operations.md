@@ -394,6 +394,12 @@ directly. Run these gates with a Node.js release that strips types by default:
 22.18.0. On Node.js 22.16.0, `npm run scripts:check` fails with
 `ERR_UNKNOWN_FILE_EXTENSION`.
 
+The real process and cleanup checks also require `zsh` with `zsh/datetime`,
+`/usr/bin/time`, `ps`, and `pgrep`. Ubuntu CI installs `zsh`, `time`, and `procps`
+explicitly. Native timing selects BSD time on macOS or GNU time on Linux;
+platform-specific metrics that are unavailable remain explicit. Passing these
+synthetic checks does not replace a full measurement receipt for that platform.
+
 The production deploy wrapper itself rechecks endpoint configuration (including
 the edge public surface: apex and `www` public route hosts and a separate admin
 host), workspace package copies, generated assets, release preflight, source
