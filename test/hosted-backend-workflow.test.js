@@ -98,10 +98,14 @@ const WORKER_GATE_RUN = [
   "set -euo pipefail",
   "vmstat -w -t 30 &",
   "resource_sampler_pid=$!",
+  'node scripts/hosted-backend-process-sampler.mjs --parent-pid "$$" &',
+  "process_sampler_pid=$!",
   "cleanup_resource_sampler() {",
   "  worker_status=$?",
   "  trap - EXIT",
+  '  kill "$process_sampler_pid" 2>/dev/null || true',
   '  kill "$resource_sampler_pid" 2>/dev/null || true',
+  '  wait "$process_sampler_pid" 2>/dev/null || true',
   '  wait "$resource_sampler_pid" 2>/dev/null || true',
   '  exit "$worker_status"',
   "}",
@@ -109,6 +113,7 @@ const WORKER_GATE_RUN = [
   "trap 'exit 130' INT",
   "trap 'exit 143' TERM",
   workerNpm("check"),
+  'kill -0 "$process_sampler_pid"',
   'kill -0 "$resource_sampler_pid"',
 ].join("\n");
 
@@ -460,6 +465,7 @@ test("three execution jobs run the unchanged Worker and Cloud Run gates and all 
   const guard = worker.indexOf([
     "node --test",
     "test/hosted-backend-workflow.test.js",
+    "test/hosted-backend-process-sampler.test.js",
     "test/hosted-backend-resource-sampler.check.mjs",
     "apps/worker/scripts/migration-numbering.check.mjs",
     "apps/worker/scripts/ci-postgres-suite.check.mjs",
@@ -481,7 +487,7 @@ test("three execution jobs run the unchanged Worker and Cloud Run gates and all 
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
 });
 
-test("Worker resource sampling wraps the full gate with one owned sampler and explicit status-preserving cleanup", async () => {
+test("Worker resource sampling wraps the full gate with two owned samplers and explicit status-preserving cleanup", async () => {
   const { workflow } = await loadWorkflow();
   const step = workflow.jobs["worker-gate"].steps.find(({ name }) => name === "Run the Worker gate");
   assert.deepEqual(step, { name: "Run the Worker gate", run: `${WORKER_GATE_RUN}\n` });

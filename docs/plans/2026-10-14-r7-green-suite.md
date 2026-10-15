@@ -7,16 +7,21 @@ status: in-progress
 
 # R7 admission repair and complete suite verification
 
-The integrated candidate's two Claude ingestion failures have reviewed and
-tested source repairs. The 15 October R7 attempt passed all six synthetic phases
-and complete-corpus admission, then failed the unchanged elapsed-resource limit.
-All ten original receipts were preserved. A concrete repeated-plan validation
-defect and inherited backend failures now have reviewed, focused-test-passing
-repairs; R7 receipt freshness,
-the full local umbrella gate and final-commit hosted CI remain pending. The next
-private-history regeneration requires explicit owner authorization after an
-automatic approval-review refusal. No
-resource limit or test assertion was relaxed. The suite is not green.
+The pushed candidate `60e00d9ee` passes the complete local Worker command,
+hosted PostgreSQL and Cloud Run gates, and four auxiliary workflows. Its hosted
+Worker runtime ran all 2,836 tests and failed one graph case at the unchanged
+five-second limit. A reviewed local reader experiment remains uncommitted;
+finer Linux process measurements are being prepared before another hosted run.
+Neither establishes a graph timing repair.
+
+The Claude ingestion and repeated-plan validation repairs are reviewed and
+tested. The 15 October R7 attempt passed all six synthetic phases and
+complete-corpus admission, then failed the unchanged elapsed-resource limit.
+All ten original receipts were preserved. R7 receipt freshness, the full local
+umbrella gate and final-commit hosted CI remain pending. Another private-history
+regeneration requires explicit owner authorization after an automatic
+approval-review refusal. No resource limit or test assertion was relaxed. The
+suite is not green.
 
 The owner requested resolution of the remaining R7 blockers and a complete
 green root suite without weakening checks. Work starts from clean
@@ -39,7 +44,7 @@ timeout, partial receipt reuse, or private-input alteration is permitted.
 | Snapshot investigator | Inspect documented artifacts and bounded local metadata for an existing complete, unmodified corpus snapshot | No candidate found in the documented locations checked |
 | Coordinator | Integrate reviewed fixes, freeze source, supervise authorized validation and record exact outcomes | Focused repairs reviewed and tested; protected regeneration and final gates pending |
 
-The authorized private-history operation remains local and follows the
+Any newly authorized private-history operation must remain local and follow the
 [R7 maintenance runbook](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md).
 Only content-free diagnostic classifications may leave the reader. Private
 history, paths, filenames, identifiers and record contents must not enter
@@ -711,3 +716,225 @@ PostgreSQL-gated tests skipped in the database-free local environment, with zero
 failures or cancellations. Both the build check and actual 13-bundle build resolved
 kernel 19. This qualifies local registration and analytics; the full local Worker
 gate and exact-head hosted PostgreSQL/Worker gates still require completion.
+
+The superseded `3ad784a2e` Worker job retained useful failed-case diagnostics
+before cancellation. Its complete graph file reported 35/36 passing; the target
+case reported failure at 6,863 milliseconds. All eleven phase records survived:
+16 uploads completed at 1,322 milliseconds, journal proof at 2,262, daily cohort
+at 2,400, and kernels 8/16/24/32 at 3,264/4,119/4,980/5,843. All original
+assertions completed at 5,893 milliseconds, beyond the unchanged five-second
+limit. The observer counted 5,110 round trips and 7,231 statements, with 5,198
+milliseconds summed settled-call time and a 46-millisecond maximum. No semantic
+assertion mismatch was observed; cancellation prevented the final error and
+runtime summaries. Completed file reports covered only 15 runtime files and
+778 tests, with one failure. This is incomplete failed-run evidence, not a full
+gate result or graph repair.
+
+Thirty resource intervals from that job, excluding the initial since-boot
+report, showed no swap usage/activity or stolen CPU and at least 9,130,468 KiB
+free memory. The interval covering the graph case and its predecessor each
+reported 74% CPU idle and 2% I/O wait. These coarse aggregate measurements still
+cannot establish cause or exclude short or per-core stalls. The next read-only
+investigation traces the actual serial kernel path for safe round-trip reductions
+while the full `60e00d9ee` gates continue; every fresh scope and assertion remains
+required.
+
+On `60e00d9ee`, hosted Cloud Run completed all five check steps and 1,191 tests
+across 20 reported invocations with no failures, skips or cancellations. The
+PostgreSQL edge partition completed its one canonical file and all 15 tests with
+no environment gaps. Both jobs built kernel 19 and stopped their owned databases.
+The Vitest partition also passed its 15 files and 107 tests, and node-1 passed
+40 files and 262 tests, without failures, skips or environment gaps. Node-2,
+the strict aggregate and complete Worker gates are still pending; these completed
+jobs do not establish a green full suite.
+
+The local Worker gate on the same source passed its complete runtime suite:
+184 files and 2,836 tests in 817.45 seconds, without failures or skips. The
+separate Node lane passed both tests, analytics passed all 33 files and 349 tests,
+and all 39 production-shape checks passed. Fastpath reported 209 passing tests
+and four existing PostgreSQL-environment skips. The gate then exited 1 at the
+release-tree cleanliness guard after 1,416.3 seconds: the coordinator's evidence
+update to this plan was the only dirty path. The guard correctly refused before
+asset inspection; neither Wrangler dry-run nor staging checks ran. This is a
+failed complete command despite passing test stages. Preserve the pending plan
+separately, validate the missing tail on the clean candidate, and then rerun the
+complete gate without intervening edits. No guard bypass is permitted. The
+runtime pass does not resolve the observed graph timing sensitivity or qualify
+the remaining hosted gate.
+
+Static graph review ruled out a pool of unchanged concurrent fixture uploads:
+their staged admissions share a singleton allocator, and an existing deterministic
+race regression requires one competing admission to refuse before an explicit
+retry. Parallelizing those journeys would change the workload, not merely remove
+idle waits. Two narrower production candidates remain unimplemented: combining
+reader admission with its same-query liveness proof, and batching checkpoint stage
+insertion with metadata verification. Their projected savings are not measured
+wall-time improvements; the latter also needs failure-atomicity and error-order
+coverage. Neither currently justifies a graph repair claim. The ongoing full local
+gate retains exclusive use of the heavy validation lane and frozen source.
+
+The complete hosted PostgreSQL suite on `60e00d9ee` passed all 717 tests across
+95 canonical files, with zero failures, skips or environment gaps. Canonical,
+selected, reported and unique file counts all agree, with no overlaps or missing
+files. The strict aggregate succeeded. Partition totals were Vitest 15 files/107
+tests, node-1 40/262, node-2 39/333 and edge 1/15. Both unchanged real boundary
+cases passed their 40,000-accept/40,001-refuse checks, 200-ID batches and
+600-second per-case limits. Their combined file took 643.485 seconds; individual
+case durations were not emitted. The occurrence regression file completed in
+162.659 seconds. Node-2 finished in 26 minutes 31 seconds, within its unchanged
+45-minute job limit. These logs contain no PostgreSQL CPU/RSS sampler, so no
+resource-cause claim follows. The hosted Worker gate remains pending.
+
+The coordinator preserved the pending evidence plan separately and restored only
+its tracked copy to the committed bytes. On clean `60e00d9ee`, both unchanged
+remaining commands passed: production dry-run in 2.276 seconds and staging
+configuration/dry-run in 1.251 seconds. Staging reports `configured_unverified`;
+no deployment occurred. No asset rebuild or guard change was needed. The first
+full attempt remains failed, with 4,861 passing tests, eleven existing local
+PostgreSQL-environment skips and no test failures or cancellations. A fresh
+complete Worker command started at 13:49:58 UTC on 15 October with the entire
+tracked checkout frozen. Pending evidence stays outside the checkout until the
+clean-tree-dependent validation completes.
+
+The fresh complete local Worker gate on clean `60e00d9ee` exited 0 after
+1,377.535 seconds at 14:12:56 UTC on 15 October. It reported 4,861 passing tests,
+eleven existing PostgreSQL-environment skips and zero failures or cancellations.
+The complete Worker runtime passed 184 files/2,836 tests, the separate Node lane
+passed both tests, analytics passed 33 files/349 tests, and production-shape
+passed all 39 tests. Both final Wrangler dry-runs completed; staging remained
+`configured_unverified`. The owner verified process cleanup and a clean final
+checkout. The failed earlier command remains separately recorded.
+
+The exact-head hosted Worker job completed with failure at 14:09:03 UTC after
+48 minutes 46 seconds, before its unchanged 60-minute job limit. Runtime ran all
+184 files/2,836 tests, with 2,835 passes and one graph timeout explicitly reported
+at the unchanged 5,000-millisecond limit. Every pre-runtime check passed, including
+1,311 Worker script tests and all 39 early Linux process checks. The subsequent
+Node, vendor, analytics, fastpath, later production-shape and deployment/staging
+steps were not reached. PostgreSQL cleanup reported stopped. The full hosted run
+therefore failed despite passing PostgreSQL, Cloud Run and auxiliary workflows.
+
+Ninety-five resource intervals, excluding the since-boot sample, showed no swap
+usage/activity or stolen CPU. Free memory stayed at or above 7,290,292 KiB.
+Nearby thirty-second samples reported 73–74% aggregate CPU idle and 4–8%
+I/O wait. These coarse measurements establish no test-level cause and do not
+rule out brief or per-core stalls. A scoped reader-admission experiment and an
+independent fence review now own the next investigation, with one serial local
+measurement lane. The five-second limit and the full graph workload remain
+unchanged; no repair or final-suite pass is claimed.
+
+The completed graph file reported 35/36 passing; the target took 7,336
+milliseconds and the final error explicitly identified its 5,000-millisecond
+timeout. All eleven diagnostic records were present and all original assertions
+completed at body time 6,370 milliseconds. The phases took 1,422 milliseconds
+for uploads, 869 for journal proof, 142 for daily/roster work, 3,888 for the 32
+kernels and 49 for both publications and final assertions. The totals remained
+5,110 round trips and 7,231 SQL statements. Kernel work accounted for 445 of the
+477-millisecond increase from the older cancelled run; this establishes elapsed
+cost, not a resource cause.
+
+A scoped reader-admission experiment removes the duplicate standalone
+pre-acquisition proof only for nonempty paged groups. The closed snapshot
+normalizer, original failure precedence, nonpaged pre-proofs, every post-proof,
+retained-membership predicate, direct-reader default and query reserve remain.
+Independent review is clear; all 21 snapshot tests passed, including eighteen
+new negative cases. The adjacent budget regression retained its exact deferred
+state, durable checkpoint, four physical pages and all upper bounds; its exact
+authority-query expectation advances from five to four for the eliminated
+duplicate query. Adjacent validation remains pending at this checkpoint.
+
+Three paired complete-target measurements retained all eleven records and the
+unchanged graph test. Each baseline used 5,110 round trips/7,231 statements;
+each candidate used 4,982/7,103. Body times were 1,660/1,594, 1,446/1,435 and
+1,551/1,383 milliseconds for baseline/candidate respectively. The median fell
+7.5%, with paired gains from 0.8% to 10.8%; this noisy local result does not
+qualify a hosted timeout repair. A second experiment is being prepared for two
+independent checkpoint read pairs, preserving separate writes and the final
+post-write fence. It has no measured result or adopted implementation yet.
+
+Additional static review found no redundant empty promotion or terminal-page
+read in the five-promotion fresh kernel: each acquisition transition follows a
+distinct real reduction pass. Whole-group or prepared-fold alternatives change
+durable progress or configuration contracts and are not neutral shortcuts. The
+positive authority-schema cache is reached only by a schema-error fallback;
+the successful current workload has zero such probes per kernel. The earlier
+general observer-identity caveat does not establish an actual extra schema
+probe or a timing cause in this workload.
+
+The reader experiment's adjacent validation subsequently passed all 36 tests
+across three files, bringing the owning total to 57 with no failures or skips;
+Worker typechecking also passed. Its four-file patch remains uncommitted and
+does not establish a hosted repair. Both checkpoint read-pair experiments were
+rejected before production edits: a failed batch loses the first proof and
+reserves both statements, changing the original unavailable classification and
+query spending when the first proof must refuse. A fallback reread spends an
+additional query and observes later state. Independent review confirmed that
+this could bypass the graph's newer-head deferral. Two new baseline negatives
+passed against the unchanged checkpoint implementation. The complete checkpoint
+file then passed all 14 tests without failures or skips, and typechecking passed.
+No checkpoint batching or timing experiment was adopted.
+
+Further source review found no larger safe round-trip reduction in the current
+upload, journal or five-promotion kernel. The ordinary fixture's reader candidate
+uses 95 calls/108 statements per fresh scope and kernel; the selected scheduler
+has additional epoch proofs and is a distinct, statically counted path. Combining
+journal proofs has the same error-priority and budget-reservation problem as the
+rejected checkpoint batches. No production change follows from those ideas.
+
+The runtime audit found an actual reporter difference: inherited Codex environment
+markers select Vitest's minimal reporter locally, while CI selects default plus
+GitHub Actions reporting. Two paired complete graph-file comparisons used explicit
+reporters and the same native JSON reporter on frozen source. All four runs passed
+36/36 tests, with no skips or failures. Default/minimal target durations were
+1,695/1,635 and 1,674/1,638 milliseconds; console output fell about 92%, but the
+36–60-millisecond local gain does not explain or resolve the hosted timeout.
+No reporter configuration was changed. D1's supported temporary persistence
+options still use disk-backed SQLite, and its calls stay inside workerd; no
+equivalent storage switch or fsync cause has been established. One bounded local
+native/Node profiling run is the next diagnostic, with synthetic fixtures and
+the original workload and five-second limit retained.
+
+The single profiling diagnostic finished with an incomplete-capture status,
+separate from its passing selected test. The full target passed in 1,851
+milliseconds overall and 1,462 milliseconds of body time; all eleven records,
+16 uploads, 32 kernels and 4,982 calls/7,103 statements were retained. The other
+35 cases were explicitly unselected for this diagnostic. Native sampling
+produced headers but no call stacks, and workerd had exited before the final
+identity check; no native or SQL cost can be attributed. Node's sampled interval
+weights were 81.07% idle and 16.07% diagnostic overhead, with delayed hook/log
+delivery. These are not CPU-time measurements or evidence of a hosted cause.
+No retry occurred; all owned processes exited and source stayed unchanged.
+
+The next scoped investigation prepares passive Linux measurements of only the
+hosted Worker shell's owned descendants at a finer interval. Closed CPU/RSS/I/O
+aggregates must preserve gaps and process identity, without reading command
+lines, environments, payloads or unrelated processes. Existing aggregate
+sampling, workload, tests, deadlines and resource limits remain. This diagnostic
+addition is pending implementation and independent review, not a performance
+repair or a passing hosted gate.
+
+The five-file Linux diagnostic addition subsequently passed independent exact-byte
+review and all 43 owning tests without failures, skips or cancellations. The
+executable Bash harness retains its original six scenarios and adds four checks
+for independent or simultaneous sampler failure. Both owned samplers are reaped;
+the original Worker failure remains authoritative. Existing `vmstat`, the full
+Worker command, workload and limits are unchanged. Fixed output records are
+bounded to 8 KiB; backpressure or a closed pipe ends diagnostics without raw
+errors or an accumulating output queue.
+
+The sampler anchors the parent and descendant lifetimes, checks per-thread child
+lists, and emits closed CPU, process-summed RSS and per-task I/O aggregates.
+Observed gaps remain explicit. Clock frequency is obtained from the Linux host;
+the 100-millisecond scan budget is cooperative, and `metadataReads` counts
+metadata operations/admissions rather than exact system calls. RSS is not unique
+memory, and I/O counters do not measure fsync latency or device throughput.
+Real Linux execution and overhead remain unqualified. The next commit will
+contain only diagnostics and this evidence record; the five reader/checkpoint
+experiment files remain uncommitted. Its production closure therefore remains
+kernel 19, enabling a comparable hosted diagnostic run without claiming a repair.
+
+The coordinator's complete workflow-contract command passed 101/101 tests,
+release-trust checks passed 87/87, all 25 workflow-policy files passed, and
+documentation/preflight passed 23/23. These focused results have no failures,
+skips or cancellations. They do not replace the final local umbrella or hosted
+gates. The five experimental files still match their preserved bytes.
