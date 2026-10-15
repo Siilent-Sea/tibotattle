@@ -598,3 +598,88 @@ and sampler checks passed 26/26, release trust passed 87/87, and policy checked
 25 workflow files. These focused results qualify the test correction locally;
 the next hosted run must prove its Linux behavior and complete the unchanged
 Worker gate.
+
+Hosted run `38728825727` on `ec45fb401` passed Cloud Run and all four auxiliary
+workflows. Its PostgreSQL partitions executed all 95 unique canonical files and
+716 tests without skips, missing files or duplicates; 715 tests passed and the
+v12 real SQL boundary case timed out at its unchanged 600,000-millisecond limit.
+The case retains 40,000 accepted variants, refusal at 40,001 and the 200-ID batch.
+Its reported duration was 600,001.691 milliseconds; no semantic assertion
+mismatch or failing intra-case phase was reported. The legacy boundary case
+passed in 139,469.071 milliseconds. The node-2 job completed after 28 minutes
+48 seconds, before its 45-minute deadline, and PostgreSQL cleanup succeeded.
+The strict aggregate correctly failed. Previous passing evidence does not close
+this new timeout; diagnosis must establish a bottleneck before a repair or rerun.
+The Worker job then failed after 45 minutes 8 seconds, before its 60-minute
+deadline. Its early native Linux production-shape gate passed all 39 tests with
+no skips or cancellations in 10.313 seconds, including the repaired signal case.
+Worker runtime completed 184 files and 2,836 tests: 183 files and 2,835 tests
+passed; the same full 16-owner graph publication case exceeded its unchanged
+5,000-millisecond timeout, reporting 6,997 milliseconds. The graph file passed
+35 of 36 tests. No assertion mismatch was reported. The later Node, vendor,
+analytics, fast-path, production-shape and deployment dry-run/staging gates
+were not reached. The earlier process repair is now natively qualified, but
+the complete Worker gate and graph timing remain unresolved.
+
+Its 88 aggregate 30-second resource intervals, excluding the initial since-boot
+report, again showed no swap activity or stolen CPU time. Free memory stayed
+above 8,321,000 KiB. Samples around the graph file showed 74% aggregate CPU idle
+and 1–2% I/O wait. Results were buffered, so an exact per-case wall-clock window
+is unavailable. These measurements do not establish a resource cause or exclude
+short or per-core stalls.
+
+A bounded local diagnostic on the unchanged complete v12 boundary passed in
+88.542 seconds, retaining every 40,000/40,001, 200-ID, parity and refusal check.
+Fixture seeding took 14.061 seconds, while the eight real expansion queries took
+63.105 seconds (71.3%): 31.357 seconds in the pinned historical reader and
+31.748 seconds in the candidate. Fixture batching was not adopted. Temporary
+instrumentation was removed byte-for-byte and the exact owned PostgreSQL cluster
+stopped. These local measurements do not close either hosted timeout or the
+separately pending R7 consent and regeneration gate.
+
+One candidate 40,000-row query execution plan retained the generic-plan setting,
+read-only repeatable-read snapshot, original fixture and query. It returned all
+40,000 rows in 8.936 seconds with no disk or temporary reads. The plan did not
+support completeness counting as the dominant cost: those 40,000 aggregates
+accounted for about 560 milliseconds inclusive. Instead, the eligibility lateral
+ran 40,000 times and took about 8.64 seconds inclusive. An inner CTE estimated
+at one row returned 200 rows per invocation, feeding two index scans with eight
+million loops and 24 million shared-buffer hits each. No raw plan, SQL, binds or
+rows were retained. The exact owned cluster was stopped again. The next reviewed
+prototype may reuse the complete eligibility result for each distinct matched
+chunk within the same statement, preserving every predicate and multiplicity;
+count-only and fixture-only optimizations are not justified by this measurement.
+
+The reviewed eligibility prototype preserves the complete lateral relation and
+its row multiplicity, evaluating it once per distinct matched chunk/manifest pair
+and joining back on both keys within the same statement. A matching single-query
+measurement returned the same 40,000 rows in 610.377 milliseconds. Eligibility
+evaluations fell from 40,000 to 200, the two index scans from eight million loops
+each to 40,000, and shared-buffer hits from 49,191,043 to 1,806,557. Generic-plan,
+JIT, work-memory and read-only snapshot settings were unchanged; no disk reads or
+temporary spill occurred. The unchanged full boundary file passed both cases
+without skips or cancellations: legacy in 56.421 seconds and v12 in 128.108
+seconds, under their original 600-second limits. This is a query-level improvement
+and a complete boundary pass, not evidence of a whole-case speedup or hosted
+qualification. The new synthetic regression passed its focused run, followed by
+all 21 occurrence tests and all ten read-plan tests on Node.js 26.2.0/PostgreSQL 17,
+with zero failures, skips or cancellations. The regression compares actual public
+results and the full pre-group eligibility bag against the immutable historical
+reader, then proves that scope deduplication and either missing join key are
+detected. Independent semantic and publication reviews are clear. Documentation
+governance and all 23 preflight checks passed. The full local Worker gate and
+exact-head hosted CI remain required.
+
+The graph case now has a reviewed test-only observer emitting eleven fixed,
+content-free phase records with numeric elapsed time, round-trip and statement
+counts. It preserves native batch boundaries, promises, results and errors;
+every upload, fresh scope/kernel, daily pass, publication and assertion remains.
+Observer identity can add a positive authority-schema cache check, so its
+measurements describe the instrumented workload, not an uninstrumented baseline.
+Typechecking and all 36 owning graph tests passed. A separate temporary delay
+after all original assertions forced the unchanged five-second timeout and
+verified that all eleven records survive the reporter's failed-test buffering.
+That expected diagnostic failure is not a passing gate; the temporary delay was
+removed and the exact reviewed source restored. The next hosted run must provide
+actual failing-case phase evidence if the graph timeout recurs; no graph
+performance repair is claimed.

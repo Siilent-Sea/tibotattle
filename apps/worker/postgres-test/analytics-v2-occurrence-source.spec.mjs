@@ -480,6 +480,99 @@ test("the v1.2 expansion excludes a requested occurrence's staged, incomplete an
       { ownerDigest: fixture.owners.india.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 })], [[D1, 1]]);
   });
 
+test("v1.2 pair eligibility preserves both record keys and authority multiplicity",
+  { skip: SKIP, timeout: 120_000 }, async () => {
+    const readers = await loadExpansionReaders();
+    try {
+      await modules.owners.withAnalyticsV2ReadSnapshot(context("active"), async (snapshot) => {
+        const captured = [];
+        const observed = { query: async (...args) => {
+          const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+          const values = typeof args[0] === "string" ? args[1] : args[0].values;
+          if (sql.includes("analytics_v2:occurrences.v12_sources") && values[1] === "usage") {
+            captured.push({ sql, values });
+          }
+          return snapshot.client.query(...args);
+        } };
+        // The public Maps and fingerprints still agree with the immutable reader.
+        await compareExpansionRead(readers, { ...snapshot, client: observed }, {
+          ownerDigest: fixtures.active.owners.alpha.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3,
+        }, (name, outcome, retained) => {
+          assert.equal(outcome.error, undefined, `${name} accepts the shared-pair fixture`);
+          assert.ok(retained.value.get(D1).length > 0);
+        });
+        assert.equal(captured.length, 4, "both readers expand usage for their Map and fingerprint");
+        assert.equal(captured[0].sql, captured[2].sql);
+        assert.equal(captured[1].sql, captured[3].sql);
+        const [base, candidate] = captured;
+        assert.equal(base.values.length, 5);
+        assert.equal(candidate.values.length, 5);
+        assert.deepEqual(base.values, candidate.values, "both eligibility probes read the identical input batch");
+        assert.ok(Array.isArray(base.values[3]) && base.values[3].length > 0 && base.values[3].length <= 200,
+          "the historical reader's single batch corresponds exactly to candidate sub-batch zero");
+        const replaceOnce = (sql, before, after) => {
+          assert.equal(sql.split(before).length, 2, "each fault targets one captured SQL clause");
+          return sql.replace(before, after);
+        };
+        const project = (sql, projection,
+          terminal = "    SELECT selected.sub_batch,selected.id::text AS storage_row_id") => {
+          assert.equal(sql.split(terminal).length, 2);
+          return sql.slice(0, sql.indexOf(terminal)) + projection;
+        };
+        // Observe the bag before grouping can conceal lost/duplicated authority
+        // rows. Read-only derived relations supply adversaries; every real table,
+        // constraint and trigger stays intact. All production eligibility CTEs
+        // and all five parameter bindings remain in the executed statement.
+        const bag = async (sql) => (await snapshot.client.query(project(sql,
+          `SELECT sub_batch,id::text,source_device_id,count(*)::integer AS copies FROM eligible
+            GROUP BY sub_batch,id,source_device_id ORDER BY sub_batch,id,source_device_id`), candidate.values)).rows;
+        await modules.owners.withGenericPlans(snapshot.client, async () => {
+          // The immutable oracle predates grouped batches and has no ordinal.
+          // The input identity/size proof above permits only its single batch's
+          // comparison coordinate to be supplied here; its CTEs stay untouched.
+          const expected = (await snapshot.client.query(project(base.sql,
+            `SELECT 0::integer AS sub_batch,id::text,source_device_id,count(*)::integer AS copies FROM eligible
+              GROUP BY id,source_device_id ORDER BY sub_batch,id,source_device_id`,
+            "    SELECT selected.id::text AS storage_row_id"), base.values)).rows;
+          assert.ok(expected.length > 1);
+          assert.deepEqual(await bag(candidate.sql), expected, "the full eligible bag equals the frozen reader");
+          const shared = (await snapshot.client.query(project(candidate.sql,
+            `SELECT count(*)::integer AS records,count(DISTINCT (chunk_id,manifest_id))::integer AS pairs
+               FROM matched`), candidate.values)).rows[0];
+          assert.ok(shared.records > shared.pairs, "multiple physical records share an eligibility pair");
+
+          const domainDays = `"${snapshot.schema}".telemetry_v12_domain_days`;
+          const duplicated = replaceOnce(candidate.sql, `JOIN ${domainDays} domain_day`,
+            `JOIN (SELECT * FROM ${domainDays} UNION ALL SELECT * FROM ${domainDays}) domain_day`);
+          const doubled = expected.map((row) => ({ ...row, copies: row.copies * 2 }));
+          assert.deepEqual(await bag(duplicated), doubled, "every qualifying generation row keeps its multiplicity");
+          const deduplicated = replaceOnce(duplicated,
+            "SELECT pair.chunk_id,pair.manifest_id,scope.source_device_id",
+            "SELECT DISTINCT pair.chunk_id,pair.manifest_id,scope.source_device_id");
+          assert.notDeepEqual(await bag(deduplicated), doubled, "the multiplicity check detects scope deduplication");
+
+          const join = "scope.chunk_id=r.chunk_id AND scope.manifest_id=r.manifest_id";
+          for (const key of ["chunk_id", "manifest_id"]) {
+            const decoy = replaceOnce(replaceOnce(candidate.sql,
+              "eligible_pairs AS MATERIALIZED (", "original_eligible_pairs AS MATERIALIZED ("),
+            "    ), eligible AS MATERIALIZED (", `    ), eligible_pairs AS MATERIALIZED (
+              SELECT * FROM original_eligible_pairs UNION ALL
+              SELECT ${key === "chunk_id" ? "chunk_id || ':decoy'" : "chunk_id"},
+                     ${key === "manifest_id" ? "manifest_id || ':decoy'" : "manifest_id"},source_device_id
+                FROM original_eligible_pairs
+            ), eligible AS MATERIALIZED (`);
+            assert.deepEqual(await bag(decoy), expected, `a different ${key} never matches the original record`);
+            const remainingKey = key === "chunk_id" ? "manifest_id" : "chunk_id";
+            const mutant = replaceOnce(decoy, join, `scope.${remainingKey}=r.${remainingKey}`);
+            const leaked = await bag(mutant);
+            assert.ok(leaked.reduce((sum, row) => sum + row.copies, 0)
+              > expected.reduce((sum, row) => sum + row.copies, 0), `omitting ${key} admits a decoy scope`);
+          }
+        });
+      });
+    } finally { await readers.close(); }
+  });
+
 test("the legacy expansion and candidates exclude superseded, incomplete and foreign variants and keep the day edges",
   { skip: SKIP, timeout: 300_000 }, async () => {
     // C-REFRESH rewrote both legacy statements to fence the owner's devices,
