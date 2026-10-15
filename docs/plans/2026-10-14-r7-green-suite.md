@@ -159,6 +159,36 @@ During integration, the unchanged application gates passed: UI 1,094/1,094,
 local companion 420/420, macOS transition 127/127, release site 82/82, release
 trust 87/87, and local-review runtime. Telemetry mirrors and preflight also
 passed. These are source and local test results, not installed/native release
-qualification. Independent review and complete frozen-source validation must
+qualification. Complete frozen-source validation must
 finish before any stronger readiness claim. The pre-PR root suite result above
 remains attributed only to its named commit.
+
+The integration was committed and pushed as
+`a1ac524ff5b7ddf73562ada93624ee0f9233bcba`. Independent review cleared the
+edge, staging and configuration repairs. Its complete local Worker command
+finished with exit 1 after 1,084.058 seconds: the preceding Node phases had
+1,304 passes and seven existing PostgreSQL-dependent skips, then Vitest had
+2,807 passes and three failures across 184 files. The remaining command stages
+were not reached. The three health/readiness parity failures exhausted the
+unchanged burst-two admission bucket shared by independent table rows; their
+response assertions must remain intact while the scenarios receive isolated
+test state and explicit lease-cleanup checks.
+
+Hosted CI also exposed an omitted classification for three newly added
+operational rate-limit bindings. The correction declares their exact edge-only
+inventory without adding them to the six replay bindings or nine injected
+origin bindings. It retains shape, duplicate, missing and unknown-name refusal,
+and both origin service planes explicitly reject injection of those bindings.
+Independent review cleared this correction. Its focused configuration checks
+passed 54/54; the complete owning offline infrastructure gate passed 390/390,
+both with zero skips or cancellations.
+
+The parity correction separates the original 14 readiness rows, eight health
+rows and five malformed-source values into independent cases. All original
+response and exact/absent-source assertions remain, and each migrated request
+checks that its named probe budget has zero active leases before the next test
+reset. The owning file now passes 39/39 cases, compared with the previous 14
+tests containing three failed multi-row cases. Independent review, TypeScript,
+documentation and all 23 preflight checks passed. No production admission
+limit, timeout or assertion was relaxed. Full root and final hosted results
+remain pending for the corrected candidate.
