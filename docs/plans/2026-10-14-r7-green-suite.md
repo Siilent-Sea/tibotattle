@@ -390,3 +390,32 @@ the complete two-case boundary file passed against PostgreSQL 17.11 and Node.js
 108.274 seconds, total 167.487 seconds. These local timings do not establish a
 hosted speedup. The final complete local run, final-commit hosted CI, and
 explicit R7 authorization and replacement remain outstanding.
+
+The pushed follow-up `52db7a1066bc23a7d406863595bd5f67fd4ef878` passed the
+complete local product gate in 1,823.91 seconds. Worker application passed all
+2,836 tests across 184 files, and analytics passed 349 tests across 33 files,
+both without skips. The existing 11 local PostgreSQL-environment script skips
+remain separate from hosted database coverage. Dry-run staging, macOS transition
+and local-review runtime qualification also passed. The full root rerun finished
+6,433 tests: 6,387 passes, the same two stale R7 workload-hash failures, 44
+existing platform skips and zero cancellations. The umbrella stops at those
+failures; its complete product portion passed separately on the same commit.
+
+Hosted run `38694697425` passed all four PostgreSQL partitions and their strict
+aggregate: exactly 95 files and 716 tests, with no skips, duplicates or gaps.
+Cloud Run, documentation, release trust, dependency scanning and contract drift
+also passed. Worker completed 2,836 runtime tests with 2,835 passes and one
+five-second timeout in the full 16-owner graph-publication meter case. The job
+ended at 47 minutes 15 seconds, before its unchanged 60-minute limit. No semantic
+assertion mismatch was reported. The same source had passed locally and in the
+previous hosted run; the cause of its timing variation is not established.
+
+The scoped follow-up removes 90 redundant setup statements by draining the
+ordered journal after all uploads and reading the stable owner roster once.
+It adds exact equality between all 16 source events and their target receipts.
+All 16 upload journeys, 32 serial fresh-scope kernel computations, four daily
+passes, both real publications, exact 14/16 statement counts and the five-second
+limit remain. Independent strictness review is clear and the full owning file
+passes 36/36 without skips. The measured local timing improvement is small;
+hosted timeout robustness remains unproven until the next complete CI run.
+R7 authorization, regeneration and final freshness checks remain pending.
