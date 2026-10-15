@@ -346,8 +346,10 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // proof from process-owned authenticated health. These are tooling boundaries,
   // never product APIs.
   // Integration also retains the reviewed GCP operation tools.
-  assert.equal(result.records, 189);
-  assert.equal(result.candidates.length, 188);
+  // The hosted Worker sampler is an owned passive Linux CI diagnostic;
+  // its content-free process aggregates do not qualify performance or release.
+  assert.equal(result.records, 190);
+  assert.equal(result.candidates.length, 189);
   assert.ok(result.aliases >= 25);
 });
 

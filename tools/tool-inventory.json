@@ -1654,6 +1654,22 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/hosted-backend-process-sampler.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Internal passive Linux diagnostic invoked by the hosted Worker CI gate; not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/hosted-backend.yml",
+        "test/hosted-backend-process-sampler.test.js"
+      ],
+      "decision": "retain_as_internal_ci_diagnostic",
+      "provenance": null,
+      "provenanceReason": "The read-only workflow diagnostic reads bounded descendant process metadata and emits content-free aggregates; its maintained contracts are the hosted workflow and focused sampler tests. It does not establish performance causality or readiness.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "release_evidence",
       "canonicalPath": "scripts/generate-release-evidence.js",
       "stableAlias": "release:evidence:generate",

@@ -938,3 +938,20 @@ release-trust checks passed 87/87, all 25 workflow-policy files passed, and
 documentation/preflight passed 23/23. These focused results have no failures,
 skips or cancellations. They do not replace the final local umbrella or hosted
 gates. The five experimental files still match their preserved bytes.
+
+Diagnostic commit `d94c7f00c` was pushed with production source unchanged.
+Its Release trust workflow correctly refused the new executable because the
+coordinator omitted its tool-inventory registration. The failing command ran
+38 tests with 37 passes and one `unclassified_executable` failure. The local
+87-test release-trust command did not include that inventory check. Three other
+auxiliary workflows passed; Hosted backend was still running when this failure
+was diagnosed. No partial hosted result is promoted to a passing gate.
+
+The scoped correction adds the sampler's canonical repository-operations
+registration and its actual workflow/test callers, preserving all 189 existing
+records. The exact inventory expectations advance from 189 records/188 paths
+to 190/189 while retaining strict equality and all refusal/importer checks.
+The complete previously failing command passed 38/38 with no skips, failures or
+cancellations; inventory validation passed with 190 records, 189 executable
+paths and 59 aliases. Sampler, production source, checker and workload remain
+unchanged. This repairs tool registration, not the graph timing failure.
