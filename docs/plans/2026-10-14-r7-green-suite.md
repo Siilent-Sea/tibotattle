@@ -456,3 +456,92 @@ reviews of the timer and prerequisite changes are clear. The Worker README and
 operations runbook now document the prerequisites. Full final-candidate local
 and hosted validation, native Linux execution and the protected R7 gate remain
 outstanding; these focused results do not establish a full measurement receipt.
+
+Candidate `0d8cde0d0` passed the complete local product gate in 1,468.89 seconds,
+including all 2,836 Worker runtime tests, 349 analytics tests, 39 production-shape
+checks, 127 macOS transition tests and the dry-run and local-review tail gates.
+The 11 existing PostgreSQL-environment script skips remain separate. Its root
+run completed 6,434 tests in 483.466 seconds: 6,388 passed, the same two R7
+workload-hash freshness checks failed, and 44 existing platform cases skipped.
+
+Hosted run `38709067567` passed all 95 unique PostgreSQL files and 716 tests,
+with no skips or coverage gaps, plus Cloud Run and all auxiliary workflows. The
+new Worker process prerequisites installed and passed their smoke checks. The
+Worker runtime then finished 2,836 tests with 2,835 passes and one timeout in
+the same graph meter case; its reported lifecycle duration was 7,472 milliseconds.
+The job ended after 47 minutes 19 seconds, before its original 60-minute limit.
+The graph file's bytes match the preceding hosted pass. No semantic assertion
+mismatch was reported, but the earlier fixture optimization has not provided
+sufficient timing margin. The later Linux timer and shell-cleanup checks were
+not reached. The next scoped repair must reduce measured fixture work while
+retaining all real journeys, calculations, publication assertions and the
+five-second case limit. No blind rerun or resource-limit change is justified.
+
+Two further synthetic diagnostic runs on the unchanged graph source isolated
+database-call cost. The final run measured 731 milliseconds in the 32 kernels,
+including 621 milliseconds covered by active database calls. Each computation
+made 93 calls containing 106 statements. Across the complete set, 96 repeated
+short-page reads consumed 45 milliseconds, only about 3.2% of the profiled
+1,398-millisecond test phases. All non-database kernel work together occupied
+110 milliseconds; the coarse runtime timer did not establish a material cost
+for the separately identified unused scalar-evidence hashing. These are local
+diagnostics, not hosted performance or a demonstrated timeout repair.
+
+The diagnostic cases ran every original assertion before intentionally reporting
+their closed timing summaries as failures; they are not counted as green test
+runs. Instrumentation was removed and the test file restored byte-for-byte to
+`0d8cde0d0`. No production optimization was adopted on these measurements.
+Whole-upload concurrency remains unsafe because admission shares a row allocator.
+Splitting the publication case would omit its combined model-history and preview
+path unless the preview case retained the full workload. A follow-up must preserve
+that coupled path, all fresh source and authority checks, checkpoint recovery,
+statement accounting and the unchanged five-second limit. The hosted timeout and
+the separately consent-gated R7 replacement remain unresolved.
+
+A subsequent production prototype batched independent metadata reads at the
+same validation boundary: the ordinary v1.1 source-pin, collection-control and
+calculation-authority proofs, plus two checkpoint-save metadata pairs. It reused
+the existing SQL and row validators. Separate prewrite and postwrite proofs,
+checkpoint part writes, compare-and-swap promotion and final readback remained.
+Every statement was still charged. A failed native batch propagated immediately;
+a later SQL failure could take precedence over an earlier invalid row, but could
+not authorize a write or accepted result. Successful results retained validation
+order.
+
+Three paired synthetic runs retained all original publication assertions and
+exactly 3,392 kernel statements in each run. Database round trips fell from 2,976
+to 2,208, a 25.8% reduction. Median kernel time fell from 729 to 642 milliseconds
+(11.9%); median whole-case time fell from 1,448 to 1,393 milliseconds (3.8%), with
+one pair slightly slower. This demonstrates reduced round trips and local kernel
+cost, not sufficient hosted timeout margin. All timing instrumentation was removed.
+The four owning files passed 81 tests without failures or skips, and TypeScript,
+architecture, documentation and all 23 preflight checks passed. Independent review
+found no actionable safety or correctness issue. The prototype preserved the
+original 16-owner case and its limit; its lost-response test injected failure
+at the same part-write operation after the two new metadata batches.
+
+The prototype was not adopted. Review established that the maintained scheduler
+constructs a selected snapshot and therefore bypasses the ordinary-source batch;
+only the checkpoint batching applies to that runtime path. Combined with the
+small whole-case timing gain, the broader change is not justified as this timeout
+repair. The prototype and its evidence are retained locally for future review,
+and its seven files are restored to the unchanged candidate. The next diagnostic
+run will collect bounded aggregate runner-resource measurements alongside the
+unchanged hosted Worker gate. It must preserve the full test command, its exit
+status, all existing timeouts and every existing check.
+
+The diagnostic wraps the exact Worker command with a single owned `vmstat`
+sampler at 30-second intervals. It logs aggregate counters and timestamps only,
+preserves the gate's exit status, and kills and reaps the sampler on ordinary
+exit or trapped cancellation. A successful gate also requires the sampler to
+remain alive. The existing job deadline bounds the output. No runner, resource
+limit, test timeout, required check, permission or action pin changes.
+
+The executable shell regression belongs to the mandatory Ubuntu workflow
+contract step, outside the portable root test glob. The root test enforces that
+unconditional route and exact gate command. Synthetic cases exercise success,
+gate failure, sampler failure, simultaneous failure and both interruption
+signals. They check arguments, status preservation and sampler termination;
+forced untrappable termination is outside the cleanup claim. This diagnostic
+adds evidence for the next run; it does not resolve the hosted timeout or the
+separately pending protected R7 operation.

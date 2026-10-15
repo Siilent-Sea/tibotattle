@@ -152,7 +152,7 @@ jobs:
         run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
 
       - name: Check this workflow's contract, migration numbering and PostgreSQL suite routing
-        run: node --test test/hosted-backend-workflow.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
+        run: node --test test/hosted-backend-workflow.test.js test/hosted-backend-resource-sampler.check.mjs apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
 
       # deploy:dry and staging:check stage production assets from a generated
       # public release site. Build one locally from the checked-out source with a
@@ -195,7 +195,24 @@ jobs:
             --social-image "$social_card" > /dev/null
 
       - name: Run the Worker gate
-        run: npm --prefix apps/worker run check
+        # The first vmstat report is since boot; subsequent reports cover 30s.
+        # Aggregate resource diagnostics do not establish readiness.
+        run: |
+          set -euo pipefail
+          vmstat -w -t 30 &
+          resource_sampler_pid=$!
+          cleanup_resource_sampler() {
+            worker_status=$?
+            trap - EXIT
+            kill "$resource_sampler_pid" 2>/dev/null || true
+            wait "$resource_sampler_pid" 2>/dev/null || true
+            exit "$worker_status"
+          }
+          trap cleanup_resource_sampler EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          npm --prefix apps/worker run check
+          kill -0 "$resource_sampler_pid"
 
       - name: Stop PostgreSQL 17
         if: always()

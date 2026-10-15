@@ -94,6 +94,23 @@ const OFFLINE_PRODUCTION_TOOLING = Object.freeze([
 ]);
 const LOCAL_CHECK = "gcp:production-tooling:local-check";
 const workerNpm = (script) => `npm --prefix apps/worker run ${script}`;
+const WORKER_GATE_RUN = [
+  "set -euo pipefail",
+  "vmstat -w -t 30 &",
+  "resource_sampler_pid=$!",
+  "cleanup_resource_sampler() {",
+  "  worker_status=$?",
+  "  trap - EXIT",
+  '  kill "$resource_sampler_pid" 2>/dev/null || true',
+  '  wait "$resource_sampler_pid" 2>/dev/null || true',
+  '  exit "$worker_status"',
+  "}",
+  "trap cleanup_resource_sampler EXIT",
+  "trap 'exit 130' INT",
+  "trap 'exit 143' TERM",
+  workerNpm("check"),
+  'kill -0 "$resource_sampler_pid"',
+].join("\n");
 
 // ---------------------------------------------------------------------------
 // A line-wise reader for the block YAML subset this workflow uses: mappings,
@@ -226,7 +243,7 @@ function workerProcessPrerequisiteFailures(workflow) {
   const steps = workflow.jobs["worker-gate"].steps;
   const prerequisites = steps.filter(({ name }) => name === WORKER_PROCESS_PREREQUISITES.name);
   const install = steps.findIndex(({ run }) => run?.includes("pnpm install"));
-  const gate = steps.findIndex(({ run }) => run === workerNpm("check"));
+  const gate = steps.findIndex(({ run }) => run?.trim() === WORKER_GATE_RUN);
   return prerequisites.length === 1
     && JSON.stringify(prerequisites[0]) === JSON.stringify(WORKER_PROCESS_PREREQUISITES)
     && steps.indexOf(prerequisites[0]) < install && install < gate
@@ -406,7 +423,7 @@ test("three execution jobs run the unchanged Worker and Cloud Run gates and all 
   assert.deepEqual(Object.keys(workflow.jobs), ["worker-gate", "cloud-run-check", "postgres-17-suite", AGGREGATE_JOB]);
   const timeouts = { "worker-gate": 60, "cloud-run-check": 30, "postgres-17-suite": 45 };
   const gates = {
-    "worker-gate": "npm --prefix apps/worker run check",
+    "worker-gate": WORKER_GATE_RUN,
     "cloud-run-check": "npm --prefix apps/worker/cloud-run run check",
     "postgres-17-suite": SHARD_COMMAND,
   };
@@ -442,14 +459,25 @@ test("three execution jobs run the unchanged Worker and Cloud Run gates and all 
   const guard = worker.indexOf([
     "node --test",
     "test/hosted-backend-workflow.test.js",
+    "test/hosted-backend-resource-sampler.check.mjs",
     "apps/worker/scripts/migration-numbering.check.mjs",
     "apps/worker/scripts/ci-postgres-suite.check.mjs",
   ].join(" "));
+  const guardStep = workflow.jobs["worker-gate"].steps.find(({ run }) => run?.trim() === worker[guard]);
+  assert.equal(guardStep?.if, undefined, "the Linux resource sampler harness is mandatory");
+  assert.equal(guardStep?.["continue-on-error"], undefined, "shell harness failures fail the workflow");
   const site = worker.findIndex((command) => command.includes("node scripts/build-public-release-site.js"));
   assert.ok(guard >= 0 && site > guard && worker.indexOf(gates["worker-gate"]) > site);
   assert.match(worker[site], /--output "\$GITHUB_WORKSPACE\/\.release-build\/public-release-site"/u);
   assert.match(worker[site], /--social-image "\$social_card"/u);
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
+});
+
+test("Worker resource sampling wraps the full gate with one owned sampler and explicit status-preserving cleanup", async () => {
+  const { workflow } = await loadWorkflow();
+  const step = workflow.jobs["worker-gate"].steps.find(({ name }) => name === "Run the Worker gate");
+  assert.deepEqual(step, { name: "Run the Worker gate", run: `${WORKER_GATE_RUN}\n` });
+  assert.equal(step.run.split("\n").filter((line) => line === workerNpm("check")).length, 1);
 });
 
 test("all four canonical PostgreSQL shards and the fail-closed aggregate are mandatory", async () => {
