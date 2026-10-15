@@ -10,6 +10,12 @@ import {
   checkReleaseWorkflowPolicy,
   inspectWorkflowSource,
 } from "../scripts/check-release-workflow-policy.mjs";
+import {
+  ACTIVATION_PRODUCER_FILES,
+  runActivationProducerSuite,
+  selectActivationProducerPlan,
+} from "../apps/worker/scripts/ci-postgres-activation-producer-suite.mjs";
+import { planPostgresSuite } from "../apps/worker/scripts/ci-postgres-suite.mjs";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW_PATH = ".github/workflows/hosted-backend.yml";
@@ -36,6 +42,7 @@ const EXPECTED_PATHS = Object.freeze([
 const START_POSTGRES = "node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile";
 const STOP_POSTGRES = "node apps/worker/scripts/ci-postgres-container.mjs --stop";
 const SUITE_SCRIPT = "apps/worker/scripts/ci-postgres-suite.mjs";
+const ACTIVATION_PRODUCER_SUITE_SCRIPT = "apps/worker/scripts/ci-postgres-activation-producer-suite.mjs";
 const EDGE_SPEC = "apps/worker/postgres-test/edge-origin-e2e.spec.mjs";
 const TRANSFER_SPEC = "apps/worker/postgres-test/postgres-v12-transfer.spec.mjs";
 const SELECTED_SOURCE_EXPRESSION = "${{ github.event.pull_request.head.sha || github.sha }}";
@@ -54,6 +61,7 @@ const NODE_PLAN = Object.freeze({
   "postgres-17-core-b": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
   "postgres-17-edge-e2e": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
   "postgres-17-suite": Object.freeze([TOOLCHAIN_NODE]),
+  "activation-producer-postgres-17": Object.freeze([TOOLCHAIN_NODE]),
 });
 // The Worker runtime-tests stage runs vendored-kernel identity and transition
 // checks against pinned production commits and the reviewed historical facade.
@@ -474,6 +482,7 @@ test("hosted execution jobs preserve the reviewed runtime, dependency and Postgr
     "worker-gate": 5,
     "cloud-run-check": 30,
     "postgres-17-suite": 45,
+    "activation-producer-postgres-17": 30,
     ...Object.fromEntries(PARTITION_PLAN.map(({ id }) => [id, 45])),
   };
   const gates = {
@@ -482,6 +491,7 @@ test("hosted execution jobs preserve the reviewed runtime, dependency and Postgr
     "worker-analytics-fastpath": workerNpm("check:analytics-fastpath"),
     "cloud-run-check": "npm --prefix apps/worker/cloud-run run check",
     "postgres-17-suite": aggregateCommand(),
+    "activation-producer-postgres-17": activationProducerCommand(),
     ...Object.fromEntries(PARTITION_PLAN.map(({ id, partition, stem }) => [id, partitionCommand(partition, stem)])),
   };
   for (const [id, job] of Object.entries(workflow.jobs)) {
@@ -521,6 +531,78 @@ test("hosted execution jobs preserve the reviewed runtime, dependency and Postgr
     const last = job.steps.find((step) => step.run?.trim() === STOP_POSTGRES);
     assert.deepEqual([last.if, last.run?.trim()], ["always()", STOP_POSTGRES], `${id} always stops PostgreSQL`);
   }
+});
+
+test("the focused producer qualification is part of the fail-closed PostgreSQL aggregate", async () => {
+  const { workflow } = await loadWorkflow();
+  const job = workflow.jobs["activation-producer-postgres-17"];
+  assert.equal(job.if, undefined);
+  assert.equal(job["continue-on-error"], undefined);
+  assert.equal(job.env, undefined, "the focused job uses only its exported private socket profile");
+  const gate = job.steps.filter((step) => step.run?.trim() === activationProducerCommand());
+  assert.equal(gate.length, 1);
+  assert.deepEqual(gate[0].env, reviewedReceiptEnvironment("activation-producer-postgres-17"));
+
+  const aggregate = workflow.jobs["postgres-17-suite"];
+  assert.ok(aggregate.needs.includes("activation-producer-postgres-17"));
+  assert.equal(aggregate.steps.filter((step) => step.run?.trim() === aggregateCommand()).length, 1);
+  assert.equal(aggregate.steps.at(-1).env.CI_POSTGRES_ACTIVATION_RESULT,
+    "${{ needs.activation-producer-postgres-17.result }}");
+});
+
+test("the focused producer job selects only the registered socket-profile regressions", async () => {
+  const { workflow } = await loadWorkflow();
+  const selected = selectActivationProducerPlan(await planPostgresSuite());
+  const expectedFiles = [
+    "postgres-test/classification-correction.spec.mjs",
+    "postgres-test/typed-v12-domain-unchanged.spec.mjs",
+    "postgres-test/typed-v12-predecessor-day-count.spec.mjs",
+  ];
+  assert.deepEqual(selected.files.map(({ file }) => file), expectedFiles);
+  assert.deepEqual(ACTIVATION_PRODUCER_FILES, expectedFiles);
+  assert.ok(selected.files.every(({ runner, profile }) => runner === "node" && profile === "SOCKET"));
+
+  const job = workflow.jobs["activation-producer-postgres-17"];
+  assert.equal(runs(job).filter((command) => command === activationProducerCommand()).length, 1);
+  const omitted = { ...selected, files: selected.files.slice(1) };
+  assert.throws(() => selectActivationProducerPlan(omitted), { code: "ACTIVATION_SPEC_NOT_REGISTERED" });
+  const wrongProfile = {
+    ...selected,
+    files: selected.files.map((entry, index) => index === 0 ? { ...entry, profile: "HOST" } : entry),
+  };
+  assert.throws(() => selectActivationProducerPlan(wrongProfile), { code: "ACTIVATION_SPEC_PROFILE_DRIFT" });
+});
+
+test("the focused runner reuses TAP parsing and rejects skipped PostgreSQL tests", async () => {
+  const calls = [];
+  const skippedTap = `TAP version 13
+# Subtest: synthetic gated test
+ok 1 - synthetic gated test # SKIP
+1..1
+# tests 1
+# suites 0
+# pass 0
+# fail 0
+# cancelled 0
+# skipped 1
+# todo 0
+`;
+  const summary = await runActivationProducerSuite({
+    environment: {
+      PG_TEST_SOCKET: "/private/tmp/tibotattle-pg-focused/socket",
+      PG_TEST_PORT: "5432",
+    },
+    run: async (args, options) => {
+      calls.push({ args, cwd: options.cwd, socket: options.env.PG_TEST_SOCKET });
+      return { exitCode: 0, stdout: skippedTap };
+    },
+  });
+  assert.equal(calls.length, ACTIVATION_PRODUCER_FILES.length);
+  assert.deepEqual(calls.map(({ args }) => args.at(-1)), ACTIVATION_PRODUCER_FILES.map((file) => `./${file}`));
+  assert.ok(calls.every(({ socket }) => socket === "/private/tmp/tibotattle-pg-focused/socket"));
+  assert.equal(summary.status, "failed");
+  assert.equal(summary.skipped.length, ACTIVATION_PRODUCER_FILES.length);
+  assert.ok(summary.failures.every(({ code }) => code === "SILENTLY_SKIPPED"));
 });
 
 test("Worker partition contract rejects missing, overlapping, weakened or cross-attempt stage aggregation", async () => {
@@ -598,7 +680,7 @@ test("the measurement prerequisite contract rejects missing, weakened, duplicate
   }
 });
 
-test("only the three PostgreSQL producer jobs get the container's loopback TCP pair", async () => {
+test("only the three PostgreSQL partition jobs get the container's loopback TCP pair", async () => {
   // Without the pair the journal-transfer spec's TCP tests skip, which the
   // suite reports as SILENTLY_SKIPPED; with a wrong port they fail to connect.
   const { workflow } = await loadWorkflow();
@@ -608,7 +690,7 @@ test("only the three PostgreSQL producer jobs get the container's loopback TCP p
   for (const id of ["postgres-17-core-a", "postgres-17-core-b", "postgres-17-edge-e2e"]) {
     assert.deepEqual(workflow.jobs[id].env, { PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: publish[0][1] });
   }
-  for (const id of [...WORKER_STAGE_IDS, "worker-gate", "cloud-run-check", "postgres-17-suite"]) {
+  for (const id of [...WORKER_STAGE_IDS, "worker-gate", "cloud-run-check", "postgres-17-suite", "activation-producer-postgres-17"]) {
     assert.equal(Object.keys(workflow.jobs[id].env ?? {}).some((name) => name.startsWith("PG_TEST_")), false,
       `${id} never dials the TCP pair`);
   }
@@ -1473,7 +1555,9 @@ function reviewedReceiptEnvironment(id) {
   if (id === "postgres-17-suite") return { ...source,
     CI_POSTGRES_CORE_A_RESULT: "${{ needs.postgres-17-core-a.result }}",
     CI_POSTGRES_CORE_B_RESULT: "${{ needs.postgres-17-core-b.result }}",
-    CI_POSTGRES_EDGE_E2E_RESULT: "${{ needs.postgres-17-edge-e2e.result }}" };
+    CI_POSTGRES_EDGE_E2E_RESULT: "${{ needs.postgres-17-edge-e2e.result }}",
+    CI_POSTGRES_ACTIVATION_RESULT: "${{ needs.activation-producer-postgres-17.result }}" };
+  if (id === "activation-producer-postgres-17") return source;
   assert.ok(PARTITION_PLAN.some((entry) => entry.id === id), `${id} has no reviewed expression env`);
   return source;
 }
@@ -1487,12 +1571,16 @@ function partitionCommand(partition, stem) {
 function aggregateCommand() {
   return ["set -euo pipefail", 'test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"',
     'test "$CI_POSTGRES_CORE_A_RESULT" = "success"', 'test "$CI_POSTGRES_CORE_B_RESULT" = "success"',
-    'test "$CI_POSTGRES_EDGE_E2E_RESULT" = "success"',
+    'test "$CI_POSTGRES_EDGE_E2E_RESULT" = "success"', 'test "$CI_POSTGRES_ACTIVATION_RESULT" = "success"',
     `node ${SUITE_SCRIPT} --aggregate "$RUNNER_TEMP/postgres-17-core-a/postgres-17-core-a.json" "$RUNNER_TEMP/postgres-17-core-b/postgres-17-core-b.json" "$RUNNER_TEMP/postgres-17-edge-e2e/postgres-17-edge-e2e.json"`].join("\n");
+}
+function activationProducerCommand() {
+  return ["set -euo pipefail", 'test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"',
+    `node ${ACTIVATION_PRODUCER_SUITE_SCRIPT}`].join("\n");
 }
 function partitionWorkflowFailures(workflow) {
   const failures = [];
-  if (JSON.stringify(Object.keys(workflow.jobs)) !== JSON.stringify(Object.keys(NODE_PLAN))) failures.push("the nine reviewed jobs are not present exactly once");
+  if (JSON.stringify(Object.keys(workflow.jobs)) !== JSON.stringify(Object.keys(NODE_PLAN))) failures.push("the ten reviewed jobs are not present exactly once");
   for (const [id, job] of Object.entries(workflow.jobs)) {
     const checkouts = job.steps.filter(step => step.uses === CHECKOUT);
     if (id === "worker-gate") {
@@ -1531,7 +1619,9 @@ function partitionWorkflowFailures(workflow) {
   }
   const aggregate = workflow.jobs["postgres-17-suite"];
   if (!aggregate) { failures.push("the required aggregate is missing"); return failures; }
-  if (JSON.stringify(aggregate.needs) !== JSON.stringify(PARTITION_PLAN.map(entry => entry.id))) failures.push("the aggregate needs all exact child jobs");
+  if (JSON.stringify(aggregate.needs) !== JSON.stringify([
+    ...PARTITION_PLAN.map(entry => entry.id), "activation-producer-postgres-17",
+  ])) failures.push("the aggregate needs every exact partition and the focused activation producer");
   if (aggregate.if !== "always()" || aggregate["continue-on-error"] !== undefined || aggregate["timeout-minutes"] !== 45) failures.push("the aggregate must always run and fail closed within 45 minutes");
   if (aggregate.env !== undefined || aggregate.steps.some(step => step.if !== undefined || step["continue-on-error"] !== undefined)) failures.push("aggregate provenance and prerequisites must not be overridden or conditional");
   if (aggregate.services !== undefined || runs(aggregate).some(command => command === START_POSTGRES || command === STOP_POSTGRES)) failures.push("the aggregate must not execute PostgreSQL tests or a database");

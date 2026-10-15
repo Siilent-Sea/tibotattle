@@ -1,19 +1,20 @@
 name: Hosted backend
 
-# Source-level CI for all nine hosted-backend jobs: three disjoint Worker
+# Source-level CI for all ten hosted-backend jobs: three disjoint Worker
 # producers and their required aggregate, the Cloud Run host check with its
-# offline production-tooling checks, and every apps/worker/postgres-test spec
-# against PostgreSQL 17 in its routed environment profile.
+# offline production-tooling checks, a focused activation-producer regression,
+# and every apps/worker/postgres-test spec against PostgreSQL 17 in its routed
+# environment profile.
 #
 # PostgreSQL 17 is the official postgres image pinned by digest in
 # apps/worker/scripts/ci-postgres-container.mjs, run as the runner uid with a
 # private 0700 socket directory. The PGDG apt fallback documented there is not
 # in use.
 #
-# Execution jobs use Node.js 26.2.0. The PostgreSQL producer jobs also install
-# Node.js 22.16.0, the Cloud Run image runtime, and name it to the receipt
-# producer as EDGE_E2E_NODE. EDGE_E2E runs the Cloud Run origin under that image
-# runtime. All three PostgreSQL producers install 22.16.0 first and 26.2.0
+# Execution jobs use Node.js 26.2.0. The three partitioned PostgreSQL producers
+# also install Node.js 22.16.0, the Cloud Run image runtime, and name it to the
+# receipt producer as EDGE_E2E_NODE. EDGE_E2E runs the Cloud Run origin under
+# that image runtime. Those three producers install 22.16.0 first and 26.2.0
 # last, so `node` on PATH and the suite stay on 26.2.0. EDGE_E2E's seeding
 # rehearsal needs that newer node:sqlite. The workflow policy allows 22.16.0
 # here only.
@@ -28,24 +29,27 @@ name: Hosted backend
 # stages and Cloud Run check run their own PostgreSQL-gated checks (for example
 # apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
 # with the SOCKET profile exported, but a skip inside those checks is reported
-# by node:test without failing the job.
+# by node:test without failing the job. The focused activation producer runner
+# applies the same TAP parser with zero-skip enforcement to its fixed files.
 #
 # The Cloud Run check also runs the offline parts of
 # gcp:production-tooling:local-check (the rollout CLI, the cutover barrier
 # capture, the infrastructure manifest and the cutover seal), which need no
 # PostgreSQL, network or credential. It checks out full history, because the
 # cutover seal check reads pinned commits as git objects; it fails, and never
-# skips, when they are absent. All three PostgreSQL producers check out full
-# history because READ-EXPANSION specs archive their pinned base commit. The
+# skips, when they are absent. The three PostgreSQL partition producers and the
+# focused activation producer check out full history; READ-EXPANSION specs in
+# the partitioned jobs archive their pinned base commit. The
 # Worker runtime-test stage also checks out full history for immutable
 # vendored-kernel source, facade and transition verification. The PostgreSQL-
 # backed part of gcp:production-tooling:local-check,
 # postgres-production-migrations.spec.mjs and
 # github-distribution-manifest-visibility.spec.mjs runs in a CORE shard.
 # The postgres-17-suite aggregate verifies exact same-run receipts, source/runtime
-# provenance, equal generated build inputs across CORE_A and CORE_B, and complete
-# disjoint coverage. The Worker gate aggregate requires all three Worker stages
-# to succeed with matching source SHA, run ID and attempt.
+# provenance, equal generated build inputs across CORE_A and CORE_B, complete
+# disjoint coverage, and success of the focused activation-producer job. The
+# Worker gate aggregate requires all three Worker stages to succeed with
+# matching source SHA, run ID and attempt.
 # PR jobs explicitly select the actual pull-request head, not the provider
 # synthetic merge revision. Push and dispatch jobs select github.sha. All
 # producer provenance binds that same selected source; GITHUB_SHA remains
@@ -783,6 +787,7 @@ jobs:
       - postgres-17-core-a
       - postgres-17-core-b
       - postgres-17-edge-e2e
+      - activation-producer-postgres-17
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -838,10 +843,64 @@ jobs:
           CI_POSTGRES_CORE_A_RESULT: ${{ needs.postgres-17-core-a.result }}
           CI_POSTGRES_CORE_B_RESULT: ${{ needs.postgres-17-core-b.result }}
           CI_POSTGRES_EDGE_E2E_RESULT: ${{ needs.postgres-17-edge-e2e.result }}
+          CI_POSTGRES_ACTIVATION_RESULT: ${{ needs.activation-producer-postgres-17.result }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"
           test "$CI_POSTGRES_CORE_A_RESULT" = "success"
           test "$CI_POSTGRES_CORE_B_RESULT" = "success"
           test "$CI_POSTGRES_EDGE_E2E_RESULT" = "success"
+          test "$CI_POSTGRES_ACTIVATION_RESULT" = "success"
           node apps/worker/scripts/ci-postgres-suite.mjs --aggregate "$RUNNER_TEMP/postgres-17-core-a/postgres-17-core-a.json" "$RUNNER_TEMP/postgres-17-core-b/postgres-17-core-b.json" "$RUNNER_TEMP/postgres-17-edge-e2e/postgres-17-edge-e2e.json"
+
+  activation-producer-postgres-17:
+    name: PostgreSQL 17 activation producer qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install locked root, Worker and Cloud Run dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm --prefix apps/worker ci
+          npm --prefix apps/worker/cloud-run ci
+
+      - name: Create the private PostgreSQL socket root
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /private/tmp
+          sudo chmod 1777 /private/tmp
+
+      - name: Start PostgreSQL 17 and export the SOCKET profile
+        run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
+
+      - name: Verify the selected revision and run focused activation producer regressions
+        env:
+          CI_POSTGRES_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CI_POSTGRES_EXPECTED_HEAD"
+          node apps/worker/scripts/ci-postgres-activation-producer-suite.mjs
+
+      - name: Stop PostgreSQL 17
+        if: always()
+        run: node apps/worker/scripts/ci-postgres-container.mjs --stop
