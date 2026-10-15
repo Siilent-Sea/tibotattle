@@ -53,8 +53,18 @@ Pass resolved absolute binary paths, not mutable symlinks. The script validates
 each binary's version and SHA-256 before executing the workload.
 
 Source admission applies the existing raw-line resource limit before parsing
-and interval selection, including oversized unfinished structured tails. An
-`export_resource_line_bytes` refusal is not a stale-receipt repair opportunity:
+and interval selection, including oversized unfinished structured tails. The
+Claude transcript reader has one bounded exception for complete lines that
+cannot carry usage: it scans all bytes without retaining the oversized line,
+and skips and counts it only when neither the literal `"usage"` token nor a
+JSON Unicode escape (`\u`) occurs. Escaped keys can spell `usage`, so any Unicode
+escape conservatively keeps the line subject to the limit, even in an unrelated
+value. Skipped lines remain bound by the frozen prefix hash and line count and
+are reported as `oversizedIrrelevantLines`. This exception does not select files
+or records by date, path, or presumed record type; unfinished tails and
+potentially relevant complete lines still fail closed at the unchanged bound.
+
+An `export_resource_line_bytes` refusal is not a stale-receipt repair opportunity:
 do not raise the limit, filter out a source or record, change the registered
 interval, or substitute derived state for the raw corpus to obtain a passing
 matrix. Out-of-interval records can affect canonical duplicate selection.
