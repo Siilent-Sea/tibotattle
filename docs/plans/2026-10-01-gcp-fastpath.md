@@ -348,7 +348,10 @@ PG_TEST_SOCKET=<local PostgreSQL 17 socket> PG_TEST_PORT=<port> \
   --per-date-expected apps/worker/analytics-v2-test/golden-q1-node/per-date-expected.json
 ```
 
-(`npm run gcp:fastpath:rehearsal` in `apps/worker` runs the same. The
+(`npm run gcp:fastpath:rehearsal` in `apps/worker` ran the same command at
+this checkpoint. The current alias explicitly selects the versioned Q-1
+expectation contract described in the maintained
+[edge runbook](../runbooks/production-edge-modes.md). The
 per-date expectation was added on 2026-10-02: under OD-12 the rehearsal
 accepts the fast path's publication of the oracle's withheld model dates
 only with exactly the values the oracle's per-date expectation holds, and
