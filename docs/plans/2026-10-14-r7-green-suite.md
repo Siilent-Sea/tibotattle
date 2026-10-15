@@ -2,15 +2,17 @@
 title: R7 admission repair and complete suite verification
 date: 2026-10-14
 type: plan
-status: blocked
+status: in-progress
 ---
 
 # R7 admission repair and complete suite verification
 
-The pre-PR source repairs and full root validation are complete. R7 receipt freshness
-remains blocked: the available corpus exceeds the unchanged line-admission
-limit, and no complete, unmodified replacement snapshot has been identified.
-The suite is not green.
+The pre-PR source repairs and full root validation are complete. The integrated
+candidate's two Claude ingestion failures have reviewed source repairs; R7
+receipt freshness and a complete final suite remain pending. No resource limit
+or test assertion was relaxed. An inherited exporter policy may change the earlier raw-input
+blocker, but no successful admission or fresh matrix is established yet. The
+suite is not green.
 
 The owner requested resolution of the remaining R7 blockers and a complete
 green root suite without weakening checks. Work starts from clean
@@ -30,7 +32,7 @@ timeout, partial receipt reuse, or private-input alteration is permitted.
 | Admission contract reviewer | Independently trace discovery, line admission, interval filtering, source frontiers and integrity contracts | Existing limit refusal confirmed; strengthening correction specified |
 | Benchmark cancellation owner | Propagate cancellation to the owned child without changing workload, timeout or assertions | Implemented in `9b4bb3d5733151efe62f68b713c306ed7f479312`; independent review and 121 focused checks passed |
 | Snapshot investigator | Inspect documented artifacts and bounded local metadata for an existing complete, unmodified corpus snapshot | No candidate found in the documented locations checked |
-| Coordinator | Integrate reviewed fixes, freeze source, supervise authorized validation and record exact outcomes | Full root run complete; receipt regeneration blocked pending admissible raw input |
+| Coordinator | Integrate reviewed fixes, freeze source, supervise authorized validation and record exact outcomes | Integrated root run complete; new source repairs and admission readiness in progress |
 
 The authorized private-history operation remains local and follows the
 [R7 maintenance runbook](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md).
@@ -46,7 +48,7 @@ A bounded local byte-count census now establishes one complete structured line
 of 30,678,766 bytes above the existing 16,777,216-byte (16 MiB) limit and no
 unfinished tails or observed source identity/size changes. No source contents,
 filenames or identifiers were parsed,
-copied or emitted. The refusal is required by the current admission contract;
+copied or emitted. The refusal was required by the pre-integration implementation;
 interval/type eligibility remains unknown and does not bypass the preparse cap.
 The owner was unsure whether a complete unmodified historical snapshot exists.
 No input selection, filtering or substitution has been performed.
@@ -60,7 +62,7 @@ elsewhere, and no undocumented private location was searched.
 Independent synthetic probes found a separate under-rejection: a file with no
 newline and exactly limit-plus-one bytes can pass the tail search as an empty
 prefix. Correcting both Claude helpers strengthens the existing boundary, but
-cannot admit the genuinely oversized current record. The retained oversized-tail
+did not admit the oversized current record under that implementation. The retained oversized-tail
 refusal, exact-limit behavior and old frozen-prefix verification must remain.
 
 A synthetic Node test also confirmed that the outer test timeout does not stop
@@ -69,8 +71,8 @@ must prevent receipt emission after cancellation and preserve the private task
 tree if termination cannot be confirmed. This is a cleanup defect, not an
 established explanation for the initial timing slowdown.
 
-A fresh matrix cannot be produced from the current corpus under the unchanged
-limit. No blind regeneration retry is justified. Any existing snapshot must be
+Before main integration, a fresh matrix could not be produced from the current
+corpus under the unchanged limit. No blind regeneration retry is justified. Any existing snapshot must be
 complete, unmodified and suitable under the same evidence contract; derived
 receipts or plans cannot substitute for missing raw input. A passing focused
 retry alone is not a green complete suite.
@@ -111,9 +113,9 @@ R7 receipts are byte-for-byte unchanged from the previous closeout, and no
 regeneration journal, staging or backup artifact remains. No fresh matrix or
 green aggregate suite has been established.
 
-## Required input to resume
+## Pre-integration input blocker
 
-The next dependency is an owner-supplied exact location and provenance for an
+Before integrating current main, the next dependency was an owner-supplied exact location and provenance for an
 existing complete, unmodified raw corpus snapshot suitable under the unchanged
 identity contract and registered 24 June–25 July 2026 interval. That snapshot
 must first pass bounded, owner-only admission and integrity verification. If
@@ -121,8 +123,8 @@ it qualifies, regenerate all ten receipts together on frozen source under both
 pinned runtimes, rerun freshness checks, and rerun the complete root suite.
 Keep any supplied private location out of this document and test artifacts.
 
-The owner is unsure whether such a snapshot exists. No compliant local path to
-green remains with the currently available inputs. A filtered copy that removes
+The owner was unsure whether such a snapshot exists. No compliant local path to
+green remained under the pre-integration implementation with the available inputs. A filtered copy that removes
 the oversized record does not preserve the evidence. Changing the admission cap
 or input policy requires a separate explicit product decision outside these
 repairs. Native qualification, signing, release and deployment remain separate
@@ -192,3 +194,51 @@ tests containing three failed multi-row cases. Independent review, TypeScript,
 documentation and all 23 preflight checks passed. No production admission
 limit, timeout or assertion was relaxed. Full root and final hosted results
 remain pending for the corrected candidate.
+
+The complete root suite on clean, pushed
+`10ed81fb6e0a3adecde214fbbe57f6bc7b559152` finished in 479.127 seconds:
+6,394 tests, 6,346 passes, four failures, zero cancellations and 44 platform
+skips. Two failures remain the R7 workload-hash freshness checks. The other two
+are the incremental same-length mutation rejection and complete-line CR byte
+boundary case. The incremental fast path truncates timestamps to milliseconds;
+the proposed repair preserves sub-millisecond precision without adding a full
+prefix scan to unchanged refreshes. Final assertion details confirm a missing
+expected rejection in both Claude cases. Hosted Cloud Run checks passed on
+this commit; Worker and PostgreSQL gates are still running.
+
+Main commit `8a2e1783a326762468c7b9eebf3a62e1d67f865b` records an accepted
+exporter repair that uses the existing bounded skip-and-count rule for complete
+Claude lines incapable of carrying usage. This preserves complete raw inputs
+and their integrity coverage, but its literal-only key detection misses escaped
+JSON keys. The corrective work must conservatively retain such lines as
+potentially relevant, preserve the exact 16 MiB and unfinished-tail limits,
+retain irrelevant-line counters and update the boundary fixture to exercise a
+usage-bearing record. The maintenance runbook must distinguish this bounded
+reader behavior from prohibited input filtering. The private oversized record
+has not been classified under the corrected predicate. Only reviewed source,
+passing synthetic regressions and a frozen candidate can justify a new protected
+regeneration attempt; no private-input retry has occurred at this stage.
+
+On 15 October 2026, both source corrections completed independent review with
+no actionable findings. All 52 owning tests passed on each pinned runtime,
+Node.js 24.14.0 and 26.2.0, as did the three affected synthetic benchmark cases
+on each runtime. Architecture passed with 1,006 production files, 4,367 imports
+and zero debt edges; documentation, all 23 preflight checks and whitespace also
+passed. The escaped-key regression demonstrably fails against the old source.
+
+The canonicalizer now retains fractional timestamps and migrates v0.2 stores
+forward to v0.3 with nullable precision metadata. Legacy rows revalidate their
+prefix once before using the unchanged fast path; parsing metrics and bounded
+tail work remain intact. A transactional database guard prevents actual v0.2
+readers from overwriting the v0.3 schema marker. Historical-reader probes on
+fresh and migrated populated stores preserve version, schema and logical rows.
+Unknown/newer closed stores are refused without changing their bytes or creating
+sidecars. Existing live-WAL reads retain SQLite coordination to see committed
+versions; coordination bytes are not claimed immutable. Identical or deliberately
+restored filesystem timestamps remain outside the metadata fast-path guarantee.
+
+Both pinned binaries, all ten unchanged owner-only receipt destinations and
+absence of transaction artifacts were reverified. The next step is one complete
+protected regeneration attempt after committing and freezing these repairs.
+This is justified by the reviewed inherited reader policy and its new escaped-key
+correction, not by a changed cap, interval, selected corpus or receipt hash.
