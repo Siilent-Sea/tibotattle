@@ -1972,6 +1972,8 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
     ENROLLMENT_RATE_LIMIT: 20, RECOVERY_RATE_LIMIT: 20, CLIENT_ATTEMPT_RATE_LIMIT: 5, PUBLIC_READ_RATE_LIMIT: 120,
     UPLOAD_AUTHORIZATION_RATE_LIMIT: 3000, UPLOAD_PRINCIPAL_RATE_LIMIT: 3000,
     UPLOAD_INGRESS_REQUEST_RATE_LIMIT: 3000, UPLOAD_INGRESS_CLIENT_RATE_LIMIT: 3000,
+    // Edge-local operational guards are separate from route-admission replay.
+    PUBLIC_PROBE_RATE_LIMIT: 60, PUBLIC_PROBE_CLIENT_RATE_LIMIT: 12, SPARKLE_APPCAST_GUARD_RATE_LIMIT: 60,
   }, "the checked-in env.production limits");
   const edge = await createEdgeInstance({ ...f.common, mode: "gcp", frontEnd: f.frontEnd,
     invokerKeyJson: f.invoker.keyJson, limits });
@@ -2377,7 +2379,9 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.deepEqual(familyTable(parity), familyTable(rehearsal.parity),
       "the edge read reproduces the rehearsal's parity table on this commit");
     if (perDateExpected !== null) {
-      assert.equal(parity.unexpectedDiffs, 0, "the edge read equals the golden and its per-date expectation");
+      // Fixed comparator families and counters only; never include leaf paths or values.
+      assert.equal(parity.unexpectedDiffs, 0, "the edge read equals the golden and its per-date expectation: "
+        + JSON.stringify({ families: familyTable(parity) }));
     }
     f.rows.push({ stage: "S9", id: "golden", bytes: answer.body.length,
       sha256: createHash("sha256").update(answer.body).digest("hex"), cacheControl: answer.header("cache-control"),
