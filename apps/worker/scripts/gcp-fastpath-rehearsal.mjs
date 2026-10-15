@@ -187,6 +187,8 @@ const CURRENT_D7_CASE_DIRECTORY = Object.freeze({
 const CURRENT_D7_STATEMENT_TIMEOUT_RESERVE_MS = 1_000;
 const CURRENT_D7_ORIGIN_TERM_GRACE_MS = 1_000;
 const CURRENT_D7_ORIGIN_KILL_REAP_MS = 1_000;
+const CURRENT_D7_ORIGIN_READINESS_CHALLENGE = "current-d7-origin-readiness-challenge-v1";
+const CURRENT_D7_ORIGIN_READINESS_ACK = "current-d7-origin-readiness-ack-v1";
 const INTERNAL_CURRENT_D7_CASE = Symbol("internal-current-d7-case");
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
 const DEFAULT_REFRESH_TIMEOUT_MINUTES = 30;
@@ -862,75 +864,165 @@ async function stopCurrentD7OwnedChild(child, exited, spawned) {
   return result;
 }
 
-/** Await an already-spawned owned origin child's readiness and reap it on failure. */
-export async function awaitCurrentD7OriginReadiness(child, { readyTimeoutMs }) {
+/** Await the owned origin child's stdout record and nonce-bound IPC acknowledgement. */
+export async function awaitCurrentD7OriginReadiness(child, { readyTimeoutMs, readinessNonce }) {
   if (!child || !child.stdout || !child.stderr || typeof child.kill !== "function"
-    || !Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs < 1) {
+    || typeof child.send !== "function" || !Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs < 1
+    || typeof readinessNonce !== "string" || !/^[a-f0-9]{64}$/u.test(readinessNonce)) {
     fail("REHEARSAL_ORIGIN_START_FAILED");
   }
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4_000); });
-  const spawned = new Promise((resolveSpawned) => {
+  const spawned = child.pid !== undefined ? Promise.resolve(true) : new Promise((resolveSpawned) => {
     child.once("spawn", () => resolveSpawned(true));
     child.once("error", () => resolveSpawned(false));
   });
-  const exited = new Promise((resolveExit) => {
-    child.once("exit", (code, signal) => resolveExit({ code, signal }));
-    child.once("error", () => {
-      if (child.pid === undefined) resolveExit({ spawnError: true });
+  const exited = child.exitCode !== null || child.signalCode !== null
+    ? Promise.resolve({ code: child.exitCode, signal: child.signalCode })
+    : new Promise((resolveExit) => {
+      child.once("exit", (code, signal) => resolveExit({ code, signal }));
+      child.once("error", () => {
+        if (child.pid === undefined) resolveExit({ spawnError: true });
+      });
     });
-  });
   try {
-    const ready = await new Promise((resolveReady, reject) => {
-      let buffer = "";
+    return await new Promise((resolveReady, rejectReady) => {
+      let buffer = Buffer.alloc(0);
+      let readyRecord = null;
+      let readinessRecordConsumed = false;
+      let challengeSent = false;
+      let challengeDeliveryConfirmed = false;
+      let acknowledged = false;
+      let ipcUnavailable = !child.connected;
+      let spawnConfirmed = child.pid !== undefined;
       let settled = false;
+      const deadlineMonotonicMs = performance.now() + readyTimeoutMs;
+      let timer;
+      const expire = () => finish(rejectReady, new RehearsalError(ipcUnavailable
+        ? "REHEARSAL_ORIGIN_START_FAILED" : "REHEARSAL_ORIGIN_START_TIMEOUT"));
+      const expireIfPastDeadline = () => {
+        if (performance.now() < deadlineMonotonicMs) return false;
+        expire();
+        return true;
+      };
       const finish = (work, value) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         child.stdout.removeListener("data", onData);
+        child.removeListener("message", onMessage);
         child.removeListener("error", onError);
+        child.removeListener("disconnect", onDisconnect);
+        child.removeListener("spawn", onSpawn);
         work(value);
       };
+      const maybeResolve = () => {
+        if (expireIfPastDeadline()) return;
+        if (ipcUnavailable || !child.connected) return;
+        if (!spawnConfirmed || readyRecord === null || !acknowledged) return;
+        if (!challengeDeliveryConfirmed) return;
+        if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+          finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
+          return;
+        }
+        finish(resolveReady, { ready: readyRecord, exited });
+      };
       const onData = (chunk) => {
-        buffer += chunk;
-        const newline = buffer.indexOf("\n");
-        if (newline < 0) return;
+        if (readinessRecordConsumed || expireIfPastDeadline()) return;
+        let chunkBytes;
+        try { chunkBytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); }
+        catch { finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED")); return; }
+        const newline = chunkBytes.indexOf(0x0a);
+        if (newline < 0) {
+          if (buffer.length + chunkBytes.length > 8_192) {
+            finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
+            return;
+          }
+          buffer = Buffer.concat([buffer, chunkBytes]);
+          return;
+        }
+        if (buffer.length + newline > 8_192) {
+          finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
+          return;
+        }
+        const line = Buffer.concat([buffer, chunkBytes.subarray(0, newline)]).toString("utf8");
+        buffer = Buffer.alloc(0);
+        readinessRecordConsumed = true;
+        child.stdout.removeListener("data", onData);
+        let value;
         try {
-          const value = JSON.parse(buffer.slice(0, newline));
-          if (value === null || typeof value !== "object" || typeof value.origin !== "string") {
+          value = JSON.parse(line);
+          if (value === null || typeof value !== "object" || Array.isArray(value) || typeof value.origin !== "string") {
             throw new Error("invalid readiness record");
           }
-          finish(resolveReady, value);
-        } catch { finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED")); }
-      };
-      const onError = () => finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
-      const timer = setTimeout(() => finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_TIMEOUT")), readyTimeoutMs);
-      child.stdout.on("data", onData);
-      child.once("error", onError);
-      exited.then((outcome) => {
-        if (outcome !== null) {
-          const last = stderr.trim().split("\n").filter(Boolean).at(-1) ?? "";
-          let childCode = "REHEARSAL_ORIGIN_EXITED";
+        } catch { finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED")); return; }
+        readyRecord = value;
+        challengeSent = true;
+        if (!child.connected) ipcUnavailable = true;
+        else {
           try {
-            const parsedCode = JSON.parse(last).code;
-            if (typeof parsedCode === "string" && /^[A-Z0-9_]{1,80}$/u.test(parsedCode)) childCode = parsedCode;
-          } catch { /* keep the closed child code */ }
-          finish(reject, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED", { childCode }));
+            child.send({ type: CURRENT_D7_ORIGIN_READINESS_CHALLENGE, nonce: readinessNonce }, (error) => {
+              if (error) ipcUnavailable = true;
+              else challengeDeliveryConfirmed = true;
+              maybeResolve();
+            });
+          } catch { ipcUnavailable = true; }
         }
+        maybeResolve();
+      };
+      const onMessage = (message) => {
+        if (expireIfPastDeadline()) return;
+        if (ipcUnavailable || !child.connected) {
+          ipcUnavailable = true;
+          return;
+        }
+        if (!challengeSent || readyRecord === null) {
+          finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
+          return;
+        }
+        let valid = false;
+        try {
+          const acknowledgement = exactCurrentD7Keys(message, ["type", "nonce", "origin"],
+            "REHEARSAL_ORIGIN_START_FAILED");
+          valid = acknowledgement.type === CURRENT_D7_ORIGIN_READINESS_ACK
+            && acknowledgement.nonce === readinessNonce && acknowledgement.origin === readyRecord.origin;
+        } catch { /* reject only with the closed origin-start error */ }
+        if (!valid) {
+          finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
+          return;
+        }
+        acknowledged = true;
+        maybeResolve();
+      };
+      const onError = () => { ipcUnavailable = true; };
+      // ChildProcess may emit disconnect before exit and still have exitCode=null.
+      // Defer classification to the exit event or this same readiness deadline.
+      const onDisconnect = () => { ipcUnavailable = true; };
+      const onSpawn = () => { spawnConfirmed = true; maybeResolve(); };
+      const onExit = (outcome) => {
+        if (outcome === null) return;
+        const last = stderr.trim().split("\n").filter(Boolean).at(-1) ?? "";
+        let childCode = "REHEARSAL_ORIGIN_EXITED";
+        try {
+          const parsedCode = JSON.parse(last).code;
+          if (typeof parsedCode === "string" && /^[A-Z0-9_]{1,80}$/u.test(parsedCode)) childCode = parsedCode;
+        } catch { /* keep the closed child code */ }
+        finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED", { childCode }));
+      };
+      timer = setTimeout(expire, Math.max(0, deadlineMonotonicMs - performance.now()));
+      child.stdout.on("data", onData);
+      child.on("message", onMessage);
+      child.once("error", onError);
+      child.once("disconnect", onDisconnect);
+      if (child.pid === undefined) child.once("spawn", onSpawn);
+      spawned.then((didSpawn) => {
+        if (!didSpawn) finish(rejectReady, new RehearsalError("REHEARSAL_ORIGIN_START_FAILED"));
+        else { spawnConfirmed = true; maybeResolve(); }
       });
+      exited.then(onExit);
+      if (!child.connected) ipcUnavailable = true;
+      if (child.exitCode !== null || child.signalCode !== null) onExit({ code: child.exitCode, signal: child.signalCode });
     });
-    const didSpawn = await waitForCurrentD7OwnedChildExit(spawned, Math.min(readyTimeoutMs, CURRENT_D7_ORIGIN_TERM_GRACE_MS));
-    if (didSpawn !== true) throw new RehearsalError("REHEARSAL_ORIGIN_START_FAILED");
-    // A child can print readiness and exit in the same turn. Give queued exit
-    // events a short bounded window before handing a dead origin to the caller.
-    if (await waitForCurrentD7OwnedChildExit(exited, 10) !== null) {
-      throw new RehearsalError("REHEARSAL_ORIGIN_START_FAILED");
-    }
-    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
-      throw new RehearsalError("REHEARSAL_ORIGIN_START_FAILED");
-    }
-    return { ready, exited };
   } catch (error) {
     await stopCurrentD7OwnedChild(child, exited, spawned);
     const code = error?.code === "REHEARSAL_ORIGIN_START_TIMEOUT"
@@ -1452,6 +1544,10 @@ async function originChild() {
   const config = JSON.parse(process.env.GCP_FASTPATH_REHEARSAL_ORIGIN ?? "null");
   if (config === null || typeof config !== "object") fail("REHEARSAL_ORIGIN_CONFIG_INVALID");
   delete process.env.GCP_FASTPATH_REHEARSAL_ORIGIN;
+  const readinessNonce = config.readinessNonce;
+  if (readinessNonce !== undefined && (typeof readinessNonce !== "string" || !/^[a-f0-9]{64}$/u.test(readinessNonce))) {
+    fail("REHEARSAL_ORIGIN_CONFIG_INVALID");
+  }
   let deadlineMonotonicMs;
   if (config.deadlineDurationMs !== undefined) {
     if (!Number.isSafeInteger(config.deadlineDurationMs) || config.deadlineDurationMs < 1
@@ -1460,6 +1556,24 @@ async function originChild() {
   }
   const started = await startOrigin({ endpoint: config.endpoint, schema: config.schema, nowMs: config.nowMs,
     deadlineMonotonicMs });
+  if (readinessNonce !== undefined) {
+    if (typeof process.send !== "function") fail("REHEARSAL_ORIGIN_START_FAILED");
+    let acknowledged = false;
+    process.on("message", (message) => {
+      if (acknowledged) return;
+      let valid = false;
+      try {
+        const challenge = exactCurrentD7Keys(message, ["type", "nonce"], "REHEARSAL_ORIGIN_START_FAILED");
+        valid = challenge.type === CURRENT_D7_ORIGIN_READINESS_CHALLENGE && challenge.nonce === readinessNonce;
+      } catch { /* ignore malformed parent messages and never expose them */ }
+      if (!valid) return;
+      acknowledged = true;
+      try {
+        process.send({ type: CURRENT_D7_ORIGIN_READINESS_ACK, nonce: readinessNonce, origin: started.origin },
+          (error) => { if (error) process.exitCode = 1; });
+      } catch { process.exitCode = 1; }
+    });
+  }
   process.stdout.write(`${JSON.stringify({ origin: started.origin, mode: started.mode, node: process.version })}\n`);
 }
 
@@ -1468,6 +1582,7 @@ async function spawnOrigin({ node, endpoint, schema, nowMs, deadlineMonotonicMs 
   const readyTimeoutMs = deadlineMonotonicMs === undefined ? 60_000
     : Math.min(60_000, currentD7RemainingMs(deadlineMonotonicMs));
   const deadlineDurationMs = deadlineMonotonicMs === undefined ? undefined : currentD7RemainingMs(deadlineMonotonicMs);
+  const readinessNonce = deadlineMonotonicMs === undefined ? undefined : randomBytes(32).toString("hex");
   const child = spawn(node, [fileURLToPath(import.meta.url), "--origin-child"], {
     cwd: CLOUD_RUN_ROOT,
     env: {
@@ -1476,12 +1591,13 @@ async function spawnOrigin({ node, endpoint, schema, nowMs, deadlineMonotonicMs 
       ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
       ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}),
       GCP_FASTPATH_REHEARSAL_ORIGIN: JSON.stringify({ endpoint, schema, nowMs,
-        ...(deadlineDurationMs === undefined ? {} : { deadlineDurationMs }) }),
+        ...(deadlineDurationMs === undefined ? {} : { deadlineDurationMs }),
+        ...(readinessNonce === undefined ? {} : { readinessNonce }) }),
     },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: deadlineMonotonicMs === undefined ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", "ipc"],
   });
   if (deadlineMonotonicMs !== undefined) {
-    const { ready, exited } = await awaitCurrentD7OriginReadiness(child, { readyTimeoutMs });
+    const { ready, exited } = await awaitCurrentD7OriginReadiness(child, { readyTimeoutMs, readinessNonce });
     return {
       ...ready,
       async close() {

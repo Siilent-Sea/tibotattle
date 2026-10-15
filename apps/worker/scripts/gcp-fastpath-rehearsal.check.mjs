@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
+import { PassThrough } from "node:stream";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -23,6 +24,154 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CURRENT_GOLDEN = join(WORKER_ROOT, "analytics-v2-test", "golden");
 
 const refused = (code) => (error) => error?.code === code;
+
+const READINESS_CHALLENGE = "current-d7-origin-readiness-challenge-v1";
+const READINESS_ACK = "current-d7-origin-readiness-ack-v1";
+const READINESS_NONCE = "1".repeat(64);
+const READINESS_ORIGIN = "http://127.0.0.1:1";
+const READINESS_CHILD_CLEANUP_CAP_MS = 2_000; // Existing 1s TERM plus 1s KILL/reap caps.
+const READINESS_SCHEDULER_MARGIN_MS = 250;
+
+function spawnReadinessChild(mode = "valid") {
+  const code = [
+    "const mode = process.env.READINESS_MODE;",
+    "const nonce = process.env.READINESS_NONCE;",
+    `const origin = ${JSON.stringify(READINESS_ORIGIN)};`,
+    "let extraOutputSent = false;",
+    "if (mode === 'late' || mode === 'staggered') process.on('SIGTERM', () => {});",
+    "else process.on('SIGTERM', () => process.exit(0));",
+    "if (mode === 'disconnect' || mode === 'extra-output') setInterval(() => {}, 1_000);",
+    "if (mode.startsWith('ack-after-')) setInterval(() => {}, 1_000);",
+    "process.on('message', (message) => {",
+    `if (message?.type === 'readiness-test-release-ack' && (mode.startsWith('ack-after-') || mode === 'extra-output')) { process.send({ type: ${JSON.stringify(READINESS_ACK)}, nonce, origin }); return; }`,
+    "if (message?.type === 'readiness-test-go') { const ready = () => { if (mode === 'staggered') process.stderr.write('readiness-test-ready-record\\n'); if (mode === 'oversized-record') { process.stdout.write(JSON.stringify({ origin, padding: 'x'.repeat(9_000) }) + '\\n'); return; } process.stdout.write(JSON.stringify({ origin }) + '\\n'); }; if (mode === 'staggered') setTimeout(ready, 300); else ready(); return; }",
+    `if (message?.type !== ${JSON.stringify(READINESS_CHALLENGE)}) return;`,
+    "if (mode === 'disconnect') { process.disconnect(); return; }",
+    "if (mode === 'extra-output') { if (!extraOutputSent) { extraOutputSent = true; process.stdout.write(JSON.stringify({ origin }) + '\\n'); process.stdout.write('x'.repeat(20_000)); process.stdout.write('y'.repeat(20_000)); } return; }",
+    "if (mode === 'absent') return;",
+    "if (mode === 'staggered') process.stderr.write('readiness-test-ack-pending\\n');",
+    "setTimeout(() => {",
+    `const acknowledgement = { type: ${JSON.stringify(READINESS_ACK)}, nonce: mode === 'invalid' ? '0'.repeat(64) : nonce, origin };`,
+    "process.send(acknowledgement, () => { if (mode === 'late' || mode === 'staggered') process.exit(0); });",
+    "}, mode === 'late' ? 700 : mode === 'staggered' ? 300 : 0);",
+    "});",
+    "process.send({ type: 'readiness-test-ready' });",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", code], {
+    env: { READINESS_MODE: mode, READINESS_NONCE },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  return { child, nonce: READINESS_NONCE };
+}
+
+function requestReadiness(child, readinessNonce, readyTimeoutMs, { sendOverride } = {}) {
+  const started = new Promise((resolveReady, rejectReady) => {
+    const onMessage = (message) => {
+      child.removeListener("error", onError);
+      if (message?.type === "readiness-test-ready") resolveReady();
+      else rejectReady(new Error("synthetic readiness child did not reach its barrier"));
+    };
+    const onError = (error) => {
+      child.removeListener("message", onMessage);
+      rejectReady(error);
+    };
+    child.once("message", onMessage);
+    child.once("error", onError);
+  });
+  return started.then(() => {
+    const readinessPromise = awaitCurrentD7OriginReadiness(child, { readyTimeoutMs, readinessNonce });
+    const sendToChild = child.send.bind(child);
+    if (sendOverride) child.send = (message, callback) => sendOverride(message, callback, sendToChild);
+    sendToChild({ type: "readiness-test-go" }, (error) => {
+      if (error) child.kill("SIGTERM");
+    });
+    return readinessPromise;
+  });
+}
+
+function createDisconnectingReadinessChild(nonce) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 41_337;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.connected = true;
+  child.kill = () => {
+    child.exitCode = 0;
+    setImmediate(() => child.emit("exit", 0, null));
+    return true;
+  };
+  child.send = (message, callback) => {
+    assert.equal(message?.type, READINESS_CHALLENGE);
+    child.connected = false;
+    child.emit("disconnect");
+    setImmediate(() => child.emit("message", { type: READINESS_ACK, nonce, origin: READINESS_ORIGIN }));
+    if (callback) setImmediate(() => callback(new Error("synthetic disconnected IPC")));
+    return false;
+  };
+  setImmediate(() => child.stdout.write(`${JSON.stringify({ origin: READINESS_ORIGIN })}\n`));
+  return child;
+}
+
+function gateChallengeCallbackUntilAcknowledgement(child, { callbackError = false, neverCallback = false } = {}) {
+  const state = { acknowledgementReceived: false, deliveryCallbackCompleted: false,
+    callbackInvoked: false, acknowledgementBeforeCallback: false };
+  let pendingCallback = null;
+  let deliveryError = null;
+  let releaseQueued = false;
+  const maybeRelease = () => {
+    if (neverCallback || releaseQueued || !state.acknowledgementReceived
+      || !state.deliveryCallbackCompleted || !pendingCallback) return;
+    releaseQueued = true;
+    setImmediate(() => {
+      state.acknowledgementBeforeCallback = state.acknowledgementReceived;
+      state.callbackInvoked = true;
+      pendingCallback(callbackError ? new Error("synthetic IPC callback refusal") : deliveryError);
+    });
+  };
+  const onMessage = (message) => {
+    if (message?.type !== READINESS_ACK) return;
+    state.acknowledgementReceived = true;
+    maybeRelease();
+  };
+  child.on("message", onMessage);
+  return {
+    state,
+    sendOverride(message, callback, sendToChild) {
+      if (message?.type !== READINESS_CHALLENGE) return sendToChild(message, callback);
+      pendingCallback = callback;
+      return sendToChild(message, (error) => {
+        deliveryError = error;
+        state.deliveryCallbackCompleted = true;
+        maybeRelease();
+      });
+    },
+    dispose() { child.removeListener("message", onMessage); },
+  };
+}
+
+function createOversizedReadyLineChild() {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 41_338;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.connected = true;
+  let challengeCount = 0;
+  child.kill = () => {
+    child.exitCode = 0;
+    setImmediate(() => child.emit("exit", 0, null));
+    return true;
+  };
+  child.send = (message) => {
+    if (message?.type === READINESS_CHALLENGE) challengeCount++;
+    return true;
+  };
+  setImmediate(() => child.stdout.write(Buffer.from(`${JSON.stringify({ origin: READINESS_ORIGIN, padding: "x".repeat(9_000) })}\n`)));
+  return { child, get challengeCount() { return challengeCount; } };
+}
 
 test("--dense holds the golden to its own per-date expectation and owner references", () => {
   const options = parseArguments(["--golden", "/g/golden-dense", "--dense", "--dump", "/d/usage-monitor-db.json"]);
@@ -542,18 +691,314 @@ test("D7 refuses the target statement if timeout setup consumes the deadline res
   ], "the target SQL is not sent after configuration uses the deadline reserve");
 });
 
+test("D7 origin readiness requires a nonce-bound acknowledgement from the live child", async () => {
+  const { child, nonce } = spawnReadinessChild();
+  let exited;
+  try {
+    const result = await requestReadiness(child, nonce, 1_000);
+    exited = result.exited;
+    assert.equal(result.ready.origin, READINESS_ORIGIN);
+    assert.equal(child.exitCode, null, "the child is alive when readiness is returned");
+  } finally {
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (exited) await exited;
+  }
+  assert.equal(child.exitCode, 0);
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness waits for successful send delivery when the valid ACK arrives first", async () => {
+  const { child, nonce } = spawnReadinessChild("ack-after-callback-success");
+  const gate = gateChallengeCallbackUntilAcknowledgement(child);
+  let readinessSettled = false;
+  let settledBeforeCallback = false;
+  let exited;
+  const readiness = requestReadiness(child, nonce, 1_000, { sendOverride: gate.sendOverride });
+  readiness.then(() => {
+    readinessSettled = true;
+    if (!gate.state.callbackInvoked) settledBeforeCallback = true;
+  }, () => { readinessSettled = true; });
+  try {
+    const result = await readiness;
+    exited = result.exited;
+    assert.equal(result.ready.origin, READINESS_ORIGIN);
+    assert.equal(gate.state.acknowledgementReceived, true);
+    assert.equal(gate.state.deliveryCallbackCompleted, true);
+    assert.equal(gate.state.acknowledgementBeforeCallback, true);
+    assert.equal(gate.state.callbackInvoked, true);
+    assert.equal(readinessSettled, true);
+    assert.equal(settledBeforeCallback, false);
+    assert.equal(child.exitCode, null, "the owned child remains alive when readiness resolves");
+  } finally {
+    gate.dispose();
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (exited) await exited;
+  }
+  assert.equal(child.exitCode, 0);
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness fails closed when an ACK precedes the send callback error", async () => {
+  const timeoutMs = 250;
+  const { child, nonce } = spawnReadinessChild("ack-after-callback-error");
+  const gate = gateChallengeCallbackUntilAcknowledgement(child, { callbackError: true });
+  const startedAt = performance.now();
+  let exited;
+  const readiness = requestReadiness(child, nonce, timeoutMs, { sendOverride: gate.sendOverride }).then((result) => {
+    exited = result.exited;
+    return result;
+  });
+  try {
+    await assert.rejects(readiness, refused("REHEARSAL_ORIGIN_START_FAILED"));
+  } finally {
+    gate.dispose();
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (exited) await exited;
+  }
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(gate.state.acknowledgementReceived, true);
+  assert.equal(gate.state.deliveryCallbackCompleted, true);
+  assert.equal(gate.state.acknowledgementBeforeCallback, true);
+  assert.equal(gate.state.callbackInvoked, true);
+  assert.ok(elapsedMs >= timeoutMs - 50, `IPC failure classification waits for the shared readiness deadline (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness and explicit reap caps stay bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(child.exitCode, 0, "the owned child is reaped after callback failure");
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness times out and reaps when ACK arrives but the send callback never fires", async () => {
+  const timeoutMs = 250;
+  const { child, nonce } = spawnReadinessChild("ack-after-callback-never");
+  const gate = gateChallengeCallbackUntilAcknowledgement(child, { neverCallback: true });
+  const startedAt = performance.now();
+  let exited;
+  const readiness = requestReadiness(child, nonce, timeoutMs, { sendOverride: gate.sendOverride }).then((result) => {
+    exited = result.exited;
+    return result;
+  });
+  try {
+    await assert.rejects(readiness, refused("REHEARSAL_ORIGIN_START_TIMEOUT"));
+  } finally {
+    gate.dispose();
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (exited) await exited;
+  }
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(gate.state.acknowledgementReceived, true);
+  assert.equal(gate.state.deliveryCallbackCompleted, true);
+  assert.equal(gate.state.callbackInvoked, false);
+  assert.ok(elapsedMs >= timeoutMs - 50, `missing delivery confirmation uses the shared readiness deadline (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness and explicit reap caps stay bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(child.exitCode, 0, "the owned child is reaped after missing callback confirmation");
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness consumes one bounded record and ignores repeated large post-ready stdout", async () => {
+  const { child, nonce } = spawnReadinessChild("extra-output");
+  const expectedPostReadyBytes = Buffer.byteLength(`${JSON.stringify({ origin: READINESS_ORIGIN })}\n`) + 40_000;
+  const sendControl = child.send.bind(child);
+  let challengeStarted = false;
+  let postReadyBytes = 0;
+  let postReadyOutputReleased = false;
+  let resolvePostReadyOutput;
+  const postReadyOutput = new Promise((resolveOutput) => { resolvePostReadyOutput = resolveOutput; });
+  child.stdout.on("data", (chunk) => {
+    if (!challengeStarted) return;
+    postReadyBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+    if (!postReadyOutputReleased && postReadyBytes >= expectedPostReadyBytes) {
+      postReadyOutputReleased = true;
+      resolvePostReadyOutput();
+      sendControl({ type: "readiness-test-release-ack" });
+    }
+  });
+  let challengeCount = 0;
+  let exited;
+  try {
+    const result = await requestReadiness(child, nonce, 1_000, { sendOverride(message, callback, sendToChild) {
+      if (message?.type !== READINESS_CHALLENGE) return sendToChild(message, callback);
+      challengeCount++;
+      challengeStarted = true;
+      return sendToChild(message, (error) => { postReadyOutput.then(() => callback(error)); });
+    } });
+    exited = result.exited;
+    assert.equal(result.ready.origin, READINESS_ORIGIN);
+    assert.ok(postReadyBytes >= expectedPostReadyBytes, "the duplicate record and both large stdout chunks were delivered");
+    assert.equal(challengeCount, 1, "post-ready output cannot issue another challenge");
+    assert.equal(child.exitCode, null, "the owned child remains live through readiness return");
+  } finally {
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (exited) await exited;
+  }
+  assert.equal(child.exitCode, 0);
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness enforces the first-line limit when newline shares an oversized chunk", async () => {
+  const { child, challengeCount } = createOversizedReadyLineChild();
+  let dataChunkCount = 0;
+  child.stdout.on("data", () => { dataChunkCount++; });
+  try {
+    await assert.rejects(awaitCurrentD7OriginReadiness(child,
+      { readyTimeoutMs: 500, readinessNonce: READINESS_NONCE }), refused("REHEARSAL_ORIGIN_START_FAILED"));
+    assert.equal(dataChunkCount, 1, "the oversized record and newline arrived in one stream chunk");
+    assert.equal(challengeCount, 0, "oversized readiness cannot trigger an IPC challenge");
+    assert.equal(child.exitCode, 0, "the rejected owned child is reaped");
+    assert.equal(child.signalCode, null);
+  } finally {
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
+});
+
+test("D7 origin readiness refuses an invalid acknowledgement and reaps its child", async () => {
+  const { child, nonce } = spawnReadinessChild("invalid");
+  await assert.rejects(requestReadiness(child, nonce, 1_000), refused("REHEARSAL_ORIGIN_START_FAILED"));
+  assert.equal(child.exitCode, 0);
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness times out when the live child never acknowledges", async () => {
+  const timeoutMs = 1_000;
+  const { child, nonce } = spawnReadinessChild("absent");
+  const startedAt = performance.now();
+  await assert.rejects(requestReadiness(child, nonce, timeoutMs), refused("REHEARSAL_ORIGIN_START_TIMEOUT"));
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs >= timeoutMs - 50, `one readiness budget elapsed (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness plus explicit cleanup caps stayed bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(child.exitCode, 0, "timeout cleanup waits for the owned child to exit");
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness does not accept an acknowledgement after the single deadline", async () => {
+  const timeoutMs = 500;
+  const { child, nonce } = spawnReadinessChild("late");
+  const startedAt = performance.now();
+  await assert.rejects(requestReadiness(child, nonce, timeoutMs), refused("REHEARSAL_ORIGIN_START_TIMEOUT"));
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs >= timeoutMs - 50, `the single readiness budget elapsed (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness plus explicit cleanup caps stayed bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(child.exitCode, 0, "the child exits only after its delayed acknowledgement is sent");
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness shares one deadline across the ready line and acknowledgement", async () => {
+  const timeoutMs = 500;
+  const { child, nonce } = spawnReadinessChild("staggered");
+  const stderr = [];
+  child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
+  const startedAt = performance.now();
+  await assert.rejects(requestReadiness(child, nonce, timeoutMs), refused("REHEARSAL_ORIGIN_START_TIMEOUT"));
+  const elapsedMs = performance.now() - startedAt;
+  const phases = stderr.join("");
+  assert.match(phases, /readiness-test-ready-record/u, "the child emitted its stdout-ready record");
+  assert.match(phases, /readiness-test-ack-pending/u, "the child received the challenge and entered the acknowledgement wait");
+  assert.ok(elapsedMs >= timeoutMs - 50, `the single readiness budget elapsed (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness plus explicit cleanup caps stayed bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(child.exitCode, 0, "the ack sent after the global deadline cannot extend readiness");
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness fails closed and reaps after a post-ready IPC disconnect", async () => {
+  const timeoutMs = 250;
+  const { child, nonce } = spawnReadinessChild("disconnect");
+  const startedAt = performance.now();
+  await assert.rejects(requestReadiness(child, nonce, timeoutMs), refused("REHEARSAL_ORIGIN_START_FAILED"));
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs >= timeoutMs - 50, `disconnected IPC used the same bounded readiness budget (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness plus explicit cleanup caps stayed bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(child.exitCode, 0);
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness ignores a queued matching acknowledgement after disconnect and reaps the child", async () => {
+  const timeoutMs = 250;
+  const child = createDisconnectingReadinessChild(READINESS_NONCE);
+  let acknowledgementReceived = false;
+  child.on("message", (message) => { if (message?.type === READINESS_ACK) acknowledgementReceived = true; });
+  const startedAt = performance.now();
+  await assert.rejects(awaitCurrentD7OriginReadiness(child,
+    { readyTimeoutMs: timeoutMs, readinessNonce: READINESS_NONCE }), refused("REHEARSAL_ORIGIN_START_FAILED"));
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs >= timeoutMs - 50, `disconnect defers refusal to the shared readiness deadline (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness plus explicit cleanup caps stayed bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(acknowledgementReceived, true, "the matching queued acknowledgement was actually delivered after disconnect");
+  assert.equal(child.exitCode, 0, "the disconnected owned child is reaped");
+  assert.equal(child.signalCode, null);
+  child.stdout.destroy();
+  child.stderr.destroy();
+});
+
+test("D7 origin readiness ignores a matching acknowledgement after synchronous send failure and reaps the child", async () => {
+  const timeoutMs = 250;
+  const { child, nonce } = spawnReadinessChild("ack-after-sync-error");
+  let acknowledgementReceived = false;
+  child.on("message", (message) => { if (message?.type === READINESS_ACK) acknowledgementReceived = true; });
+  const startedAt = performance.now();
+  await assert.rejects(requestReadiness(child, nonce, timeoutMs, {
+    sendOverride(message, _callback, sendToChild) {
+      if (message?.type === READINESS_CHALLENGE) {
+        sendToChild({ type: "readiness-test-release-ack" });
+        throw new Error("synthetic IPC send refusal");
+      }
+      return sendToChild(message);
+    },
+  }), refused("REHEARSAL_ORIGIN_START_FAILED"));
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs >= timeoutMs - 50, `send refusal remained within the shared readiness budget (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness plus explicit cleanup caps stayed bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(acknowledgementReceived, true, "the matching acknowledgement was emitted after the synchronous throw");
+  assert.equal(child.exitCode, 0);
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness ignores a matching acknowledgement after callback failure and reaps the child", async () => {
+  const timeoutMs = 250;
+  const { child, nonce } = spawnReadinessChild("ack-after-callback-error");
+  let acknowledgementReceived = false;
+  child.on("message", (message) => { if (message?.type === READINESS_ACK) acknowledgementReceived = true; });
+  const startedAt = performance.now();
+  await assert.rejects(requestReadiness(child, nonce, timeoutMs, {
+    sendOverride(message, callback, sendToChild) {
+      if (message?.type === READINESS_CHALLENGE) {
+        setImmediate(() => {
+          callback(new Error("synthetic IPC callback refusal"));
+          sendToChild({ type: "readiness-test-release-ack" });
+        });
+        return true;
+      }
+      return sendToChild(message, callback);
+    },
+  }), refused("REHEARSAL_ORIGIN_START_FAILED"));
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs >= timeoutMs - 50, `callback refusal remained within the shared readiness budget (${elapsedMs.toFixed(1)}ms)`);
+  assert.ok(elapsedMs <= timeoutMs + READINESS_CHILD_CLEANUP_CAP_MS + READINESS_SCHEDULER_MARGIN_MS,
+    `readiness plus explicit cleanup caps stayed bounded (${elapsedMs.toFixed(1)}ms)`);
+  assert.equal(acknowledgementReceived, true, "the matching acknowledgement was emitted after the callback error");
+  assert.equal(child.exitCode, 0);
+  assert.equal(child.signalCode, null);
+});
+
 test("D7 origin readiness timeout terminates and reaps a child before its late-ready line", async () => {
+  const nonce = READINESS_NONCE;
   const code = [
     "process.on('SIGTERM', () => process.exit(0));",
     "process.stdout.write('armed\\n');",
     "setTimeout(() => process.stdout.write(JSON.stringify({origin:'http://127.0.0.1:1'}) + '\\n'), 250);",
   ].join("");
-  const child = spawn(process.execPath, ["-e", code], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, ["-e", code], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
   await new Promise((resolveReady, rejectReady) => {
     child.stdout.once("data", resolveReady);
     child.once("error", rejectReady);
   });
-  await assert.rejects(awaitCurrentD7OriginReadiness(child, { readyTimeoutMs: 25 }),
+  await assert.rejects(awaitCurrentD7OriginReadiness(child, { readyTimeoutMs: 25, readinessNonce: nonce }),
     refused("REHEARSAL_ORIGIN_START_TIMEOUT"));
   assert.equal(child.exitCode, 0, "the controller waits for its own SIGTERM-handled child to exit");
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
@@ -562,10 +1007,24 @@ test("D7 origin readiness timeout terminates and reaps a child before its late-r
 });
 
 test("D7 origin readiness rejects an early-exit child without returning a dead handle", async () => {
+  const nonce = READINESS_NONCE;
   const child = spawn(process.execPath, ["-e", "process.stdout.write(JSON.stringify({origin:'http://127.0.0.1:1'}) + '\\n'); process.exit(7);"],
-    { stdio: ["ignore", "pipe", "pipe"] });
-  await assert.rejects(awaitCurrentD7OriginReadiness(child, { readyTimeoutMs: 500 }),
+    { stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  await assert.rejects(awaitCurrentD7OriginReadiness(child, { readyTimeoutMs: 500, readinessNonce: nonce }),
     refused("REHEARSAL_ORIGIN_START_FAILED"));
+  assert.equal(child.exitCode, 7);
+  assert.equal(child.signalCode, null);
+});
+
+test("D7 origin readiness refuses an already-exited IPC child without missed-event waits", async () => {
+  const child = spawn(process.execPath, ["-e", "process.stdout.write(JSON.stringify({origin:'http://127.0.0.1:1'}) + '\\n'); process.exit(7);"],
+    { stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  await new Promise((resolveClose, rejectClose) => {
+    child.once("close", resolveClose);
+    child.once("error", rejectClose);
+  });
+  await assert.rejects(awaitCurrentD7OriginReadiness(child,
+    { readyTimeoutMs: 500, readinessNonce: READINESS_NONCE }), refused("REHEARSAL_ORIGIN_START_FAILED"));
   assert.equal(child.exitCode, 7);
   assert.equal(child.signalCode, null);
 });
