@@ -373,7 +373,8 @@ test("the Worker real cleanup callers have mandatory process prerequisites befor
   const worker = JSON.parse(await readFile(join(REPOSITORY_ROOT, "apps/worker/package.json"), "utf8"));
   const callers = await readFile(join(REPOSITORY_ROOT, "apps/worker/scripts/gcp-fastpath-prod-shape/prod-shape.check.mjs"), "utf8");
   assert.ok(worker.scripts.check.split(" && ").includes("npm run gcp:fastpath:scripts-check"));
-  assert.ok(worker.scripts["gcp:fastpath:scripts-check"].split(" && ").includes("npm run gcp:fastpath:prod-shape:check"));
+  assert.equal(worker.scripts["gcp:fastpath:scripts-check"].split(" && ").at(-1), "npm run gcp:fastpath:prod-shape:check",
+    "the complete Worker gate retains its later production-shape checks");
   assert.ok(worker.scripts["gcp:fastpath:prod-shape:check"].includes("./scripts/gcp-fastpath-prod-shape/prod-shape.check.mjs"));
   assert.ok(callers.includes('spawn("zsh", ["-c", script]'), "the checks execute real shell callers");
   assert.ok(callers.includes("zmodload zsh/datetime"), "the signal check needs the zsh datetime module");
@@ -466,8 +467,15 @@ test("three execution jobs run the unchanged Worker and Cloud Run gates and all 
   const guardStep = workflow.jobs["worker-gate"].steps.find(({ run }) => run?.trim() === worker[guard]);
   assert.equal(guardStep?.if, undefined, "the Linux resource sampler harness is mandatory");
   assert.equal(guardStep?.["continue-on-error"], undefined, "shell harness failures fail the workflow");
+  const earlyCommand = workerNpm("gcp:fastpath:prod-shape:check");
+  const early = worker.indexOf(earlyCommand);
+  assert.equal(worker.filter((command) => command === earlyCommand).length, 1, "run the complete early check once without filters");
+  assert.deepEqual(workflow.jobs["worker-gate"].steps.find(({ name }) => name === "Check Linux process and measurement tooling early"),
+    { name: "Check Linux process and measurement tooling early", run: earlyCommand }, "the early gate has no condition or tolerated failure");
+  const installed = worker.findIndex((command) => command.includes("pnpm install"));
   const site = worker.findIndex((command) => command.includes("node scripts/build-public-release-site.js"));
-  assert.ok(guard >= 0 && site > guard && worker.indexOf(gates["worker-gate"]) > site);
+  assert.ok(installed >= 0 && guard > installed && early === guard + 1 && site > early && worker.indexOf(gates["worker-gate"]) > site,
+    "the full early process check follows locked dependencies and contract checks, before the complete Worker gate");
   assert.match(worker[site], /--output "\$GITHUB_WORKSPACE\/\.release-build\/public-release-site"/u);
   assert.match(worker[site], /--social-image "\$social_card"/u);
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });

@@ -154,6 +154,9 @@ jobs:
       - name: Check this workflow's contract, migration numbering and PostgreSQL suite routing
         run: node --test test/hosted-backend-workflow.test.js test/hosted-backend-resource-sampler.check.mjs apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
 
+      - name: Check Linux process and measurement tooling early
+        run: npm --prefix apps/worker run gcp:fastpath:prod-shape:check
+
       # deploy:dry and staging:check stage production assets from a generated
       # public release site. Build one locally from the checked-out source with a
       # synthetic 1200x630 card; it is bundled by the dry run and never published.

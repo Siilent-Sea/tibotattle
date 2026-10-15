@@ -545,3 +545,56 @@ signals. They check arguments, status preservation and sampler termination;
 forced untrappable termination is outside the cleanup claim. This diagnostic
 adds evidence for the next run; it does not resolve the hosted timeout or the
 separately pending protected R7 operation.
+
+Hosted run `38722050344` on `676ac10a8` passed all 95 canonical PostgreSQL
+files and 716 tests, the strict aggregate, Cloud Run and all four auxiliary
+workflows. Worker runtime passed 184 files and 2,836 tests in 1,423.96 seconds;
+its graph meter case passed in 4,879 milliseconds. The separate Node lane passed
+2/2, and analytics passed 33 files and 349 tests in 434.70 seconds. The unchanged
+graph case has both passing and failing hosted outcomes; its timing remains
+flaky, and this diagnostic commit does not establish a timeout repair.
+
+The Worker job failed after 39 minutes 27 seconds in the production-shape
+process test: 38/39 passed with no skips or cancellations. The signal-cleanup
+harness did not observe its required owned-child evidence within the existing
+five-second startup bound. It failed before sending a signal, not at the
+teardown deadline. The original failure lacked a scenario label, so the specific
+variant and cause require a focused diagnosis. The native timer matrix and real
+caller cleanup checks passed; deployment dry-run and staging checks were not
+reached. The wrapper preserved the gate's failure exit status.
+
+Excluding the initial since-boot report, 77 aggregate 30-second resource samples
+showed no swap activity or stolen CPU and at least 7,165,696 KiB free memory.
+Adjacent samples around the graph report showed 73–74% aggregate CPU idle.
+The final sample overlapped the start of the failing process test but did not
+cover its complete failure window. These coarse samples neither establish
+resource pressure as the cause nor exclude short or per-core stalls. The next
+repair retains all process scenarios, assertions and five-second bounds. An
+early mandatory run of the existing production-shape gate will expose Linux
+process failures before the full Worker gate, which retains its complete check
+chain and the later production-shape run.
+
+Source review identified a concrete test portability defect: three harness
+invocations reopen Node-captured stdio through `/dev/stdout` and `/dev/stderr`.
+The [pinned Node.js documentation](https://nodejs.org/download/release/v26.2.0/docs/api/child_process.html#optionsstdio)
+explicitly excludes that descriptor-filesystem access. The first such invocation
+is the resistant-root scenario, but the unlabelled hosted failure does not prove
+which scenario failed. The narrow test correction retains regular log destinations
+and duplicates the capture descriptors with shell-native redirection at those
+invocations. Descendants inherit the duplicates, so the capture-close assertion
+still depends on their exit. Production shell functions, all eleven scenarios,
+PID visibility and group ownership, the unrelated sentinel and five-second
+startup and cleanup bounds remain unchanged. Closed scenario labels make future
+failures attributable without exposing shell output or private data. Native Linux
+qualification still requires the new hosted run.
+
+On Node.js 26.2.0/macOS, the complete production-shape gate passed 39/39 with
+zero skips, failures or cancellations; its signal case exercised all eleven
+variants in 7.910 seconds. A separate bounded synthetic control verified that
+the inherited duplicate descriptors keep Node captures open after the parent
+exits, while ordinary file redirection does not, and confirmed exact-group
+cleanup. Independent review found no weakened assertion or workload. Workflow
+and sampler checks passed 26/26, release trust passed 87/87, and policy checked
+25 workflow files. These focused results qualify the test correction locally;
+the next hosted run must prove its Linux behavior and complete the unchanged
+Worker gate.
