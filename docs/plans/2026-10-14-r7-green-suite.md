@@ -683,3 +683,31 @@ That expected diagnostic failure is not a passing gate; the temporary delay was
 removed and the exact reviewed source restored. The next hosted run must provide
 actual failing-case phase evidence if the graph timeout recurs; no graph
 performance repair is claimed.
+
+Hosted run `38739514155` on `3ad784a2e` exposed an omitted integration step:
+Cloud Run and all four PostgreSQL jobs refused the new compute closure with
+`CLOUD_RUN_BUILD_KERNEL_UNREGISTERED` during bundle construction. No PostgreSQL
+test file ran; every owned PostgreSQL container stopped and the strict aggregate
+failed. The four auxiliary workflows passed. The build guard is correct: changing
+the occurrence reader requires a new append-only kernel-registry entry under the
+existing registration contract. Registration and its owning validation must be
+completed before a fresh full run; old entries and closure checks remain intact.
+The parallel local Worker gate was cancelled after this known admission failure,
+with exact owned-process cleanup verified. It had completed 1,183 tests and seven
+existing PostgreSQL-environment skips without a test failure, but had not reached
+Worker runtime, analytics or deployment dry-run/staging checks. It is incomplete,
+not passing evidence for the candidate.
+
+The registration correction derives kernel 19 from the actual build closure and
+appends its canonical registry pin. All 18 historical entry blocks and the old
+pin block remain byte-for-byte unchanged. Independent source and semantic review
+confirm that vendor provenance, pricing identity and orchestration method stay
+unchanged, while the compute identity advances with the source. All 19 owning
+registry and pricing-class checks passed without skips or cancellations. Full
+analytics passed 33 files and 349 tests, plus 25 script checks and 100,076 synthetic
+pricing comparisons, without failures or skips. The complete offline Cloud Run
+check passed all 16 test invocations: 574 tests passed and four explicitly
+PostgreSQL-gated tests skipped in the database-free local environment, with zero
+failures or cancellations. Both the build check and actual 13-bundle build resolved
+kernel 19. This qualifies local registration and analytics; the full local Worker
+gate and exact-head hosted PostgreSQL/Worker gates still require completion.
