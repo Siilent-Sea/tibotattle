@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -29,6 +29,14 @@ import {
 import { currentQ1D7SyntheticFixture } from "./current-q1-d7-contract.check.mjs";
 
 const CHECK_WORKER_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const CHECK_REPOSITORY_ROOT = resolve(CHECK_WORKER_ROOT, "../..");
+const CHECK_NODE_MODULES_ROOT = join(CHECK_WORKER_ROOT, "node_modules");
+const SOURCE_MIRROR_SUPPORT_PATHS = Object.freeze([
+  "apps/worker/package.json",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-contract.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d1-recompute.mjs",
+  "apps/worker/scripts/analytics-v2-current-d7-compare.mjs",
+]);
 const COMPARATOR_SOURCE_SHA256 = Object.freeze({
   ...CURRENT_Q1_D7_DTO_SOURCE_SHA256,
   "packages/telemetry-contract/index.js": CURRENT_Q1_D7_DTO_SOURCE_SHA256[
@@ -103,6 +111,142 @@ function currentAuthoritySha256() {
   return createHash("sha256").update(JSON.stringify(projection)).digest("hex");
 }
 
+function orderedSourceHashes(sourceHashes) {
+  return Object.fromEntries(Object.entries(sourceHashes).sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0));
+}
+
+async function capturePinnedSourceHashes(repositoryRoot) {
+  const sourceHashes = {};
+  for (const path of Object.keys(CURRENT_Q1_D7_DTO_SOURCE_SHA256)) {
+    const bytes = await readFile(join(repositoryRoot, ...path.split("/")));
+    sourceHashes[path] = createHash("sha256").update(bytes).digest("hex");
+  }
+  return orderedSourceHashes(sourceHashes);
+}
+
+async function assertRealPinnedSourcesUntouched() {
+  const actual = await capturePinnedSourceHashes(CHECK_REPOSITORY_ROOT);
+  assert.deepEqual(actual, orderedSourceHashes(CURRENT_Q1_D7_DTO_SOURCE_SHA256),
+    "the real pinned DTO source tree must remain byte-for-byte unchanged during mirror probes");
+}
+
+function isWorkerNodeModulePath(path) {
+  return path.startsWith("apps/worker/node_modules/");
+}
+
+function sourceMirrorCopyPaths() {
+  const pinnedPaths = Object.keys(CURRENT_Q1_D7_DTO_SOURCE_SHA256).filter((path) => !isWorkerNodeModulePath(path));
+  return [...new Set([...pinnedPaths, ...SOURCE_MIRROR_SUPPORT_PATHS])].sort();
+}
+
+async function removePrivateSourceMirror(mirror) {
+  const rootAfter = await lstat(mirror.root);
+  assert.equal(rootAfter.isDirectory(), true);
+  assert.equal(rootAfter.isSymbolicLink(), false);
+  assert.equal(rootAfter.uid, process.getuid());
+  assert.equal(rootAfter.dev, mirror.rootIdentity.dev);
+  assert.equal(rootAfter.ino, mirror.rootIdentity.ino);
+  assert.equal(rootAfter.mode & 0o077, 0);
+
+  const dependencyLink = await lstat(mirror.nodeModulesLink);
+  assert.equal(dependencyLink.isSymbolicLink(), true);
+  assert.equal(dependencyLink.uid, process.getuid());
+  assert.equal(dependencyLink.nlink, 1);
+  assert.equal(await readlink(mirror.nodeModulesLink), CHECK_NODE_MODULES_ROOT);
+  await rm(mirror.nodeModulesLink);
+  await rm(mirror.root, { recursive: true });
+}
+
+async function assertRealSourcesThenRemoveMirror(mirror) {
+  try {
+    await assertRealPinnedSourcesUntouched();
+  } finally {
+    await removePrivateSourceMirror(mirror);
+  }
+}
+
+async function createPrivateSourceMirror() {
+  const expectedHashes = orderedSourceHashes(CURRENT_Q1_D7_DTO_SOURCE_SHA256);
+  await assertRealPinnedSourcesUntouched();
+
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-current-d7-source-mirror-"));
+  await chmod(root, 0o700);
+  const rootIdentity = await lstat(root);
+  assert.equal(rootIdentity.isDirectory(), true);
+  assert.equal(rootIdentity.isSymbolicLink(), false);
+  assert.equal(rootIdentity.uid, process.getuid());
+  assert.equal(rootIdentity.mode & 0o077, 0);
+  const nodeModulesLink = join(root, "apps", "worker", "node_modules");
+  const mirror = {
+    root,
+    rootIdentity,
+    repositoryRoot: root,
+    workerRoot: join(root, "apps", "worker"),
+    nodeModulesLink,
+    comparatorUrl: pathToFileURL(join(root, "apps", "worker", "scripts", "analytics-v2-current-d7-compare.mjs")).href,
+  };
+
+  try {
+    for (const path of sourceMirrorCopyPaths()) {
+      assert.equal(isWorkerNodeModulePath(path), false, "never copy files through the dependency symlink");
+      const sourcePath = join(CHECK_REPOSITORY_ROOT, ...path.split("/"));
+      const sourceIdentity = await lstat(sourcePath);
+      assert.equal(sourceIdentity.isFile(), true, path);
+      assert.equal(sourceIdentity.isSymbolicLink(), false, path);
+      const bytes = await readFile(sourcePath);
+      const expectedHash = expectedHashes[path];
+      if (expectedHash !== undefined) {
+        assert.equal(createHash("sha256").update(bytes).digest("hex"), expectedHash, path);
+      }
+
+      const mirrorPath = join(root, ...path.split("/"));
+      await mkdir(resolve(mirrorPath, ".."), { recursive: true, mode: 0o700 });
+      await writeFile(mirrorPath, bytes, { flag: "wx", mode: 0o600 });
+      const mirrorIdentity = await lstat(mirrorPath);
+      assert.equal(mirrorIdentity.isFile(), true, path);
+      assert.equal(mirrorIdentity.isSymbolicLink(), false, path);
+      assert.equal(mirrorIdentity.uid, process.getuid(), path);
+      assert.equal(mirrorIdentity.nlink, 1, path);
+      assert.equal(mirrorIdentity.mode & 0o077, 0, path);
+      assert.deepEqual(await readFile(mirrorPath), bytes, path);
+    }
+
+    await assertRealPinnedSourcesUntouched();
+    const nodeModulesIdentity = await lstat(CHECK_NODE_MODULES_ROOT);
+    assert.equal(nodeModulesIdentity.isDirectory(), true);
+    assert.equal(nodeModulesIdentity.isSymbolicLink(), false);
+    await symlink(CHECK_NODE_MODULES_ROOT, nodeModulesLink, "dir");
+    const dependencyLink = await lstat(nodeModulesLink);
+    assert.equal(dependencyLink.isSymbolicLink(), true);
+    assert.equal(dependencyLink.uid, process.getuid());
+    assert.equal(dependencyLink.nlink, 1);
+    assert.equal(await readlink(nodeModulesLink), CHECK_NODE_MODULES_ROOT);
+
+    assert.deepEqual(await capturePinnedSourceHashes(root), expectedHashes,
+      "the isolated mirror must expose the exact pinned source graph before each mutation");
+    await assertRealPinnedSourcesUntouched();
+    return mirror;
+  } catch (error) {
+    const link = await lstat(nodeModulesLink).catch((candidateError) => {
+      if (candidateError?.code === "ENOENT") return null;
+      throw candidateError;
+    });
+    if (link?.isSymbolicLink() && await readlink(nodeModulesLink) === CHECK_NODE_MODULES_ROOT) {
+      await rm(nodeModulesLink);
+    }
+    const currentRoot = await lstat(root).catch((candidateError) => {
+      if (candidateError?.code === "ENOENT") return null;
+      throw candidateError;
+    });
+    if (currentRoot?.isDirectory() && !currentRoot.isSymbolicLink()
+        && currentRoot.dev === rootIdentity.dev && currentRoot.ino === rootIdentity.ino) {
+      await rm(root, { recursive: true });
+    }
+    throw error;
+  }
+}
+
 async function createPrivateTestFile(path, contents) {
   try {
     await lstat(path);
@@ -132,18 +276,20 @@ async function removePrivateTestFile(path, identity) {
 test("a fresh public-Vite worker loader ignores injected .env files and preserves source authority", async () => {
   const sentinelName = `VITE_CURRENT_D7_ENV_ISOLATION_${process.pid}`;
   assert.equal(Object.hasOwn(process.env, sentinelName), false);
-  const envPath = join(CHECK_WORKER_ROOT, ".env");
-  const localEnvPath = join(CHECK_WORKER_ROOT, ".env.local");
+  const sourceMirror = await createPrivateSourceMirror();
+  const envPath = join(sourceMirror.workerRoot, ".env");
+  const localEnvPath = join(sourceMirror.workerRoot, ".env.local");
   const probeName = `.current-d7-env-probe-${process.pid}.mjs`;
-  const probePath = join(CHECK_WORKER_ROOT, probeName);
+  const probePath = join(sourceMirror.workerRoot, probeName);
   const identities = [];
   try {
+    await assertRealPinnedSourcesUntouched();
     identities.push([envPath, await createPrivateTestFile(envPath, `${sentinelName}=first-marker\n`)]);
     identities.push([localEnvPath, await createPrivateTestFile(localEnvPath, `${sentinelName}=second-marker\n`)]);
     identities.push([probePath, await createPrivateTestFile(probePath,
       `export const sentinel = import.meta.env.${sentinelName};\n`)]);
 
-    const comparatorUrl = new URL("./analytics-v2-current-d7-compare.mjs", import.meta.url).href;
+    const comparatorUrl = sourceMirror.comparatorUrl;
     const childCode = `
       import { createHash } from "node:crypto";
       import { chmod, mkdtemp, rm } from "node:fs/promises";
@@ -154,7 +300,7 @@ test("a fresh public-Vite worker loader ignores injected .env files and preserve
       const comparator = await import(${JSON.stringify(comparatorUrl)});
       const projection = Object.fromEntries(Object.entries(comparator.CURRENT_Q1_D7_DTO_AUTHORITY).sort(([a],[b]) => a < b ? -1 : a > b ? 1 : 0).map(([key,value]) => [key, typeof value === "function" ? Function.prototype.toString.call(value) : value]));
       const authoritySha256 = createHash("sha256").update(JSON.stringify(projection)).digest("hex");
-      const workerRoot = ${JSON.stringify(CHECK_WORKER_ROOT)};
+      const workerRoot = ${JSON.stringify(sourceMirror.workerRoot)};
       const workerRequire = createRequire(join(workerRoot, "package.json"));
       const { createServer } = await import(pathToFileURL(workerRequire.resolve("vite")).href);
       const cacheRoot = await mkdtemp(join(tmpdir(), "tibotattle-current-d7-env-probe-"));
@@ -175,7 +321,7 @@ test("a fresh public-Vite worker loader ignores injected .env files and preserve
     let stdout;
     try {
       stdout = execFileSync(process.execPath, ["--input-type=module", "-e", childCode], {
-        cwd: CHECK_WORKER_ROOT, env: { ...process.env }, encoding: "utf8", timeout: 30000, maxBuffer: 256 * 1024,
+        cwd: sourceMirror.workerRoot, env: { ...process.env }, encoding: "utf8", timeout: 30000, maxBuffer: 256 * 1024,
       });
     } catch {
       throw new Error("ANALYTICS_V2_CURRENT_D7_ENV_ISOLATION_CHILD_FAILED");
@@ -188,33 +334,40 @@ test("a fresh public-Vite worker loader ignores injected .env files and preserve
     assert.deepEqual(JSON.parse(JSON.stringify(result.sourceSha256)), JSON.parse(JSON.stringify(CURRENT_Q1_D7_DTO_SOURCE_SHA256)));
     assert.equal(result.sentinel, null);
   } finally {
-    for (const [path, identity] of identities.reverse()) await removePrivateTestFile(path, identity);
+    try {
+      for (const [path, identity] of identities.reverse()) await removePrivateTestFile(path, identity);
+    } finally {
+      await assertRealSourcesThenRemoveMirror(sourceMirror);
+    }
   }
 });
 
 test("a broken current authority source returns only the fixed loader error", async () => {
-  const sourcePath = join(CHECK_WORKER_ROOT, "src/admin-community-allowance.ts");
+  const sourceMirror = await createPrivateSourceMirror();
+  const sourcePath = join(sourceMirror.workerRoot, "src/admin-community-allowance.ts");
   const marker = `CURRENT_D7_LOADER_FAILURE_SENTINEL_${process.pid}`;
   const originalBytes = await readFile(sourcePath);
   const original = await lstat(sourcePath);
   assert.equal(original.isFile(), true);
   assert.equal(original.isSymbolicLink(), false);
   const originalMode = original.mode & 0o777;
-  await chmod(sourcePath, originalMode | 0o200);
   try {
+    await assertRealPinnedSourcesUntouched();
+    await chmod(sourcePath, originalMode | 0o200);
     await writeFile(sourcePath, `// ${marker}\nexport const invalid = ;\n`);
     const afterWrite = await lstat(sourcePath);
     assert.equal(afterWrite.dev, original.dev);
     assert.equal(afterWrite.ino, original.ino);
     assert.equal(afterWrite.uid, original.uid);
+    await assertRealPinnedSourcesUntouched();
 
-    const comparatorUrl = new URL("./analytics-v2-current-d7-compare.mjs", import.meta.url).href;
+    const comparatorUrl = sourceMirror.comparatorUrl;
     const childCode = `
       try { await import(${JSON.stringify(comparatorUrl)}); process.exitCode = 1; }
       catch (error) { process.stdout.write(String(error?.message ?? "UNKNOWN_LOADER_ERROR")); }
     `;
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
-      cwd: CHECK_WORKER_ROOT, env: { ...process.env }, encoding: "utf8", timeout: 30000, maxBuffer: 64 * 1024,
+      cwd: sourceMirror.workerRoot, env: { ...process.env }, encoding: "utf8", timeout: 30000, maxBuffer: 64 * 1024,
     });
     assert.equal(child.error, undefined);
     assert.equal(child.status, 0);
@@ -223,15 +376,19 @@ test("a broken current authority source returns only the fixed loader error", as
     assert.equal(emitted.includes(marker), false);
     assert.equal(emitted.includes("admin-community-allowance.ts"), false);
   } finally {
-    const beforeRestore = await lstat(sourcePath);
-    assert.equal(beforeRestore.isFile(), true);
-    assert.equal(beforeRestore.isSymbolicLink(), false);
-    assert.equal(beforeRestore.dev, original.dev);
-    assert.equal(beforeRestore.ino, original.ino);
-    await writeFile(sourcePath, originalBytes);
-    await chmod(sourcePath, originalMode);
+    try {
+      const beforeRestore = await lstat(sourcePath);
+      assert.equal(beforeRestore.isFile(), true);
+      assert.equal(beforeRestore.isSymbolicLink(), false);
+      assert.equal(beforeRestore.dev, original.dev);
+      assert.equal(beforeRestore.ino, original.ino);
+      await writeFile(sourcePath, originalBytes);
+      await chmod(sourcePath, originalMode);
+      assert.deepEqual(await readFile(sourcePath), originalBytes);
+    } finally {
+      await assertRealSourcesThenRemoveMirror(sourceMirror);
+    }
   }
-  assert.deepEqual(await readFile(sourcePath), originalBytes);
 });
 
 test("the staged controller-relative dynamic import resolves the comparator API", async () => {
@@ -624,29 +781,43 @@ test("a reused process rejects newly pinned source after its DTO authority was l
     return;
   }
 
+  const sourceMirror = await createPrivateSourceMirror();
   const relativePath = "apps/worker/src/admin-community-allowance.ts";
-  const sourcePath = join(CHECK_WORKER_ROOT, "src/admin-community-allowance.ts");
+  const sourcePath = join(sourceMirror.workerRoot, "src/admin-community-allowance.ts");
   const originalBytes = await readFile(sourcePath);
   const originalStat = await lstat(sourcePath);
   assert.equal(originalStat.isFile(), true);
   assert.equal(originalStat.isSymbolicLink(), false);
   const marker = `CURRENT_D7_STALE_AUTHORITY_SENTINEL_${process.pid}`;
   const changedBytes = Buffer.concat([originalBytes, Buffer.from(`\n// ${marker}\n`)]);
-  await writeFile(sourcePath, changedBytes);
   try {
+    await assertRealPinnedSourcesUntouched();
+    const mirrorComparator = await import(sourceMirror.comparatorUrl);
+    assert.deepEqual(JSON.parse(JSON.stringify(mirrorComparator.CURRENT_Q1_D7_DTO_SOURCE_SHA256)),
+      JSON.parse(JSON.stringify(CURRENT_Q1_D7_DTO_SOURCE_SHA256)));
+    const baselineReport = mirrorComparator.compareCurrentQ1D7Contract(contractInput());
+    assert.equal(baselineReport.accepted, true);
+    assert.equal(baselineReport.establishesNativeExecution, false);
+
+    await writeFile(sourcePath, changedBytes);
+    await assertRealPinnedSourcesUntouched();
     const changedPins = { ...COMPARATOR_SOURCE_SHA256,
       [relativePath]: createHash("sha256").update(changedBytes).digest("hex") };
     const reboundEvidence = contractInput(contractCaseInputs(changedPins));
-    assert.throws(() => compareCurrentQ1D7Contract(reboundEvidence), /SOURCE_BINDING_INVALID/u);
+    assert.throws(() => mirrorComparator.compareCurrentQ1D7Contract(reboundEvidence), /SOURCE_BINDING_INVALID/u);
   } finally {
-    await writeFile(sourcePath, originalBytes);
-    await chmod(sourcePath, originalStat.mode & 0o777);
-    const restored = await readFile(sourcePath);
-    assert.deepEqual(restored, originalBytes);
-    const restoredStat = await lstat(sourcePath);
-    assert.equal(restoredStat.dev, originalStat.dev);
-    assert.equal(restoredStat.ino, originalStat.ino);
-    assert.equal(restoredStat.uid, originalStat.uid);
+    try {
+      await writeFile(sourcePath, originalBytes);
+      await chmod(sourcePath, originalStat.mode & 0o777);
+      const restored = await readFile(sourcePath);
+      assert.deepEqual(restored, originalBytes);
+      const restoredStat = await lstat(sourcePath);
+      assert.equal(restoredStat.dev, originalStat.dev);
+      assert.equal(restoredStat.ino, originalStat.ino);
+      assert.equal(restoredStat.uid, originalStat.uid);
+    } finally {
+      await assertRealSourcesThenRemoveMirror(sourceMirror);
+    }
   }
 });
 
